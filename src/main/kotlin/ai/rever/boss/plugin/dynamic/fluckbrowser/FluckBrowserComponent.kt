@@ -11,7 +11,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.*
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -196,7 +199,7 @@ internal fun BrowserUrlBar(
             modifier = Modifier.size(28.dp)
         ) {
             Icon(
-                imageVector = Icons.Default.ArrowBack,
+                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                 contentDescription = "Back",
                 tint = if (canGoBack) Color(0xFFCCCCCC) else Color(0xFF666666),
                 modifier = Modifier.size(16.dp)
@@ -210,7 +213,7 @@ internal fun BrowserUrlBar(
             modifier = Modifier.size(28.dp)
         ) {
             Icon(
-                imageVector = Icons.Default.ArrowForward,
+                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                 contentDescription = "Forward",
                 tint = if (canGoForward) Color(0xFFCCCCCC) else Color(0xFF666666),
                 modifier = Modifier.size(16.dp)
