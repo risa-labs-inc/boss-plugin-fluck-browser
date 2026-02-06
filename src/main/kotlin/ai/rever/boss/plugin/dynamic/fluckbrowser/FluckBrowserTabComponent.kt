@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import ai.rever.boss.plugin.api.ActiveTabsProvider
+import ai.rever.boss.plugin.api.BookmarkDataProvider
 import ai.rever.boss.plugin.api.CreateSecretRequestData
 import ai.rever.boss.plugin.api.DashboardContentProvider
 import ai.rever.boss.plugin.api.PluginContext
@@ -11,6 +13,11 @@ import ai.rever.boss.plugin.api.TabTypeId
 import ai.rever.boss.plugin.api.TabTypeInfo
 import ai.rever.boss.plugin.api.TabUpdateProvider
 import ai.rever.boss.plugin.api.TabUpdateProviderFactory
+import ai.rever.boss.plugin.api.UrlHistoryEntry
+import ai.rever.boss.plugin.api.UrlHistoryProvider
+import ai.rever.boss.plugin.api.ZoomSettingsProvider
+import ai.rever.boss.plugin.bookmark.Bookmark
+import ai.rever.boss.plugin.workspace.TabConfig
 import ai.rever.boss.plugin.browser.BrowserConfig
 import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
 import ai.rever.boss.plugin.browser.BrowserHandle
@@ -126,12 +133,19 @@ class FluckBrowserTabComponent(
                 tabTypeId = config.typeId,
                 dashboardContentProvider = pluginContext.dashboardContentProvider,
                 secretDataProvider = pluginContext.secretDataProvider,
+                bookmarkDataProvider = pluginContext.bookmarkDataProvider,
+                activeTabsProvider = pluginContext.activeTabsProvider,
+                zoomSettingsProvider = pluginContext.zoomSettingsProvider,
+                urlHistoryProvider = pluginContext.urlHistoryProvider,
                 onOpenInNewTab = { url ->
                     pluginContext.splitViewOperations?.openUrlInActivePanel(
                         url = url,
                         title = "New Tab",
                         forceNewTab = true
                     )
+                },
+                onCloseTab = {
+                    pluginContext.activeTabsProvider?.closeTab(config.id)
                 }
             )
         } else {
@@ -219,7 +233,12 @@ internal fun FluckBrowserTabContent(
     tabTypeId: TabTypeId = TabTypeId("", ""),
     dashboardContentProvider: DashboardContentProvider? = null,
     secretDataProvider: SecretDataProvider? = null,
-    onOpenInNewTab: (String) -> Unit = {}
+    bookmarkDataProvider: BookmarkDataProvider? = null,
+    activeTabsProvider: ActiveTabsProvider? = null,
+    zoomSettingsProvider: ZoomSettingsProvider? = null,
+    urlHistoryProvider: UrlHistoryProvider? = null,
+    onOpenInNewTab: (String) -> Unit = {},
+    onCloseTab: () -> Unit = {}
 ) {
     // Browser state
     var browserHandle by remember { mutableStateOf<BrowserHandle?>(null) }
@@ -234,8 +253,12 @@ internal fun FluckBrowserTabContent(
     var canGoBack by remember { mutableStateOf(false) }
     var canGoForward by remember { mutableStateOf(false) }
 
-    // Bookmark state (placeholder - actual bookmark functionality requires host API)
+    // Bookmark state - check against actual bookmark provider
     var isBookmarked by remember { mutableStateOf(false) }
+
+    // URL history autocomplete state
+    var showUrlSuggestions by remember { mutableStateOf(false) }
+    var urlSuggestions by remember { mutableStateOf<List<UrlHistoryEntry>>(emptyList()) }
 
     // Context menu state
     var showContextMenu by remember { mutableStateOf(false) }
@@ -304,15 +327,47 @@ internal fun FluckBrowserTabContent(
 
                     // Update the tab's URL in the host (for bookmark/workspace persistence)
                     tabUpdateProvider?.updateUrl(url)
+
+                    // Load saved zoom level for this domain (zoom persistence feature)
+                    zoomSettingsProvider?.let { provider ->
+                        val domain = provider.extractDomain(url)
+                        if (domain != null) {
+                            val savedZoom = provider.getZoomForDomain(domain)
+                            if (savedZoom != null && abs(savedZoom - zoomLevel) > 0.001) {
+                                zoomLevel = savedZoom
+                                handle.setZoomLevel(savedZoom)
+                            }
+                        }
+                    }
+
+                    // Check if URL is bookmarked
+                    bookmarkDataProvider?.let { provider ->
+                        val tabConfig = ai.rever.boss.plugin.workspace.TabConfig(
+                            type = "fluck",
+                            title = pageTitle,
+                            url = url
+                        )
+                        isBookmarked = provider.isTabBookmarked(tabConfig)
+                    }
                 }
                 handle.addTitleListener { title ->
                     pageTitle = title
 
                     // Update the tab's title in the tab bar via the host
                     tabUpdateProvider?.updateTitle(title)
+
+                    // Add URL to history with title (URL history feature)
+                    urlHistoryProvider?.addUrl(currentUrl, title)
                 }
                 handle.addLoadingListener { loading ->
                     isLoading = loading
+
+                    // Save history when page finishes loading
+                    if (!loading && currentUrl.isNotBlank() && currentUrl != "about:blank") {
+                        coroutineScope.launch {
+                            urlHistoryProvider?.saveHistory()
+                        }
+                    }
                 }
 
                 // Also update favicon when available
@@ -323,6 +378,17 @@ internal fun FluckBrowserTabContent(
                 // Listen for zoom changes (e.g., from pinch-to-zoom gestures)
                 handle.addZoomListener { newZoom ->
                     zoomLevel = newZoom
+
+                    // Save zoom level for this domain (zoom persistence feature)
+                    zoomSettingsProvider?.let { provider ->
+                        val domain = provider.extractDomain(currentUrl)
+                        if (domain != null) {
+                            provider.setZoomForDomain(domain, newZoom)
+                            coroutineScope.launch {
+                                provider.saveSettings()
+                            }
+                        }
+                    }
                 }
 
                 // Set up context menu callback
@@ -397,8 +463,19 @@ internal fun FluckBrowserTabContent(
         // URL bar with navigation controls
         BrowserToolbar(
             urlBarText = urlBarText,
-            onUrlBarTextChange = { urlBarText = it },
+            onUrlBarTextChange = { newText ->
+                urlBarText = newText
+                // Update URL suggestions for autocomplete
+                if (newText.isNotBlank() && urlHistoryProvider != null) {
+                    urlSuggestions = urlHistoryProvider.getSuggestions(newText, limit = 8)
+                    showUrlSuggestions = urlSuggestions.isNotEmpty()
+                } else {
+                    urlSuggestions = emptyList()
+                    showUrlSuggestions = false
+                }
+            },
             onNavigate = { url ->
+                showUrlSuggestions = false
                 coroutineScope.launch {
                     browserHandle?.loadUrl(url)
                 }
@@ -418,9 +495,45 @@ internal fun FluckBrowserTabContent(
             },
             isBookmarked = isBookmarked,
             onBookmarkClick = {
-                // Toggle bookmark state (placeholder - actual functionality requires host API)
-                isBookmarked = !isBookmarked
-            }
+                // Add or remove bookmark using the host API
+                bookmarkDataProvider?.let { provider ->
+                    val tabConfig = TabConfig(
+                        type = "fluck",
+                        title = pageTitle,
+                        url = currentUrl
+                    )
+                    if (isBookmarked) {
+                        // Remove bookmark
+                        val bookmarkInfo = provider.findBookmarkForTab(tabConfig)
+                        if (bookmarkInfo != null) {
+                            val (collectionId, bookmarkId) = bookmarkInfo
+                            provider.removeBookmark(collectionId, bookmarkId)
+                        }
+                        isBookmarked = false
+                    } else {
+                        // Add bookmark to default collection
+                        val bookmark = Bookmark(
+                            tabConfig = tabConfig,
+                            workspaceName = "Default"
+                        )
+                        provider.addBookmark("Bookmarks", bookmark)
+                        isBookmarked = true
+                    }
+                } ?: run {
+                    // Fallback to simple toggle if provider not available
+                    isBookmarked = !isBookmarked
+                }
+            },
+            urlSuggestions = urlSuggestions,
+            showUrlSuggestions = showUrlSuggestions,
+            onSuggestionSelected = { suggestion ->
+                urlBarText = suggestion.url
+                showUrlSuggestions = false
+                coroutineScope.launch {
+                    browserHandle?.loadUrl(suggestion.url)
+                }
+            },
+            onDismissSuggestions = { showUrlSuggestions = false }
         )
 
         // Loading indicator
@@ -484,7 +597,7 @@ internal fun FluckBrowserTabContent(
                     )
                 }
                 browserHandle != null -> {
-                    // Wrap browser content with mouse back/forward button handler
+                    // Wrap browser content with mouse button handler (back/forward/middle-click)
                     @OptIn(ExperimentalComposeUiApi::class)
                     Box(
                         modifier = Modifier
@@ -492,6 +605,13 @@ internal fun FluckBrowserTabContent(
                             .onPointerEvent(PointerEventType.Press) { event ->
                                 // Access native AWT MouseEvent for extended button detection
                                 val awtEvent = event.nativeEvent as? java.awt.event.MouseEvent
+
+                                // Handle middle-click to close tab (button 2 is middle mouse button in AWT)
+                                if (awtEvent?.button == 2) {
+                                    onCloseTab()
+                                    event.changes.forEach { it.consume() }
+                                    return@onPointerEvent
+                                }
 
                                 // Handle mouse back button
                                 // Windows/macOS: awtButton=4, Linux: awtButton=6 or 8 (varies by mouse)
@@ -555,6 +675,34 @@ internal fun FluckBrowserTabContent(
                             onAddNewSecret = { websitePrefill ->
                                 quickCreateWebsitePrefill = websitePrefill
                                 showQuickCreateDialog = true
+                            },
+                            isBookmarked = isBookmarked,
+                            onAddBookmark = {
+                                // Add or remove bookmark using the host API
+                                bookmarkDataProvider?.let { provider ->
+                                    val tabConfig = TabConfig(
+                                        type = "fluck",
+                                        title = pageTitle,
+                                        url = currentUrl
+                                    )
+                                    if (isBookmarked) {
+                                        // Remove bookmark
+                                        val bookmarkInfo = provider.findBookmarkForTab(tabConfig)
+                                        if (bookmarkInfo != null) {
+                                            val (collectionId, bookmarkId) = bookmarkInfo
+                                            provider.removeBookmark(collectionId, bookmarkId)
+                                        }
+                                        isBookmarked = false
+                                    } else {
+                                        // Add bookmark to default collection
+                                        val bookmark = Bookmark(
+                                            tabConfig = tabConfig,
+                                            workspaceName = "Default"
+                                        )
+                                        provider.addBookmark("Bookmarks", bookmark)
+                                        isBookmarked = true
+                                    }
+                                }
                             }
                         )
                         SwingContextMenu.show(
@@ -702,7 +850,9 @@ private fun buildContextMenuItems(
     secrets: List<SecretEntryData> = emptyList(),
     coroutineScope: CoroutineScope? = null,
     onShowAllSecrets: () -> Unit = {},
-    onAddNewSecret: (websitePrefill: String) -> Unit = {}
+    onAddNewSecret: (websitePrefill: String) -> Unit = {},
+    isBookmarked: Boolean = false,
+    onAddBookmark: () -> Unit = {}
 ): List<ContextMenuItem> = buildList {
     // Check if form field is focused (editable element)
     if (info?.isEditable == true) {
@@ -885,6 +1035,14 @@ private fun buildContextMenuItems(
             ))
         }
 
+        add(ContextMenuItem(isDivider = true))
+
+        // Bookmark option
+        add(ContextMenuItem(
+            text = if (isBookmarked) "Remove Bookmark" else "Add Bookmark",
+            onClick = onAddBookmark
+        ))
+
         // Developer tools (always at the end)
         add(ContextMenuItem(
             text = "Inspect Element",
@@ -1002,7 +1160,7 @@ private fun copyToClipboard(text: String) {
 }
 
 /**
- * Browser toolbar with URL bar, navigation controls, bookmark star, and zoom indicator.
+ * Browser toolbar with URL bar, navigation controls, bookmark star, zoom indicator, and URL autocomplete.
  * Design matches the main implementation.
  */
 @Composable
@@ -1021,7 +1179,11 @@ internal fun BrowserToolbar(
     zoomLevel: Double,
     onZoomChange: (Double) -> Unit,
     isBookmarked: Boolean,
-    onBookmarkClick: () -> Unit
+    onBookmarkClick: () -> Unit,
+    urlSuggestions: List<UrlHistoryEntry> = emptyList(),
+    showUrlSuggestions: Boolean = false,
+    onSuggestionSelected: (UrlHistoryEntry) -> Unit = {},
+    onDismissSuggestions: () -> Unit = {}
 ) {
     Row(
         modifier = Modifier
@@ -1071,95 +1233,134 @@ internal fun BrowserToolbar(
             )
         }
 
-        // URL text field with bookmark star and zoom indicator inside
-        BasicTextField(
-            value = urlBarText,
-            onValueChange = onUrlBarTextChange,
-            modifier = Modifier
-                .weight(1f)
-                .height(28.dp)
-                .onKeyEvent { keyEvent ->
-                    if (keyEvent.key == Key.Enter && keyEvent.type == KeyEventType.KeyDown) {
-                        val processedUrl = processUrlInput(urlBarText)
-                        onNavigate(processedUrl)
-                        true
-                    } else {
-                        false
-                    }
-                },
-            singleLine = true,
-            textStyle = MaterialTheme.typography.body2.copy(color = MaterialTheme.colors.onSurface),
-            cursorBrush = SolidColor(MaterialTheme.colors.primary),
-            decorationBox = { innerTextField ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(MaterialTheme.colors.surface)
-                        .border(
-                            1.dp,
-                            MaterialTheme.colors.onSurface.copy(alpha = 0.3f)
-                        )
-                        .padding(horizontal = 12.dp, vertical = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Security indicator (lock icon for HTTPS)
-                    if (isSecure) {
-                        Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = "Secure connection",
-                            tint = Color(0xFF4CAF50),
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                    }
-
-                    // URL input area
-                    Box(
+        // URL text field with bookmark star, zoom indicator, and autocomplete dropdown
+        Box(modifier = Modifier.weight(1f)) {
+            BasicTextField(
+                value = urlBarText,
+                onValueChange = onUrlBarTextChange,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(28.dp)
+                    .onKeyEvent { keyEvent ->
+                        when {
+                            keyEvent.key == Key.Enter && keyEvent.type == KeyEventType.KeyDown -> {
+                                onDismissSuggestions()
+                                val processedUrl = processUrlInput(urlBarText)
+                                onNavigate(processedUrl)
+                                true
+                            }
+                            keyEvent.key == Key.Escape && keyEvent.type == KeyEventType.KeyDown -> {
+                                onDismissSuggestions()
+                                true
+                            }
+                            else -> false
+                        }
+                    },
+                singleLine = true,
+                textStyle = MaterialTheme.typography.body2.copy(color = MaterialTheme.colors.onSurface),
+                cursorBrush = SolidColor(MaterialTheme.colors.primary),
+                decorationBox = { innerTextField ->
+                    Row(
                         modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight(),
-                        contentAlignment = Alignment.CenterStart
+                            .fillMaxSize()
+                            .background(MaterialTheme.colors.surface)
+                            .border(
+                                1.dp,
+                                MaterialTheme.colors.onSurface.copy(alpha = 0.3f)
+                            )
+                            .padding(horizontal = 12.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Placeholder when empty
-                        if (urlBarText.isEmpty()) {
-                            Text(
-                                "Enter URL or search",
-                                style = MaterialTheme.typography.body2,
-                                color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+                        // Security indicator (lock icon for HTTPS)
+                        if (isSecure) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = "Secure connection",
+                                tint = Color(0xFF4CAF50),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+
+                        // URL input area
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight(),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
+                            // Placeholder when empty
+                            if (urlBarText.isEmpty()) {
+                                Text(
+                                    "Enter URL or search",
+                                    style = MaterialTheme.typography.body2,
+                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+                                )
+                            }
+
+                            // Actual text field
+                            innerTextField()
+                        }
+
+                        // Bookmark star button
+                        IconButton(
+                            onClick = onBookmarkClick,
+                            modifier = Modifier.size(20.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isBookmarked) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                contentDescription = if (isBookmarked) "Remove from Bookmarks" else "Add to Bookmarks",
+                                tint = if (isBookmarked) Color(0xFFFFD700) else MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                modifier = Modifier.size(16.dp)
                             )
                         }
 
-                        // Actual text field
-                        innerTextField()
+                        // Zoom level indicator (only shown when not at 100%)
+                        if (abs(zoomLevel - 1.0) > 0.001) {
+                            Text(
+                                text = "${(zoomLevel * 100).toInt()}%",
+                                style = MaterialTheme.typography.caption,
+                                color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                modifier = Modifier
+                                    .padding(start = 4.dp)
+                                    .clickable { onZoomChange(1.0) }
+                            )
+                        }
                     }
+                }
+            )
 
-                    // Bookmark star button
-                    IconButton(
-                        onClick = onBookmarkClick,
-                        modifier = Modifier.size(20.dp)
+            // URL autocomplete dropdown
+            DropdownMenu(
+                expanded = showUrlSuggestions && urlSuggestions.isNotEmpty(),
+                onDismissRequest = onDismissSuggestions,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF2B2B2B))
+            ) {
+                urlSuggestions.forEach { suggestion ->
+                    DropdownMenuItem(
+                        onClick = { onSuggestionSelected(suggestion) },
+                        modifier = Modifier.background(Color(0xFF2B2B2B))
                     ) {
-                        Icon(
-                            imageVector = if (isBookmarked) Icons.Filled.Star else Icons.Outlined.StarBorder,
-                            contentDescription = if (isBookmarked) "Remove from Bookmarks" else "Add to Bookmarks",
-                            tint = if (isBookmarked) Color(0xFFFFD700) else MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-
-                    // Zoom level indicator (only shown when not at 100%)
-                    if (abs(zoomLevel - 1.0) > 0.001) {
-                        Text(
-                            text = "${(zoomLevel * 100).toInt()}%",
-                            style = MaterialTheme.typography.caption,
-                            color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
-                            modifier = Modifier
-                                .padding(start = 4.dp)
-                                .clickable { onZoomChange(1.0) }
-                        )
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                text = suggestion.title.ifBlank { suggestion.domain },
+                                style = MaterialTheme.typography.body2,
+                                color = Color.White,
+                                maxLines = 1
+                            )
+                            Text(
+                                text = suggestion.url,
+                                style = MaterialTheme.typography.caption,
+                                color = Color(0xFF9E9E9E),
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
             }
-        )
+        }
     }
 }
 

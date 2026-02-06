@@ -22,7 +22,7 @@ kotlin {
 }
 
 // Flag to switch between local development and published dependencies
-val useLocalDependencies = true
+val useLocalDependencies = false
 val bossConsolePath = "../../BossConsole"
 
 repositories {
@@ -39,12 +39,17 @@ dependencies {
         implementation(files("$bossConsolePath/plugins/plugin-api-browser/build/libs/plugin-api-browser-desktop-1.0.4.jar"))
         implementation(files("$bossConsolePath/plugins/plugin-ui-core/build/libs/plugin-ui-core-desktop-1.0.7.jar"))
         implementation(files("$bossConsolePath/plugins/plugin-scrollbar/build/libs/plugin-scrollbar-desktop-1.0.7.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-bookmark-types/build/libs/plugin-bookmark-types-desktop-1.0.4.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-workspace-types/build/libs/plugin-workspace-types-desktop-1.0.4.jar"))
     } else {
         // Plugin API from Maven Central (for release)
-        implementation("com.risaboss:plugin-api-desktop:1.0.5")
-        implementation("com.risaboss:plugin-api-browser-desktop:1.0.3")
-        implementation("com.risaboss:plugin-ui-core-desktop:1.0.4")
-        implementation("com.risaboss:plugin-scrollbar-desktop:1.0.4")
+        // NOTE: plugin-api-desktop 1.0.10 required for ZoomSettingsProvider/UrlHistoryProvider
+        implementation("com.risaboss:plugin-api-desktop:1.0.10")
+        implementation("com.risaboss:plugin-api-browser-desktop:1.0.5")
+        implementation("com.risaboss:plugin-ui-core-desktop:1.0.7")
+        implementation("com.risaboss:plugin-scrollbar-desktop:1.0.7")
+        implementation("com.risaboss:plugin-bookmark-types-desktop:1.0.4")
+        implementation("com.risaboss:plugin-workspace-types-desktop:1.0.4")
     }
 
     // Compose dependencies
