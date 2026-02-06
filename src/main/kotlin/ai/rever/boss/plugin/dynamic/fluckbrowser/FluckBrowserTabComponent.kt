@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.Fullscreen
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.StarBorder
@@ -249,6 +250,9 @@ internal fun FluckBrowserTabContent(
     var quickCreateWebsitePrefill by remember { mutableStateOf("") }
     var allSecrets by remember { mutableStateOf<List<SecretEntryData>>(emptyList()) }
 
+    // Fullscreen state - tracks when browser content is displayed in a fullscreen window
+    var isInFullscreen by remember { mutableStateOf(false) }
+
     // Retry state for browser creation
     var retryCount by remember { mutableStateOf(0) }
     val maxRetries = 3
@@ -330,6 +334,19 @@ internal fun FluckBrowserTabContent(
                 // Set up callback for cmd+click and target="_blank" to open in new tab
                 handle.setOpenInNewTabCallback { url ->
                     onOpenInNewTab(url)
+                }
+
+                // Set up fullscreen handler for video fullscreen (e.g., YouTube)
+                if (tabId.isNotEmpty()) {
+                    handle.setFullscreenHandler(
+                        tabId = tabId,
+                        onEnterFullscreen = {
+                            isInFullscreen = true
+                        },
+                        onExitFullscreen = {
+                            isInFullscreen = false
+                        }
+                    )
                 }
 
                 // Initialize zoom level from browser
@@ -444,6 +461,15 @@ internal fun FluckBrowserTabContent(
                             error = null
                             retryCount = 0
                             isInitializing = true
+                        }
+                    )
+                }
+                isInFullscreen -> {
+                    // Fullscreen placeholder - browser is displayed in a separate fullscreen window
+                    FullscreenPlaceholder(
+                        onExitClick = {
+                            // Request exit through the browser's fullscreen API
+                            browserHandle?.requestExitFullscreen()
                         }
                     )
                 }
@@ -1880,6 +1906,47 @@ private fun QuickDialogTextField(
                     )
                 }
             }
+        }
+    }
+}
+
+// ============================================================
+// FULLSCREEN SUPPORT
+// ============================================================
+
+/**
+ * Placeholder shown in the tab when browser content is displayed in fullscreen mode.
+ * Clicking this placeholder exits fullscreen and returns browser content to the tab.
+ */
+@Composable
+private fun FullscreenPlaceholder(onExitClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1E1E1E))
+            .clickable { onExitClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Fullscreen,
+                contentDescription = null,
+                modifier = Modifier.size(64.dp),
+                tint = Color(0xFF888888)
+            )
+            Text(
+                text = "Tab is in fullscreen mode",
+                style = MaterialTheme.typography.h6,
+                color = Color.White
+            )
+            Text(
+                text = "Click here or press ESC to exit fullscreen",
+                style = MaterialTheme.typography.body2,
+                color = Color(0xFF888888)
+            )
         }
     }
 }
