@@ -183,6 +183,21 @@ class FluckBrowserTabComponent(
 }
 
 /**
+ * Platform detection for keyboard shortcut modifier keys.
+ * On macOS, we use Meta (⌘), on other platforms we use Ctrl.
+ */
+private val isMacOS: Boolean by lazy {
+    System.getProperty("os.name").lowercase().contains("mac")
+}
+
+/**
+ * Check if the primary modifier key is pressed (Cmd on macOS, Ctrl on others).
+ */
+private fun KeyEvent.isPrimaryModifierPressed(): Boolean {
+    return if (isMacOS) isMetaPressed else isCtrlPressed
+}
+
+/**
  * Process URL input with smart detection for:
  * - Full URLs (http://, https://, file://, etc.)
  * - Localhost patterns (localhost:3000, 127.0.0.1:8080)
@@ -459,6 +474,37 @@ internal fun FluckBrowserTabContent(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colors.background)
+            .onPreviewKeyEvent { keyEvent ->
+                // Handle keyboard shortcuts: Cmd+R (reload), Cmd+0 (reset zoom),
+                // Cmd++/= (zoom in), Cmd+- (zoom out)
+                if (keyEvent.type == KeyEventType.KeyDown && keyEvent.isPrimaryModifierPressed()) {
+                    when (keyEvent.key) {
+                        Key.R -> {
+                            // Reload - Cmd+R / Ctrl+R
+                            browserHandle?.reload()
+                            true
+                        }
+                        Key.Zero -> {
+                            // Reset zoom - Cmd+0 / Ctrl+0
+                            browserHandle?.resetZoom()
+                            true
+                        }
+                        Key.Equals, Key.NumPadAdd -> {
+                            // Zoom in - Cmd++ or Cmd+= / Ctrl++ or Ctrl+=
+                            browserHandle?.zoomIn()
+                            true
+                        }
+                        Key.Minus, Key.NumPadSubtract -> {
+                            // Zoom out - Cmd+- / Ctrl+-
+                            browserHandle?.zoomOut()
+                            true
+                        }
+                        else -> false
+                    }
+                } else {
+                    false
+                }
+            }
     ) {
         // URL bar with navigation controls
         BrowserToolbar(
