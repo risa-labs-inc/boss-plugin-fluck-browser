@@ -21,6 +21,10 @@ kotlin {
     }
 }
 
+// Flag to switch between local development and published dependencies
+val useLocalDependencies = true
+val bossConsolePath = "../../BossConsole"
+
 repositories {
     google()
     mavenCentral()
@@ -28,11 +32,20 @@ repositories {
 }
 
 dependencies {
-    // Plugin API from Maven Central
-    implementation("com.risaboss:plugin-api-desktop:1.0.5")
-    implementation("com.risaboss:plugin-api-browser-desktop:1.0.3")
-    implementation("com.risaboss:plugin-ui-core-desktop:1.0.4")
-    implementation("com.risaboss:plugin-scrollbar-desktop:1.0.4")
+    if (useLocalDependencies) {
+        // Local development dependencies from BossConsole
+        // Use the latest versioned jars (update versions when rebuilding BossConsole)
+        implementation(files("$bossConsolePath/plugins/plugin-api/build/libs/plugin-api-desktop-1.0.9.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-api-browser/build/libs/plugin-api-browser-desktop-1.0.4.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-ui-core/build/libs/plugin-ui-core-desktop-1.0.7.jar"))
+        implementation(files("$bossConsolePath/plugins/plugin-scrollbar/build/libs/plugin-scrollbar-desktop-1.0.7.jar"))
+    } else {
+        // Plugin API from Maven Central (for release)
+        implementation("com.risaboss:plugin-api-desktop:1.0.5")
+        implementation("com.risaboss:plugin-api-browser-desktop:1.0.3")
+        implementation("com.risaboss:plugin-ui-core-desktop:1.0.4")
+        implementation("com.risaboss:plugin-scrollbar-desktop:1.0.4")
+    }
 
     // Compose dependencies
     implementation(compose.desktop.currentOs)

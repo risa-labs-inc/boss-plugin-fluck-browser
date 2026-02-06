@@ -1,0 +1,17 @@
+{
+  "manifestVersion": 1,
+  "pluginId": "ai.rever.boss.plugin.dynamic.fluckbrowser",
+  "displayName": "Fluck Browser",
+  "version": "1.0.0",
+  "apiVersion": "1.0",
+  "mainClass": "ai.rever.boss.plugin.dynamic.fluckbrowser.FluckBrowserDynamicPlugin",
+  "type": "tab",
+  "description": "Full-featured embedded web browser tab with zoom controls, loading indicator, and security indicator",
+  "author": "Risa Labs",
+  "url": "https://github.com/risa-labs-inc/boss-plugin-fluck-browser",
+  "tab": {
+    "typeId": "fluck",
+    "displayName": "Browser",
+    "defaultEnabled": true
+  }
+}
