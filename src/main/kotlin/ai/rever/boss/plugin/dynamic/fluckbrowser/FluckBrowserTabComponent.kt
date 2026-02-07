@@ -266,16 +266,14 @@ internal fun FluckBrowserTabContent(
     onOpenInNewTab: (String) -> Unit = {},
     onCloseTab: () -> Unit = {}
 ) {
-    // Browser state
+    // Browser state - matches bundled browser exactly
     var browserHandle by remember { mutableStateOf<BrowserHandle?>(null) }
     var isInitializing by remember { mutableStateOf(true) }
     var isLoading by remember { mutableStateOf(false) }
-    var currentUrl by remember { mutableStateOf(initialUrl) }
     var urlBarText by remember { mutableStateOf(TextFieldValue(initialUrl, TextRange(initialUrl.length))) }
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
     var pageTitle by remember { mutableStateOf("New Tab") }
-    var isSecure by remember { mutableStateOf(initialUrl.startsWith("https://")) }
     var zoomLevel by remember { mutableStateOf(1.0) }
     var error by remember { mutableStateOf<String?>(null) }
     var canGoBack by remember { mutableStateOf(false) }
@@ -311,16 +309,12 @@ internal fun FluckBrowserTabContent(
     var retryCount by remember { mutableStateOf(0) }
     val maxRetries = 3
 
-    // Show dashboard for about:blank pages (using host's dashboard)
-    // Only show if:
-    // 1. Initial URL was blank/about:blank (explicit new tab, not opened with a URL)
-    // 2. Current URL is still blank/about:blank
-    // 3. NOT currently loading (no navigation in progress)
-    val initialIsBlank = initialUrl.isBlank() || initialUrl == "about:blank"
-    val showDashboard = remember(initialIsBlank, currentUrl, isLoading) {
-        val currentIsBlank = currentUrl.isBlank() || currentUrl == "about:blank"
-        initialIsBlank && currentIsBlank && !isLoading
-    }
+    // Show dashboard for about:blank pages - matches bundled browser exactly
+    val currentUrl = urlBarText.text
+    val showDashboard = currentUrl.isEmpty() || currentUrl == "about:blank"
+
+    // Security indicator derived from current URL
+    val isSecure = currentUrl.startsWith("https://")
 
     // Lazily created provider - by the time LaunchedEffect runs, the tab should be registered
     var tabUpdateProvider by remember { mutableStateOf<TabUpdateProvider?>(null) }
@@ -348,21 +342,15 @@ internal fun FluckBrowserTabContent(
                 browserHandle = handle
                 isInitializing = false
 
-                // Add listeners
+                // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
-                    // Skip about:blank updates if we already have a real URL
-                    // This prevents the URL bar from resetting during intermediate navigation states
-                    if (url == "about:blank" && currentUrl.isNotBlank() && currentUrl != "about:blank") {
-                        return@addNavigationListener
-                    }
-
-                    currentUrl = url
-                    // Only update URL bar if user is not actively editing
+                    // Only update URL bar if user isn't actively editing
+                    // AND sufficient time has passed since last input (300ms buffer for Tab completion)
                     val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
                     if (!isUserEditingUrl && timeSinceEdit > 300) {
                         urlBarText = TextFieldValue(url, TextRange(url.length))
                     }
-                    isSecure = url.startsWith("https://")
+
                     canGoBack = handle.canGoBack()
                     canGoForward = handle.canGoForward()
 
@@ -398,13 +386,14 @@ internal fun FluckBrowserTabContent(
                     tabUpdateProvider?.updateTitle(title)
 
                     // Add URL to history with title (URL history feature)
-                    urlHistoryProvider?.addUrl(currentUrl, title)
+                    urlHistoryProvider?.addUrl(urlBarText.text, title)
                 }
                 handle.addLoadingListener { loading ->
                     isLoading = loading
 
                     // Save history when page finishes loading
-                    if (!loading && currentUrl.isNotBlank() && currentUrl != "about:blank") {
+                    val currentUrlText = urlBarText.text
+                    if (!loading && currentUrlText.isNotBlank() && currentUrlText != "about:blank") {
                         coroutineScope.launch {
                             urlHistoryProvider?.saveHistory()
                         }
@@ -422,7 +411,7 @@ internal fun FluckBrowserTabContent(
 
                     // Save zoom level for this domain (zoom persistence feature)
                     zoomSettingsProvider?.let { provider ->
-                        val domain = provider.extractDomain(currentUrl)
+                        val domain = provider.extractDomain(urlBarText.text)
                         if (domain != null) {
                             provider.setZoomForDomain(domain, newZoom)
                             coroutineScope.launch {
