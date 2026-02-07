@@ -47,11 +47,13 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -260,7 +262,9 @@ internal fun FluckBrowserTabContent(
     var isInitializing by remember { mutableStateOf(true) }
     var isLoading by remember { mutableStateOf(false) }
     var currentUrl by remember { mutableStateOf(initialUrl) }
-    var urlBarText by remember { mutableStateOf(initialUrl) }
+    var urlBarText by remember { mutableStateOf(TextFieldValue(initialUrl, TextRange(initialUrl.length))) }
+    var isUserEditingUrl by remember { mutableStateOf(false) }
+    var lastUserEditTime by remember { mutableStateOf(0L) }
     var pageTitle by remember { mutableStateOf("New Tab") }
     var isSecure by remember { mutableStateOf(initialUrl.startsWith("https://")) }
     var zoomLevel by remember { mutableStateOf(1.0) }
@@ -335,7 +339,11 @@ internal fun FluckBrowserTabContent(
                 // Add listeners
                 handle.addNavigationListener { url ->
                     currentUrl = url
-                    urlBarText = url
+                    // Only update URL bar if user is not actively editing
+                    val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
+                    if (!isUserEditingUrl && timeSinceEdit > 300) {
+                        urlBarText = TextFieldValue(url, TextRange(url.length))
+                    }
                     isSecure = url.startsWith("https://")
                     canGoBack = handle.canGoBack()
                     canGoForward = handle.canGoForward()
@@ -509,11 +517,13 @@ internal fun FluckBrowserTabContent(
         // URL bar with navigation controls
         BrowserToolbar(
             urlBarText = urlBarText,
-            onUrlBarTextChange = { newText ->
-                urlBarText = newText
+            onUrlBarTextChange = { newValue ->
+                isUserEditingUrl = true
+                lastUserEditTime = System.currentTimeMillis()
+                urlBarText = newValue
                 // Update URL suggestions for autocomplete
-                if (newText.isNotBlank() && urlHistoryProvider != null) {
-                    urlSuggestions = urlHistoryProvider.getSuggestions(newText, limit = 8)
+                if (newValue.text.isNotBlank() && urlHistoryProvider != null) {
+                    urlSuggestions = urlHistoryProvider.getSuggestions(newValue.text, limit = 8)
                     showUrlSuggestions = urlSuggestions.isNotEmpty()
                 } else {
                     urlSuggestions = emptyList()
@@ -521,6 +531,9 @@ internal fun FluckBrowserTabContent(
                 }
             },
             onNavigate = { url ->
+                // Clear editing state to allow URL bar updates during navigation
+                isUserEditingUrl = false
+                lastUserEditTime = 0L
                 showUrlSuggestions = false
                 coroutineScope.launch {
                     browserHandle?.loadUrl(url)
@@ -573,7 +586,9 @@ internal fun FluckBrowserTabContent(
             urlSuggestions = urlSuggestions,
             showUrlSuggestions = showUrlSuggestions,
             onSuggestionSelected = { suggestion ->
-                urlBarText = suggestion.url
+                urlBarText = TextFieldValue(suggestion.url, TextRange(suggestion.url.length))
+                isUserEditingUrl = false
+                lastUserEditTime = 0L
                 showUrlSuggestions = false
                 coroutineScope.launch {
                     browserHandle?.loadUrl(suggestion.url)
@@ -1211,8 +1226,8 @@ private fun copyToClipboard(text: String) {
  */
 @Composable
 internal fun BrowserToolbar(
-    urlBarText: String,
-    onUrlBarTextChange: (String) -> Unit,
+    urlBarText: TextFieldValue,
+    onUrlBarTextChange: (TextFieldValue) -> Unit,
     onNavigate: (String) -> Unit,
     canGoBack: Boolean,
     canGoForward: Boolean,
@@ -1291,7 +1306,7 @@ internal fun BrowserToolbar(
                         when {
                             keyEvent.key == Key.Enter && keyEvent.type == KeyEventType.KeyDown -> {
                                 onDismissSuggestions()
-                                val processedUrl = processUrlInput(urlBarText)
+                                val processedUrl = processUrlInput(urlBarText.text)
                                 onNavigate(processedUrl)
                                 true
                             }
@@ -1336,7 +1351,7 @@ internal fun BrowserToolbar(
                             contentAlignment = Alignment.CenterStart
                         ) {
                             // Placeholder when empty
-                            if (urlBarText.isEmpty()) {
+                            if (urlBarText.text.isEmpty()) {
                                 Text(
                                     "Enter URL or search",
                                     style = MaterialTheme.typography.body2,
