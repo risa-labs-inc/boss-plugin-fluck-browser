@@ -47,10 +47,14 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
@@ -59,7 +63,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.Lifecycle.Callbacks
 import kotlinx.coroutines.CoroutineScope
@@ -278,6 +285,9 @@ internal fun FluckBrowserTabContent(
     // URL history autocomplete state
     var showUrlSuggestions by remember { mutableStateOf(false) }
     var urlSuggestions by remember { mutableStateOf<List<UrlHistoryEntry>>(emptyList()) }
+    var autocompleteSuggestion by remember { mutableStateOf<String?>(null) }
+    var selectedDropdownIndex by remember { mutableStateOf(-1) }
+    val dropdownListState = rememberLazyListState()
 
     // Context menu state
     var showContextMenu by remember { mutableStateOf(false) }
@@ -521,13 +531,30 @@ internal fun FluckBrowserTabContent(
                 isUserEditingUrl = true
                 lastUserEditTime = System.currentTimeMillis()
                 urlBarText = newValue
+                selectedDropdownIndex = -1
+
                 // Update URL suggestions for autocomplete
                 if (newValue.text.isNotBlank() && urlHistoryProvider != null) {
-                    urlSuggestions = urlHistoryProvider.getSuggestions(newValue.text, limit = 8)
-                    showUrlSuggestions = urlSuggestions.isNotEmpty()
+                    val suggestions = urlHistoryProvider.getSuggestions(newValue.text, limit = 8)
+                    urlSuggestions = suggestions
+                    showUrlSuggestions = suggestions.isNotEmpty()
+
+                    // Compute inline autocomplete from first suggestion
+                    if (suggestions.isNotEmpty()) {
+                        val suggestionUrl = suggestions.first().url
+                        if (suggestionUrl.lowercase().startsWith(newValue.text.lowercase()) &&
+                            suggestionUrl.length > newValue.text.length) {
+                            autocompleteSuggestion = suggestionUrl
+                        } else {
+                            autocompleteSuggestion = null
+                        }
+                    } else {
+                        autocompleteSuggestion = null
+                    }
                 } else {
                     urlSuggestions = emptyList()
                     showUrlSuggestions = false
+                    autocompleteSuggestion = null
                 }
             },
             onNavigate = { url ->
@@ -535,6 +562,8 @@ internal fun FluckBrowserTabContent(
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
                 showUrlSuggestions = false
+                autocompleteSuggestion = null
+                selectedDropdownIndex = -1
                 coroutineScope.launch {
                     browserHandle?.loadUrl(url)
                 }
@@ -585,16 +614,34 @@ internal fun FluckBrowserTabContent(
             },
             urlSuggestions = urlSuggestions,
             showUrlSuggestions = showUrlSuggestions,
+            autocompleteSuggestion = autocompleteSuggestion,
+            selectedDropdownIndex = selectedDropdownIndex,
+            dropdownListState = dropdownListState,
             onSuggestionSelected = { suggestion ->
                 urlBarText = TextFieldValue(suggestion.url, TextRange(suggestion.url.length))
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
                 showUrlSuggestions = false
+                autocompleteSuggestion = null
+                selectedDropdownIndex = -1
                 coroutineScope.launch {
                     browserHandle?.loadUrl(suggestion.url)
                 }
             },
-            onDismissSuggestions = { showUrlSuggestions = false }
+            onDismissSuggestions = {
+                showUrlSuggestions = false
+                autocompleteSuggestion = null
+                selectedDropdownIndex = -1
+            },
+            onAcceptAutocomplete = {
+                if (autocompleteSuggestion != null) {
+                    urlBarText = TextFieldValue(autocompleteSuggestion!!, TextRange(autocompleteSuggestion!!.length))
+                    autocompleteSuggestion = null
+                }
+            },
+            onSelectedDropdownIndexChange = { newIndex ->
+                selectedDropdownIndex = newIndex
+            }
         )
 
         // Loading indicator
@@ -1222,7 +1269,7 @@ private fun copyToClipboard(text: String) {
 
 /**
  * Browser toolbar with URL bar, navigation controls, bookmark star, zoom indicator, and URL autocomplete.
- * Design matches the main implementation.
+ * Design matches the main implementation with inline autocomplete and keyboard navigation.
  */
 @Composable
 internal fun BrowserToolbar(
@@ -1243,9 +1290,21 @@ internal fun BrowserToolbar(
     onBookmarkClick: () -> Unit,
     urlSuggestions: List<UrlHistoryEntry> = emptyList(),
     showUrlSuggestions: Boolean = false,
+    autocompleteSuggestion: String? = null,
+    selectedDropdownIndex: Int = -1,
+    dropdownListState: LazyListState = rememberLazyListState(),
     onSuggestionSelected: (UrlHistoryEntry) -> Unit = {},
-    onDismissSuggestions: () -> Unit = {}
+    onDismissSuggestions: () -> Unit = {},
+    onAcceptAutocomplete: () -> Unit = {},
+    onSelectedDropdownIndexChange: (Int) -> Unit = {}
 ) {
+    // Auto-scroll to selected suggestion when using arrow keys
+    LaunchedEffect(selectedDropdownIndex) {
+        if (selectedDropdownIndex >= 0 && urlSuggestions.isNotEmpty()) {
+            dropdownListState.animateScrollToItem(selectedDropdownIndex)
+        }
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1304,13 +1363,61 @@ internal fun BrowserToolbar(
                     .height(28.dp)
                     .onKeyEvent { keyEvent ->
                         when {
-                            keyEvent.key == Key.Enter && keyEvent.type == KeyEventType.KeyDown -> {
+                            keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Tab -> {
+                                // Accept autocomplete suggestion with Tab
+                                if (autocompleteSuggestion != null) {
+                                    onAcceptAutocomplete()
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Enter -> {
+                                val urlToLoad = when {
+                                    selectedDropdownIndex >= 0 && selectedDropdownIndex < urlSuggestions.size -> {
+                                        // Use selected dropdown item
+                                        urlSuggestions[selectedDropdownIndex].url
+                                    }
+                                    autocompleteSuggestion != null &&
+                                        urlBarText.text == autocompleteSuggestion.take(urlBarText.text.length) -> {
+                                        // Use autocomplete suggestion
+                                        processUrlInput(autocompleteSuggestion)
+                                    }
+                                    else -> {
+                                        processUrlInput(urlBarText.text)
+                                    }
+                                }
                                 onDismissSuggestions()
-                                val processedUrl = processUrlInput(urlBarText.text)
-                                onNavigate(processedUrl)
+                                onNavigate(urlToLoad)
                                 true
                             }
-                            keyEvent.key == Key.Escape && keyEvent.type == KeyEventType.KeyDown -> {
+                            keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.DirectionDown -> {
+                                if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
+                                    val newIndex = (selectedDropdownIndex + 1).coerceAtMost(urlSuggestions.size - 1)
+                                    onSelectedDropdownIndexChange(newIndex)
+                                }
+                                true
+                            }
+                            keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.DirectionUp -> {
+                                if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
+                                    val newIndex = (selectedDropdownIndex - 1).coerceAtLeast(-1)
+                                    onSelectedDropdownIndexChange(newIndex)
+                                }
+                                true
+                            }
+                            keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.DirectionRight -> {
+                                // Accept inline autocomplete when cursor is at the end of input
+                                if (autocompleteSuggestion != null &&
+                                    urlBarText.selection.collapsed &&
+                                    urlBarText.selection.start == urlBarText.text.length) {
+                                    onAcceptAutocomplete()
+                                    onDismissSuggestions()
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape -> {
                                 onDismissSuggestions()
                                 true
                             }
@@ -1359,6 +1466,30 @@ internal fun BrowserToolbar(
                                 )
                             }
 
+                            // Show autocomplete using AnnotatedString approach
+                            if (autocompleteSuggestion != null &&
+                                urlBarText.text.isNotEmpty() &&
+                                autocompleteSuggestion.lowercase().startsWith(urlBarText.text.lowercase())) {
+
+                                // Build styled text: user's input (transparent) + autocomplete suffix (gray)
+                                val annotatedString = buildAnnotatedString {
+                                    // User's input in transparent (so actual input shows through)
+                                    withStyle(SpanStyle(color = Color.Transparent)) {
+                                        append(urlBarText.text)
+                                    }
+                                    // Autocomplete suffix in gray
+                                    withStyle(SpanStyle(color = MaterialTheme.colors.onSurface.copy(alpha = 0.3f))) {
+                                        append(autocompleteSuggestion.substring(urlBarText.text.length))
+                                    }
+                                }
+
+                                Text(
+                                    text = annotatedString,
+                                    style = MaterialTheme.typography.body2,
+                                    maxLines = 1
+                                )
+                            }
+
                             // Actual text field
                             innerTextField()
                         }
@@ -1391,32 +1522,60 @@ internal fun BrowserToolbar(
                 }
             )
 
-            // URL autocomplete dropdown
-            DropdownMenu(
-                expanded = showUrlSuggestions && urlSuggestions.isNotEmpty(),
-                onDismissRequest = onDismissSuggestions,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xFF2B2B2B))
-            ) {
-                urlSuggestions.forEach { suggestion ->
-                    DropdownMenuItem(
-                        onClick = { onSuggestionSelected(suggestion) },
-                        modifier = Modifier.background(Color(0xFF2B2B2B))
+            // URL autocomplete dropdown using Card + LazyColumn for better keyboard navigation
+            if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 2.dp),
+                    elevation = 4.dp,
+                    backgroundColor = Color(0xFF2B2B2B)
+                ) {
+                    LazyColumn(
+                        state = dropdownListState,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 300.dp)
                     ) {
-                        Column(modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                text = suggestion.title.ifBlank { suggestion.domain },
-                                style = MaterialTheme.typography.body2,
-                                color = Color.White,
-                                maxLines = 1
-                            )
-                            Text(
-                                text = suggestion.url,
-                                style = MaterialTheme.typography.caption,
-                                color = Color(0xFF9E9E9E),
-                                maxLines = 1
-                            )
+                        itemsIndexed(urlSuggestions) { index, entry ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(
+                                        if (index == selectedDropdownIndex)
+                                            MaterialTheme.colors.primary.copy(alpha = 0.1f)
+                                        else
+                                            Color.Transparent
+                                    )
+                                    .clickable {
+                                        onSuggestionSelected(entry)
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // URL icon
+                                Icon(
+                                    imageVector = Icons.Outlined.Language,
+                                    contentDescription = null,
+                                    tint = Color(0xFF9E9E9E),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = entry.title.ifBlank { entry.domain },
+                                        style = MaterialTheme.typography.body2,
+                                        color = Color.White,
+                                        maxLines = 1
+                                    )
+                                    Text(
+                                        text = entry.url,
+                                        style = MaterialTheme.typography.caption,
+                                        color = Color(0xFF9E9E9E),
+                                        maxLines = 1
+                                    )
+                                }
+                            }
                         }
                     }
                 }
