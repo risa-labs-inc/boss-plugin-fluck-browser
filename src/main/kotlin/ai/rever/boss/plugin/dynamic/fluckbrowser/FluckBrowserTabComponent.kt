@@ -1034,7 +1034,6 @@ private fun getDisplayName(website: String): String {
 
 /**
  * Build context menu items based on browser state.
- * Matches the original JxBrowserCompose implementation exactly.
  */
 private fun buildContextMenuItems(
     info: BrowserContextMenuInfo?,
@@ -1248,7 +1247,7 @@ private fun buildContextMenuItems(
 }
 
 /**
- * Swing-based context menu for JxBrowser in HARDWARE_ACCELERATED mode.
+ * Swing-based context menu for browser in HARDWARE_ACCELERATED mode.
  * Uses native AWT JPopupMenu which is heavyweight and can appear above
  * the browser view, unlike Compose's lightweight Popup component.
  */
