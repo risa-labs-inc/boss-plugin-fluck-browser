@@ -25,7 +25,7 @@ import ai.rever.boss.plugin.api.PluginContext
 class FluckBrowserDynamicPlugin : DynamicPlugin {
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.fluckbrowser"
     override val displayName: String = "Fluck Browser"
-    override val version: String = "1.0.4"
+    override val version: String = "1.0.5"
     override val description: String = "Full-featured embedded web browser tab with zoom, downloads, and secret integration"
     override val author: String = "Risa Labs"
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-fluck-browser"

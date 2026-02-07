@@ -350,6 +350,12 @@ internal fun FluckBrowserTabContent(
 
                 // Add listeners
                 handle.addNavigationListener { url ->
+                    // Skip about:blank updates if we already have a real URL
+                    // This prevents the URL bar from resetting during intermediate navigation states
+                    if (url == "about:blank" && currentUrl.isNotBlank() && currentUrl != "about:blank") {
+                        return@addNavigationListener
+                    }
+
                     currentUrl = url
                     // Only update URL bar if user is not actively editing
                     val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
