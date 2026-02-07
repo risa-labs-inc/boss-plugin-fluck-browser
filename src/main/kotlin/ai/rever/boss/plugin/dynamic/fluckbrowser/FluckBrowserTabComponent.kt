@@ -38,12 +38,14 @@ import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.runtime.*
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
@@ -533,15 +535,20 @@ internal fun FluckBrowserTabContent(
                 urlBarText = newValue
                 selectedDropdownIndex = -1
 
-                // Update URL suggestions for autocomplete
-                if (newValue.text.isNotBlank() && urlHistoryProvider != null) {
-                    val suggestions = urlHistoryProvider.getSuggestions(newValue.text, limit = 8)
-                    urlSuggestions = suggestions
-                    showUrlSuggestions = suggestions.isNotEmpty()
+                // Get autocomplete suggestion and dropdown items
+                // Only compute when text is not empty and cursor is not selecting text
+                if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
+                    val suggestions = urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
 
-                    // Compute inline autocomplete from first suggestion
+                    // Set inline autocomplete (first suggestion with protocol stripped)
                     if (suggestions.isNotEmpty()) {
-                        val suggestionUrl = suggestions.first().url
+                        val suggestion = suggestions.first()
+                        val suggestionUrl = suggestion.url
+                            .removePrefix("https://")
+                            .removePrefix("http://")
+                            .removePrefix("www.")
+
+                        // Only suggest if the stripped URL starts with the input
                         if (suggestionUrl.lowercase().startsWith(newValue.text.lowercase()) &&
                             suggestionUrl.length > newValue.text.length) {
                             autocompleteSuggestion = suggestionUrl
@@ -551,10 +558,14 @@ internal fun FluckBrowserTabContent(
                     } else {
                         autocompleteSuggestion = null
                     }
+
+                    // Set dropdown suggestions
+                    urlSuggestions = suggestions
+                    showUrlSuggestions = suggestions.isNotEmpty()
                 } else {
+                    autocompleteSuggestion = null
                     urlSuggestions = emptyList()
                     showUrlSuggestions = false
-                    autocompleteSuggestion = null
                 }
             },
             onNavigate = { url ->
@@ -641,6 +652,14 @@ internal fun FluckBrowserTabContent(
             },
             onSelectedDropdownIndexChange = { newIndex ->
                 selectedDropdownIndex = newIndex
+            },
+            onFocusLost = {
+                // Hide dropdown when focus is lost (with delay to allow click events)
+                coroutineScope.launch {
+                    delay(200)
+                    showUrlSuggestions = false
+                    isUserEditingUrl = false
+                }
             }
         )
 
@@ -1296,8 +1315,10 @@ internal fun BrowserToolbar(
     onSuggestionSelected: (UrlHistoryEntry) -> Unit = {},
     onDismissSuggestions: () -> Unit = {},
     onAcceptAutocomplete: () -> Unit = {},
-    onSelectedDropdownIndexChange: (Int) -> Unit = {}
+    onSelectedDropdownIndexChange: (Int) -> Unit = {},
+    onFocusLost: () -> Unit = {}
 ) {
+    val coroutineScope = rememberCoroutineScope()
     // Auto-scroll to selected suggestion when using arrow keys
     LaunchedEffect(selectedDropdownIndex) {
         if (selectedDropdownIndex >= 0 && urlSuggestions.isNotEmpty()) {
@@ -1361,7 +1382,12 @@ internal fun BrowserToolbar(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(28.dp)
-                    .onKeyEvent { keyEvent ->
+                    .onFocusChanged { focusState ->
+                        if (!focusState.isFocused) {
+                            onFocusLost()
+                        }
+                    }
+                    .onPreviewKeyEvent { keyEvent ->
                         when {
                             keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Tab -> {
                                 // Accept autocomplete suggestion with Tab
