@@ -1430,9 +1430,26 @@ internal fun BrowserToolbar(
             )
         }
 
-        // Dynamic Reload/Stop button
+        // Refresh/Stop button - changes based on loading state
+        // Matches bundled browser: when not loading, navigates to URL bar text (not just reload)
         IconButton(
-            onClick = { if (isLoading) onStop() else onReload() },
+            onClick = {
+                if (isLoading) {
+                    // Stop the current navigation
+                    onStop()
+                } else {
+                    // Reload/navigate to URL - matches bundled browser exactly
+                    val urlToLoad = if (autocompleteSuggestion != null &&
+                        urlBarText.text == autocompleteSuggestion.take(urlBarText.text.length)) {
+                        processUrlInput(autocompleteSuggestion)
+                    } else {
+                        val input = urlBarText.text.trim()
+                        processUrlInput(input)
+                    }
+                    onDismissSuggestions()
+                    onNavigate(urlToLoad)
+                }
+            },
             modifier = Modifier.size(32.dp)
         ) {
             Icon(
@@ -1468,18 +1485,16 @@ internal fun BrowserToolbar(
                                 }
                             }
                             keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Enter -> {
+                                // Matches bundled browser exactly
                                 val urlToLoad = when {
                                     selectedDropdownIndex >= 0 && selectedDropdownIndex < urlSuggestions.size -> {
                                         // Use selected dropdown item
                                         urlSuggestions[selectedDropdownIndex].url
                                     }
-                                    autocompleteSuggestion != null &&
-                                        urlBarText.text == autocompleteSuggestion.take(urlBarText.text.length) -> {
-                                        // Use autocomplete suggestion
-                                        processUrlInput(autocompleteSuggestion)
-                                    }
                                     else -> {
-                                        processUrlInput(urlBarText.text)
+                                        // Use what the user actually typed
+                                        val input = urlBarText.text.trim()
+                                        processUrlInput(input)
                                     }
                                 }
                                 onDismissSuggestions()
