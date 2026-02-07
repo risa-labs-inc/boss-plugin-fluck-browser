@@ -490,42 +490,43 @@ internal fun FluckBrowserTabContent(
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colors.background)
-            .onPreviewKeyEvent { keyEvent ->
-                // Handle keyboard shortcuts: Cmd+R (reload), Cmd+0 (reset zoom),
-                // Cmd++/= (zoom in), Cmd+- (zoom out)
-                if (keyEvent.type == KeyEventType.KeyDown && keyEvent.isPrimaryModifierPressed()) {
-                    when (keyEvent.key) {
-                        Key.R -> {
-                            // Reload - Cmd+R / Ctrl+R
-                            browserHandle?.reload()
-                            true
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colors.background)
+                .onPreviewKeyEvent { keyEvent ->
+                    // Handle keyboard shortcuts: Cmd+R (reload), Cmd+0 (reset zoom),
+                    // Cmd++/= (zoom in), Cmd+- (zoom out)
+                    if (keyEvent.type == KeyEventType.KeyDown && keyEvent.isPrimaryModifierPressed()) {
+                        when (keyEvent.key) {
+                            Key.R -> {
+                                // Reload - Cmd+R / Ctrl+R
+                                browserHandle?.reload()
+                                true
+                            }
+                            Key.Zero -> {
+                                // Reset zoom - Cmd+0 / Ctrl+0
+                                browserHandle?.resetZoom()
+                                true
+                            }
+                            Key.Equals, Key.NumPadAdd -> {
+                                // Zoom in - Cmd++ or Cmd+= / Ctrl++ or Ctrl+=
+                                browserHandle?.zoomIn()
+                                true
+                            }
+                            Key.Minus, Key.NumPadSubtract -> {
+                                // Zoom out - Cmd+- / Ctrl+-
+                                browserHandle?.zoomOut()
+                                true
+                            }
+                            else -> false
                         }
-                        Key.Zero -> {
-                            // Reset zoom - Cmd+0 / Ctrl+0
-                            browserHandle?.resetZoom()
-                            true
-                        }
-                        Key.Equals, Key.NumPadAdd -> {
-                            // Zoom in - Cmd++ or Cmd+= / Ctrl++ or Ctrl+=
-                            browserHandle?.zoomIn()
-                            true
-                        }
-                        Key.Minus, Key.NumPadSubtract -> {
-                            // Zoom out - Cmd+- / Ctrl+-
-                            browserHandle?.zoomOut()
-                            true
-                        }
-                        else -> false
+                    } else {
+                        false
                     }
-                } else {
-                    false
                 }
-            }
-    ) {
+        ) {
         // URL bar with navigation controls
         BrowserToolbar(
             urlBarText = urlBarText,
@@ -883,7 +884,80 @@ internal fun FluckBrowserTabContent(
                 )
             }
         }
-    }
+        } // End Column
+
+        // Floating URL autocomplete dropdown overlay (positioned below toolbar)
+        if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth(0.5f) // Half the width of the screen
+                    .wrapContentHeight()
+                    .align(Alignment.TopCenter)
+                    .offset(y = 38.dp), // Position below the navigation bar
+                elevation = 8.dp,
+                backgroundColor = MaterialTheme.colors.surface
+            ) {
+                LazyColumn(
+                    state = dropdownListState,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 300.dp)
+                ) {
+                    itemsIndexed(urlSuggestions) { index, entry ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(
+                                    if (index == selectedDropdownIndex)
+                                        MaterialTheme.colors.primary.copy(alpha = 0.1f)
+                                    else
+                                        MaterialTheme.colors.surface
+                                )
+                                .clickable {
+                                    urlBarText = TextFieldValue(entry.url, TextRange(entry.url.length))
+                                    showUrlSuggestions = false
+                                    autocompleteSuggestion = null
+                                    selectedDropdownIndex = -1
+                                    isUserEditingUrl = false
+                                    lastUserEditTime = 0L
+                                    coroutineScope.launch {
+                                        browserHandle?.loadUrl(entry.url)
+                                    }
+                                }
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // Icon to indicate type
+                            Icon(
+                                imageVector = if (entry.title.contains("Google Search", ignoreCase = true))
+                                    Icons.Filled.Search
+                                else
+                                    Icons.Outlined.Language,
+                                contentDescription = null,
+                                tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = entry.title.ifBlank { entry.domain },
+                                    style = MaterialTheme.typography.body2,
+                                    color = MaterialTheme.colors.onSurface,
+                                    maxLines = 1
+                                )
+                                Text(
+                                    text = entry.url,
+                                    style = MaterialTheme.typography.caption,
+                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } // End Box
 }
 
 /**
@@ -1548,64 +1622,7 @@ internal fun BrowserToolbar(
                 }
             )
 
-            // URL autocomplete dropdown using Card + LazyColumn for better keyboard navigation
-            if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 2.dp),
-                    elevation = 4.dp,
-                    backgroundColor = Color(0xFF2B2B2B)
-                ) {
-                    LazyColumn(
-                        state = dropdownListState,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 300.dp)
-                    ) {
-                        itemsIndexed(urlSuggestions) { index, entry ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(
-                                        if (index == selectedDropdownIndex)
-                                            MaterialTheme.colors.primary.copy(alpha = 0.1f)
-                                        else
-                                            Color.Transparent
-                                    )
-                                    .clickable {
-                                        onSuggestionSelected(entry)
-                                    }
-                                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                // URL icon
-                                Icon(
-                                    imageVector = Icons.Outlined.Language,
-                                    contentDescription = null,
-                                    tint = Color(0xFF9E9E9E),
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = entry.title.ifBlank { entry.domain },
-                                        style = MaterialTheme.typography.body2,
-                                        color = Color.White,
-                                        maxLines = 1
-                                    )
-                                    Text(
-                                        text = entry.url,
-                                        style = MaterialTheme.typography.caption,
-                                        color = Color(0xFF9E9E9E),
-                                        maxLines = 1
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Dropdown is rendered as floating overlay in parent, not here
         }
     }
 }
