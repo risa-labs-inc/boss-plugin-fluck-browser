@@ -4,7 +4,9 @@ import ai.rever.boss.plugin.api.ActiveTabsProvider
 import ai.rever.boss.plugin.api.BookmarkDataProvider
 import ai.rever.boss.plugin.api.CreateSecretRequestData
 import ai.rever.boss.plugin.api.DashboardContentProvider
+import ai.rever.boss.plugin.api.InternalBrowserTabData
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.boss.plugin.api.ScreenCaptureProvider
 import ai.rever.boss.plugin.api.SecretDataProvider
 import ai.rever.boss.plugin.api.SecretEntryData
 import ai.rever.boss.plugin.api.TabComponentWithUI
@@ -148,6 +150,7 @@ class FluckBrowserTabComponent(
                 activeTabsProvider = pluginContext.activeTabsProvider,
                 zoomSettingsProvider = pluginContext.zoomSettingsProvider,
                 urlHistoryProvider = pluginContext.urlHistoryProvider,
+                screenCaptureProvider = pluginContext.screenCaptureProvider,
                 onOpenInNewTab = { url ->
                     pluginContext.splitViewOperations?.openUrlInActivePanel(
                         url = url,
@@ -263,6 +266,7 @@ internal fun FluckBrowserTabContent(
     activeTabsProvider: ActiveTabsProvider? = null,
     zoomSettingsProvider: ZoomSettingsProvider? = null,
     urlHistoryProvider: UrlHistoryProvider? = null,
+    screenCaptureProvider: ScreenCaptureProvider? = null,
     onOpenInNewTab: (String) -> Unit = {},
     onCloseTab: () -> Unit = {}
 ) {
@@ -309,6 +313,14 @@ internal fun FluckBrowserTabContent(
     var retryCount by remember { mutableStateOf(0) }
     val maxRetries = 3
 
+    // Recovery state - prevents infinite recovery loops
+    var recoveryAttempts by remember { mutableStateOf(0) }
+    val maxRecoveryAttempts = 5
+
+    // Navigation history state - tracks back/forward history for persistence
+    var navigationHistory by remember { mutableStateOf<MutableList<Pair<String, String>>>(mutableListOf()) }
+    var historyIndex by remember { mutableStateOf(-1) }
+
     // Show dashboard for about:blank pages - matches bundled browser exactly
     val currentUrl = urlBarText.text
     val showDashboard = currentUrl.isEmpty() || currentUrl == "about:blank"
@@ -353,6 +365,19 @@ internal fun FluckBrowserTabContent(
 
                     canGoBack = handle.canGoBack()
                     canGoForward = handle.canGoForward()
+
+                    // Track navigation history for workspace persistence
+                    // Only add new entry if URL is different from current position
+                    if (navigationHistory.isEmpty() || navigationHistory.lastOrNull()?.second != url) {
+                        // Truncate forward history if we're not at the end
+                        if (historyIndex < navigationHistory.size - 1) {
+                            while (navigationHistory.size > historyIndex + 1) {
+                                navigationHistory.removeAt(navigationHistory.size - 1)
+                            }
+                        }
+                        navigationHistory.add(Pair(pageTitle, url))
+                        historyIndex = navigationHistory.size - 1
+                    }
 
                     // Update the tab's URL in the host (for bookmark/workspace persistence)
                     tabUpdateProvider?.updateUrl(url)
@@ -462,6 +487,58 @@ internal fun FluckBrowserTabContent(
             } else {
                 error = e.message ?: "Unknown error"
                 isInitializing = false
+            }
+        }
+    }
+
+    // Browser validity check and recovery mechanism
+    // Periodically check if browser is still valid and trigger recovery if needed
+    LaunchedEffect(browserHandle) {
+        if (browserHandle != null) {
+            while (true) {
+                delay(2000) // Check every 2 seconds
+
+                val handle = browserHandle
+                if (handle != null && !handle.isValid) {
+                    // Browser became invalid - trigger recovery
+                    if (recoveryAttempts < maxRecoveryAttempts) {
+                        recoveryAttempts++
+                        println("[FluckBrowser] Browser invalid, triggering recovery (attempt $recoveryAttempts/$maxRecoveryAttempts)")
+
+                        // Save current URL for recovery
+                        val currentUrl = urlBarText.text
+
+                        // Reset state to trigger reinitialization
+                        browserHandle = null
+                        isInitializing = true
+                        error = null
+
+                        // Restore URL after small delay
+                        delay(100)
+                        if (currentUrl.isNotBlank() && currentUrl != "about:blank") {
+                            urlBarText = TextFieldValue(currentUrl, TextRange(currentUrl.length))
+                        }
+
+                        // Increment retry count to trigger LaunchedEffect
+                        retryCount++
+                    } else {
+                        // Max recovery attempts reached
+                        error = "Browser recovery failed after $maxRecoveryAttempts attempts. Please close and reopen this tab."
+                        browserHandle = null
+                        isInitializing = false
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    // Reset recovery counter on successful browser initialization
+    LaunchedEffect(browserHandle) {
+        if (browserHandle != null && browserHandle?.isValid == true) {
+            if (recoveryAttempts > 0) {
+                println("[FluckBrowser] Browser recovered successfully, resetting recovery counter")
+                recoveryAttempts = 0
             }
         }
     }
