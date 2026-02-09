@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.9"
+version = "1.0.11"
 
 java {
     toolchain {
@@ -21,10 +21,9 @@ kotlin {
     }
 }
 
-// Flag to switch between local development and published dependencies
-// Set to true when using unreleased plugin-api versions
-val useLocalDependencies = false
-val bossConsolePath = "../../BossConsole"
+// Auto-detect CI environment
+val useLocalDependencies = System.getenv("CI") != "true"
+val bossPluginApiPath = "../boss-plugin-api"
 
 repositories {
     google()
@@ -34,23 +33,11 @@ repositories {
 
 dependencies {
     if (useLocalDependencies) {
-        // Local development dependencies from BossConsole
-        // Use the latest versioned jars (update versions when rebuilding BossConsole)
-        implementation(files("$bossConsolePath/plugins/plugin-api/build/libs/plugin-api-desktop-1.0.13.jar"))
-        implementation(files("$bossConsolePath/plugins/plugin-api-browser/build/libs/plugin-api-browser-desktop-1.0.5.jar"))
-        implementation(files("$bossConsolePath/plugins/plugin-ui-core/build/libs/plugin-ui-core-desktop-1.0.7.jar"))
-        implementation(files("$bossConsolePath/plugins/plugin-scrollbar/build/libs/plugin-scrollbar-desktop-1.0.7.jar"))
-        implementation(files("$bossConsolePath/plugins/plugin-bookmark-types/build/libs/plugin-bookmark-types-desktop-1.0.4.jar"))
-        implementation(files("$bossConsolePath/plugins/plugin-workspace-types/build/libs/plugin-workspace-types-desktop-1.0.4.jar"))
+        // Local development: use boss-plugin-api JAR from sibling repo
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.18.jar"))
     } else {
-        // Plugin API from Maven Central (for release)
-        // NOTE: plugin-api-desktop 1.0.13 required for ScreenCaptureProvider
-        implementation("com.risaboss:plugin-api-desktop:1.0.13")
-        implementation("com.risaboss:plugin-api-browser-desktop:1.0.5")
-        implementation("com.risaboss:plugin-ui-core-desktop:1.0.7")
-        implementation("com.risaboss:plugin-scrollbar-desktop:1.0.7")
-        implementation("com.risaboss:plugin-bookmark-types-desktop:1.0.4")
-        implementation("com.risaboss:plugin-workspace-types-desktop:1.0.4")
+        // CI: use downloaded JAR
+        compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
     }
 
     // Compose dependencies
