@@ -492,11 +492,11 @@ internal fun FluckBrowserTabContent(
     }
 
     // Browser validity check and recovery mechanism
-    // Periodically check if browser is still valid and trigger recovery if needed
+    // Poll browser validity to detect engine resets and trigger recovery
     LaunchedEffect(browserHandle) {
         if (browserHandle != null) {
             while (true) {
-                delay(2000) // Check every 2 seconds
+                delay(500) // Check every 500ms for fast recovery
 
                 val handle = browserHandle
                 if (handle != null && !handle.isValid) {
