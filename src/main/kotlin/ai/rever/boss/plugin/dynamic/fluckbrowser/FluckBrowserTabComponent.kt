@@ -331,9 +331,14 @@ internal fun FluckBrowserTabContent(
     // Lazily created provider - by the time LaunchedEffect runs, the tab should be registered
     var tabUpdateProvider by remember { mutableStateOf<TabUpdateProvider?>(null) }
 
+    // Initialization timeout state - shows retry UI when init takes too long
+    var initTimedOut by remember { mutableStateOf(false) }
+
     // Initialize browser with retry mechanism
     LaunchedEffect(retryCount) {
         if (browserHandle != null) return@LaunchedEffect
+
+        initTimedOut = false
 
         try {
             // Create the TabUpdateProvider now (tab should be registered by this point)
@@ -347,9 +352,12 @@ internal fun FluckBrowserTabContent(
                 delay(delayMs)
             }
 
-            val handle = browserService.createBrowser(
-                BrowserConfig(url = initialUrl)
-            )
+            // Use timeout to prevent hanging forever when engine fails to init
+            val handle = kotlinx.coroutines.withTimeoutOrNull(15_000L) {
+                browserService.createBrowser(
+                    BrowserConfig(url = initialUrl)
+                )
+            }
             if (handle != null) {
                 browserHandle = handle
                 isInitializing = false
@@ -481,6 +489,10 @@ internal fun FluckBrowserTabContent(
                     isInitializing = false
                 }
             }
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            // Timeout - show retry UI instead of retrying silently
+            println("[FluckBrowser] Browser creation timed out (attempt ${retryCount + 1}/$maxRetries)")
+            initTimedOut = true
         } catch (e: Exception) {
             if (retryCount < maxRetries) {
                 retryCount++
@@ -758,13 +770,67 @@ internal fun FluckBrowserTabContent(
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            CircularProgressIndicator(color = MaterialTheme.colors.primary)
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text(
-                                text = if (retryCount > 0) "Retrying... ($retryCount/$maxRetries)" else "Initializing browser...",
-                                color = MaterialTheme.colors.onBackground,
-                                fontSize = 14.sp
-                            )
+                            if (initTimedOut) {
+                                // Timed out - show error with retry options
+                                Icon(
+                                    imageVector = Icons.Default.Warning,
+                                    contentDescription = "Warning",
+                                    tint = Color(0xFFFFA726),
+                                    modifier = Modifier.size(48.dp)
+                                )
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text(
+                                    text = "Browser initialization timed out",
+                                    color = MaterialTheme.colors.onBackground,
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "The browser engine may not be available in this environment.",
+                                    color = MaterialTheme.colors.onBackground.copy(alpha = 0.7f),
+                                    fontSize = 13.sp
+                                )
+                                Spacer(modifier = Modifier.height(20.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Button(
+                                        onClick = {
+                                            initTimedOut = false
+                                            retryCount++
+                                        },
+                                        colors = ButtonDefaults.buttonColors(
+                                            backgroundColor = MaterialTheme.colors.primary,
+                                            contentColor = MaterialTheme.colors.onPrimary
+                                        )
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Refresh,
+                                            contentDescription = "Retry",
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Retry")
+                                    }
+                                    OutlinedButton(
+                                        onClick = {
+                                            initTimedOut = false
+                                            error = "Browser initialization timed out. Please close and reopen this tab."
+                                            isInitializing = false
+                                        }
+                                    ) {
+                                        Text("Close")
+                                    }
+                                }
+                            } else {
+                                // Normal loading spinner
+                                CircularProgressIndicator(color = MaterialTheme.colors.primary)
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text(
+                                    text = if (retryCount > 0) "Retrying... ($retryCount/$maxRetries)" else "Initializing browser...",
+                                    color = MaterialTheme.colors.onBackground,
+                                    fontSize = 14.sp
+                                )
+                            }
                         }
                     }
                 }
