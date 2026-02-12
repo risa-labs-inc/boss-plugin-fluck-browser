@@ -331,14 +331,9 @@ internal fun FluckBrowserTabContent(
     // Lazily created provider - by the time LaunchedEffect runs, the tab should be registered
     var tabUpdateProvider by remember { mutableStateOf<TabUpdateProvider?>(null) }
 
-    // Initialization timeout state - shows retry UI when init takes too long
-    var initTimedOut by remember { mutableStateOf(false) }
-
     // Initialize browser with retry mechanism
     LaunchedEffect(retryCount) {
         if (browserHandle != null) return@LaunchedEffect
-
-        initTimedOut = false
 
         try {
             // Create the TabUpdateProvider now (tab should be registered by this point)
@@ -353,7 +348,7 @@ internal fun FluckBrowserTabContent(
             }
 
             // Use timeout to prevent hanging forever when engine fails to init
-            val handle = kotlinx.coroutines.withTimeoutOrNull(15_000L) {
+            val handle = kotlinx.coroutines.withTimeoutOrNull(10_000L) {
                 browserService.createBrowser(
                     BrowserConfig(url = initialUrl)
                 )
@@ -481,18 +476,15 @@ internal fun FluckBrowserTabContent(
                 // Initialize zoom level from browser
                 zoomLevel = handle.getZoomLevel()
             } else {
-                // Retry if we haven't exceeded max retries
-                if (retryCount < maxRetries) {
-                    retryCount++
-                } else {
-                    error = "Failed to create browser instance after $maxRetries attempts"
-                    isInitializing = false
-                }
+                // Browser creation returned null — show error immediately
+                error = "Failed to create browser instance. The browser engine may not be available."
+                isInitializing = false
             }
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-            // Timeout - show retry UI instead of retrying silently
+            // Timeout — show error immediately
             println("[FluckBrowser] Browser creation timed out (attempt ${retryCount + 1}/$maxRetries)")
-            initTimedOut = true
+            error = "Browser initialization timed out. The browser engine may not be available in this environment."
+            isInitializing = false
         } catch (e: Exception) {
             if (retryCount < maxRetries) {
                 retryCount++
@@ -767,70 +759,14 @@ internal fun FluckBrowserTabContent(
                         modifier = Modifier.fillMaxSize(),
                         contentAlignment = Alignment.Center
                     ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            if (initTimedOut) {
-                                // Timed out - show error with retry options
-                                Icon(
-                                    imageVector = Icons.Default.Warning,
-                                    contentDescription = "Warning",
-                                    tint = Color(0xFFFFA726),
-                                    modifier = Modifier.size(48.dp)
-                                )
-                                Spacer(modifier = Modifier.height(16.dp))
-                                Text(
-                                    text = "Browser initialization timed out",
-                                    color = MaterialTheme.colors.onBackground,
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    text = "The browser engine may not be available in this environment.",
-                                    color = MaterialTheme.colors.onBackground.copy(alpha = 0.7f),
-                                    fontSize = 13.sp
-                                )
-                                Spacer(modifier = Modifier.height(20.dp))
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    Button(
-                                        onClick = {
-                                            initTimedOut = false
-                                            retryCount++
-                                        },
-                                        colors = ButtonDefaults.buttonColors(
-                                            backgroundColor = MaterialTheme.colors.primary,
-                                            contentColor = MaterialTheme.colors.onPrimary
-                                        )
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Refresh,
-                                            contentDescription = "Retry",
-                                            modifier = Modifier.size(16.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Text("Retry")
-                                    }
-                                    OutlinedButton(
-                                        onClick = {
-                                            initTimedOut = false
-                                            error = "Browser initialization timed out. Please close and reopen this tab."
-                                            isInitializing = false
-                                        }
-                                    ) {
-                                        Text("Close")
-                                    }
-                                }
-                            } else {
-                                // Normal loading spinner
-                                CircularProgressIndicator(color = MaterialTheme.colors.primary)
-                                Spacer(modifier = Modifier.height(16.dp))
-                                Text(
-                                    text = if (retryCount > 0) "Retrying... ($retryCount/$maxRetries)" else "Initializing browser...",
-                                    color = MaterialTheme.colors.onBackground,
-                                    fontSize = 14.sp
-                                )
-                            }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator(color = MaterialTheme.colors.primary)
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = if (retryCount > 0) "Retrying... ($retryCount/$maxRetries)" else "Initializing browser...",
+                                color = MaterialTheme.colors.onBackground,
+                                fontSize = 14.sp
+                            )
                         }
                     }
                 }
@@ -840,6 +776,14 @@ internal fun FluckBrowserTabContent(
                         onRetry = {
                             error = null
                             retryCount = 0
+                            isInitializing = true
+                        },
+                        onResetTab = {
+                            // Full reset: clear all state and start fresh
+                            error = null
+                            retryCount = 0
+                            recoveryAttempts = 0
+                            browserHandle = null
                             isInitializing = true
                         }
                     )
@@ -1782,12 +1726,14 @@ internal fun BrowserToolbar(
 
 /**
  * Error content when browser fails to load.
- * Includes a retry button.
+ * Shows error message with Retry and Reset Tab buttons,
+ * matching the bundled browser's BrowserErrorView.
  */
 @Composable
 internal fun BrowserErrorContent(
     error: String,
-    onRetry: (() -> Unit)? = null
+    onRetry: (() -> Unit)? = null,
+    onResetTab: (() -> Unit)? = null
 ) {
     Box(
         modifier = Modifier
@@ -1796,18 +1742,18 @@ internal fun BrowserErrorContent(
         contentAlignment = Alignment.Center
     ) {
         Card(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth(0.6f),
             elevation = 4.dp,
             backgroundColor = MaterialTheme.colors.surface
         ) {
             Column(
-                modifier = Modifier.padding(24.dp),
+                modifier = Modifier.padding(32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Icon(
                     imageVector = Icons.Default.Warning,
                     contentDescription = "Error",
-                    tint = MaterialTheme.colors.error,
+                    tint = Color(0xFFFFA726),
                     modifier = Modifier.size(48.dp)
                 )
 
@@ -1829,23 +1775,34 @@ internal fun BrowserErrorContent(
                     textAlign = TextAlign.Center
                 )
 
-                if (onRetry != null) {
-                    Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(24.dp))
 
-                    Button(
-                        onClick = onRetry,
-                        colors = ButtonDefaults.buttonColors(
-                            backgroundColor = MaterialTheme.colors.primary,
-                            contentColor = MaterialTheme.colors.onPrimary
-                        )
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "Retry",
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Retry")
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (onRetry != null) {
+                        Button(
+                            onClick = onRetry,
+                            colors = ButtonDefaults.buttonColors(
+                                backgroundColor = MaterialTheme.colors.primary,
+                                contentColor = MaterialTheme.colors.onPrimary
+                            )
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Retry",
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Retry Loading")
+                        }
+                    }
+
+                    if (onResetTab != null) {
+                        OutlinedButton(onClick = onResetTab) {
+                            Text("Reset Tab")
+                        }
                     }
                 }
             }
