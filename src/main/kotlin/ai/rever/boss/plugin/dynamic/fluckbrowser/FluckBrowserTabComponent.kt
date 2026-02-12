@@ -279,7 +279,7 @@ internal fun FluckBrowserTabContent(
     var lastUserEditTime by remember { mutableStateOf(0L) }
     var pageTitle by remember { mutableStateOf("New Tab") }
     var zoomLevel by remember { mutableStateOf(1.0) }
-    var error by remember { mutableStateOf<String?>(null) }
+    var error by remember { mutableStateOf<String?>("Initializing browser...") }
     var canGoBack by remember { mutableStateOf(false) }
     var canGoForward by remember { mutableStateOf(false) }
 
@@ -347,8 +347,8 @@ internal fun FluckBrowserTabContent(
                 delay(delayMs)
             }
 
-            // Use timeout to prevent hanging forever when engine fails to init
-            val handle = kotlinx.coroutines.withTimeoutOrNull(10_000L) {
+            // Short timeout - if engine can't create a browser quickly, show error view
+            val handle = kotlinx.coroutines.withTimeoutOrNull(3_000L) {
                 browserService.createBrowser(
                     BrowserConfig(url = initialUrl)
                 )
@@ -418,6 +418,12 @@ internal fun FluckBrowserTabContent(
                 }
                 handle.addLoadingListener { loading ->
                     isLoading = loading
+
+                    // Page finished loading — browser is working, clear error/loading state
+                    if (!loading) {
+                        error = null
+                        isInitializing = false
+                    }
 
                     // Save history when page finishes loading
                     val currentUrlText = urlBarText.text
@@ -515,7 +521,7 @@ internal fun FluckBrowserTabContent(
                         // Reset state to trigger reinitialization
                         browserHandle = null
                         isInitializing = true
-                        error = null
+                        error = "Browser crashed. Recovering..."
 
                         // Restore URL after small delay
                         delay(100)
@@ -754,37 +760,20 @@ internal fun FluckBrowserTabContent(
         // Browser content or Dashboard
         Box(modifier = Modifier.fillMaxSize()) {
             when {
-                isInitializing -> {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(color = MaterialTheme.colors.primary)
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text(
-                                text = if (retryCount > 0) "Retrying... ($retryCount/$maxRetries)" else "Initializing browser...",
-                                color = MaterialTheme.colors.onBackground,
-                                fontSize = 14.sp
-                            )
-                        }
-                    }
-                }
                 error != null -> {
                     BrowserErrorContent(
                         error = error!!,
+                        isLoading = isInitializing,
                         onRetry = {
-                            error = null
+                            error = "Initializing browser..."
                             retryCount = 0
                             isInitializing = true
                         },
                         onResetTab = {
-                            // Full reset: clear all state and start fresh
-                            error = null
-                            retryCount = 0
-                            recoveryAttempts = 0
-                            browserHandle = null
-                            isInitializing = true
+                            // Open current URL in a new tab, then close this one
+                            val currentUrl = urlBarText.text.ifBlank { initialUrl }
+                            onOpenInNewTab(currentUrl)
+                            onCloseTab()
                         }
                     )
                 }
@@ -1725,13 +1714,14 @@ internal fun BrowserToolbar(
 }
 
 /**
- * Error content when browser fails to load.
- * Shows error message with Retry and Reset Tab buttons,
- * matching the bundled browser's BrowserErrorView.
+ * Error/loading content when browser fails to load or is initializing.
+ * Shows message with Retry and Reset Tab buttons.
+ * When isLoading=true, shows a spinner; otherwise shows a warning icon.
  */
 @Composable
 internal fun BrowserErrorContent(
     error: String,
+    isLoading: Boolean = false,
     onRetry: (() -> Unit)? = null,
     onResetTab: (() -> Unit)? = null
 ) {
@@ -1741,68 +1731,59 @@ internal fun BrowserErrorContent(
             .padding(32.dp),
         contentAlignment = Alignment.Center
     ) {
-        Card(
-            modifier = Modifier.fillMaxWidth(0.6f),
-            elevation = 4.dp,
-            backgroundColor = MaterialTheme.colors.surface
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Column(
-                modifier = Modifier.padding(32.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
+            if (isLoading) {
+                CircularProgressIndicator(
+                    color = MaterialTheme.colors.primary,
+                    modifier = Modifier.size(48.dp)
+                )
+            } else {
                 Icon(
                     imageVector = Icons.Default.Warning,
                     contentDescription = "Error",
                     tint = Color(0xFFFFA726),
                     modifier = Modifier.size(48.dp)
                 )
+            }
 
-                Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(16.dp))
 
-                Text(
-                    text = "Browser Error",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colors.onSurface
-                )
+            Text(
+                text = error,
+                fontSize = 14.sp,
+                color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f),
+                textAlign = TextAlign.Center
+            )
 
-                Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
-                Text(
-                    text = error,
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f),
-                    textAlign = TextAlign.Center
-                )
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (onRetry != null) {
-                        Button(
-                            onClick = onRetry,
-                            colors = ButtonDefaults.buttonColors(
-                                backgroundColor = MaterialTheme.colors.primary,
-                                contentColor = MaterialTheme.colors.onPrimary
-                            )
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Refresh,
-                                contentDescription = "Retry",
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Retry Loading")
-                        }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (onRetry != null) {
+                    Button(
+                        onClick = onRetry,
+                        colors = ButtonDefaults.buttonColors(
+                            backgroundColor = MaterialTheme.colors.primary,
+                            contentColor = MaterialTheme.colors.onPrimary
+                        )
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "Retry",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Retry Loading")
                     }
+                }
 
-                    if (onResetTab != null) {
-                        OutlinedButton(onClick = onResetTab) {
-                            Text("Reset Tab")
-                        }
+                if (onResetTab != null) {
+                    OutlinedButton(onClick = onResetTab) {
+                        Text("Reset Tab")
                     }
                 }
             }
