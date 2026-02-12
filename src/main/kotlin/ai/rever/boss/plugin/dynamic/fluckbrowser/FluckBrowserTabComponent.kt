@@ -688,10 +688,11 @@ internal fun FluckBrowserTabContent(
                             tabConfig = tabConfig,
                             workspaceName = "Default"
                         )
-                        provider.addBookmark("Bookmarks", bookmark)
+                        provider.addBookmark("Favorites", bookmark)
                         isBookmarked = true
                     }
                 } ?: run {
+                    println("📚 BOOKMARK: provider is null, fallback toggle")
                     // Fallback to simple toggle if provider not available
                     isBookmarked = !isBookmarked
                 }
@@ -899,7 +900,7 @@ internal fun FluckBrowserTabContent(
                                             tabConfig = tabConfig,
                                             workspaceName = "Default"
                                         )
-                                        provider.addBookmark("Bookmarks", bookmark)
+                                        provider.addBookmark("Favorites", bookmark)
                                         isBookmarked = true
                                     }
                                 }
