@@ -146,7 +146,7 @@ class FluckBrowserTabComponent(
                 tabTypeId = config.typeId,
                 dashboardContentProvider = pluginContext.dashboardContentProvider,
                 secretDataProvider = pluginContext.secretDataProvider,
-                bookmarkDataProvider = pluginContext.bookmarkDataProvider,
+                bookmarkDataProvider = pluginContext.getPluginAPI(BookmarkDataProvider::class.java) ?: pluginContext.bookmarkDataProvider,
                 activeTabsProvider = pluginContext.activeTabsProvider,
                 zoomSettingsProvider = pluginContext.zoomSettingsProvider,
                 urlHistoryProvider = pluginContext.urlHistoryProvider,
