@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "pluginId": "ai.rever.boss.plugin.dynamic.fluckbrowser",
   "displayName": "Fluck Browser",
-  "version": "1.0.16",
+  "version": "1.0.19",
   "apiVersion": "1.0.20",
   "mainClass": "ai.rever.boss.plugin.dynamic.fluckbrowser.FluckBrowserDynamicPlugin",
   "type": "tab",

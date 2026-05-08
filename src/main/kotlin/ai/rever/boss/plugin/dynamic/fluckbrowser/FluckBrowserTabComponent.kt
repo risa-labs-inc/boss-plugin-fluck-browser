@@ -121,10 +121,25 @@ class FluckBrowserTabComponent(
     // Store factory for lazy provider creation (provider created after tab is registered)
     private val tabUpdateProviderFactory: TabUpdateProviderFactory? = pluginContext.tabUpdateProviderFactory
 
+    // All persistent UI state is hoisted onto the Component, which survives
+    // tab switches. Otherwise each tab switch would dispose the JxBrowser
+    // instance AND drop every state field; even if the handle were
+    // preserved, the navigation/loading/title listeners attached on first
+    // create would keep writing into the now-dead state objects the OLD
+    // composition allocated, while the NEW composition saw stale defaults
+    // (e.g. error = "Initializing browser…", urlBarText = initialUrl) and
+    // never recovered.
+    //
+    // Disposal happens on lifecycle.onDestroy (i.e. tab close), not on
+    // transient composition exit.
+    internal val state = FluckBrowserTabState()
+
     init {
         lifecycle.subscribe(
             callbacks = object : Callbacks {
                 override fun onDestroy() {
+                    state.browserHandle?.dispose()
+                    state.browserHandle = null
                     coroutineScope.cancel()
                 }
             }
@@ -133,6 +148,7 @@ class FluckBrowserTabComponent(
 
     @Composable
     override fun Content() {
+        println("[FluckBrowser-DEBUG] browserService=${browserService}, isAvailable=${browserService?.isAvailable()}")
         if (browserService != null && browserService.isAvailable()) {
             // Extract initial URL from config - handle both FluckBrowserTabData and built-in FluckTabInfo
             val initialUrl = getInitialUrl(config)
@@ -141,6 +157,7 @@ class FluckBrowserTabComponent(
                 initialUrl = initialUrl,
                 browserService = browserService,
                 coroutineScope = coroutineScope,
+                hoistedState = state,
                 tabUpdateProviderFactory = tabUpdateProviderFactory,
                 tabId = config.id,
                 tabTypeId = config.typeId,
@@ -252,11 +269,44 @@ private fun processUrlInput(input: String): String {
  * Main browser tab content with URL bar, toolbar, and browser view.
  * Shows Dashboard for about:blank pages and browser content otherwise.
  */
+/**
+ * Persistent state for [FluckBrowserTabContent]. Owned by the parent
+ * [FluckBrowserTabComponent] so it survives tab switches — the host
+ * removes the inactive tab's Composable from composition, which would
+ * otherwise reset every `remember`-scoped field and dispose the
+ * BrowserHandle.
+ *
+ * The browser's navigation/loading/title listeners are wired against
+ * these fields once on first init; subsequent re-entries into
+ * composition just read the same observable state and the UI re-syncs
+ * without re-creating the browser.
+ */
+internal class FluckBrowserTabState {
+    var browserHandle: BrowserHandle? by mutableStateOf<BrowserHandle?>(null)
+    var isInitializing: Boolean by mutableStateOf(true)
+    var isLoading: Boolean by mutableStateOf(false)
+    var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
+    var pageTitle: String by mutableStateOf("New Tab")
+    var zoomLevel: Double by mutableStateOf(1.0)
+    var error: String? by mutableStateOf("Initializing browser...")
+    var canGoBack: Boolean by mutableStateOf(false)
+    var canGoForward: Boolean by mutableStateOf(false)
+    var isBookmarked: Boolean by mutableStateOf(false)
+    var navigationHistory: MutableList<Pair<String, String>> by mutableStateOf(mutableListOf())
+    var historyIndex: Int by mutableStateOf(-1)
+}
+
 @Composable
 internal fun FluckBrowserTabContent(
     initialUrl: String,
     browserService: BrowserService,
     coroutineScope: CoroutineScope,
+    /**
+     * Persistent state owned by the parent [FluckBrowserTabComponent].
+     * Survives tab switches so the JxBrowser instance and all UI state are
+     * reused instead of re-created on every re-entry into composition.
+     */
+    hoistedState: FluckBrowserTabState = remember { FluckBrowserTabState() },
     tabUpdateProviderFactory: TabUpdateProviderFactory? = null,
     tabId: String = "",
     tabTypeId: TabTypeId = TabTypeId("", ""),
@@ -270,21 +320,39 @@ internal fun FluckBrowserTabContent(
     onOpenInNewTab: (String) -> Unit = {},
     onCloseTab: () -> Unit = {}
 ) {
-    // Browser state - matches bundled browser exactly
-    var browserHandle by remember { mutableStateOf<BrowserHandle?>(null) }
-    var isInitializing by remember { mutableStateOf(true) }
-    var isLoading by remember { mutableStateOf(false) }
-    var urlBarText by remember { mutableStateOf(TextFieldValue(initialUrl, TextRange(initialUrl.length))) }
+    // Browser state — all hoisted into the parent Component so it survives
+    // tab switches. The JxBrowser instance, the listeners attached to it,
+    // and the observable state they write into all share the same lifetime
+    // (tab open → tab close), independent of how many times this Composable
+    // enters and leaves composition.
+    //
+    // First-time init: when the Component is freshly constructed,
+    // hoistedState.urlBarText is empty; we seed it from initialUrl.
+    LaunchedEffect(Unit) {
+        if (hoistedState.urlBarText.text.isEmpty()) {
+            hoistedState.urlBarText = TextFieldValue(initialUrl, TextRange(initialUrl.length))
+        }
+    }
+    // Property-reference delegation: `var x by ::y` compiles to direct
+    // get/set on hoistedState, so the local names below behave the same
+    // as before but their backing storage lives on the Component.
+    var browserHandle by hoistedState::browserHandle
+    var isInitializing by hoistedState::isInitializing
+    var isLoading by hoistedState::isLoading
+    var urlBarText by hoistedState::urlBarText
+    var pageTitle by hoistedState::pageTitle
+    var zoomLevel by hoistedState::zoomLevel
+    var error by hoistedState::error
+    var canGoBack by hoistedState::canGoBack
+    var canGoForward by hoistedState::canGoForward
+    var isBookmarked by hoistedState::isBookmarked
+    var navigationHistory by hoistedState::navigationHistory
+    var historyIndex by hoistedState::historyIndex
+
+    // Local-only state (not shared across composition) — derived/transient,
+    // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
-    var pageTitle by remember { mutableStateOf("New Tab") }
-    var zoomLevel by remember { mutableStateOf(1.0) }
-    var error by remember { mutableStateOf<String?>("Initializing browser...") }
-    var canGoBack by remember { mutableStateOf(false) }
-    var canGoForward by remember { mutableStateOf(false) }
-
-    // Bookmark state - check against actual bookmark provider
-    var isBookmarked by remember { mutableStateOf(false) }
 
     // URL history autocomplete state
     var showUrlSuggestions by remember { mutableStateOf(false) }
@@ -317,9 +385,7 @@ internal fun FluckBrowserTabContent(
     var recoveryAttempts by remember { mutableStateOf(0) }
     val maxRecoveryAttempts = 5
 
-    // Navigation history state - tracks back/forward history for persistence
-    var navigationHistory by remember { mutableStateOf<MutableList<Pair<String, String>>>(mutableListOf()) }
-    var historyIndex by remember { mutableStateOf(-1) }
+    // navigationHistory / historyIndex live on hoistedState (declared above).
 
     // Show dashboard for about:blank pages - matches bundled browser exactly
     val currentUrl = urlBarText.text
@@ -565,12 +631,12 @@ internal fun FluckBrowserTabContent(
         }
     }
 
-    // Cleanup on dispose
-    DisposableEffect(Unit) {
-        onDispose {
-            browserHandle?.dispose()
-        }
-    }
+    // No DisposableEffect for the BrowserHandle here. Disposing it on
+    // composition exit would kill the JxBrowser instance every time the
+    // host removes the inactive tab from the composition (i.e. on every
+    // tab switch), forcing a full reload on the next switch back. The
+    // handle is owned by the parent Component and disposed in its
+    // lifecycle.onDestroy callback (i.e. only on tab close).
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -1846,7 +1912,7 @@ internal fun FluckBrowserStubContent() {
                         Spacer(modifier = Modifier.height(8.dp))
 
                         Text(
-                            text = "The browser service is not available.",
+                            text = "The browser service is not available. This may be due to licensing or initialization issues.",
                             fontSize = 12.sp,
                             color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
                         )
