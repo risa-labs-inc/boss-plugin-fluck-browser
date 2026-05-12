@@ -527,9 +527,17 @@ internal fun FluckBrowserTabContent(
                     showContextMenu = true
                 }
 
-                // Set up callback for cmd+click and target="_blank" to open in new tab
-                handle.setOpenInNewTabCallback { url ->
-                    onOpenInNewTab(url)
+                // Set up callback for cmd+click and target="_blank" to open in new tab.
+                // Use the data-aware variant so form-submit popups (e.g. OncoEMR print)
+                // preserve their POST body across the handoff — without this, the
+                // destination server sees a GET and can't reconstruct the print job.
+                handle.setOpenInNewTabWithDataCallback { nav ->
+                    val body = nav.postData
+                    val contentType = nav.contentType
+                    if (body != null && contentType != null) {
+                        browserService.stashPopupPost(nav.url, body, contentType)
+                    }
+                    onOpenInNewTab(nav.url)
                 }
 
                 // Set up fullscreen handler for video fullscreen (e.g., YouTube)
@@ -1292,7 +1300,7 @@ private fun buildContextMenuItems(
         // Developer tools
         add(ContextMenuItem(
             text = "Inspect Element",
-            onClick = { }
+            onClick = { browserHandle?.showDevTools() }
         ))
     } else {
         // Default context menu
@@ -1384,7 +1392,7 @@ private fun buildContextMenuItems(
         // Developer tools (always at the end)
         add(ContextMenuItem(
             text = "Inspect Element",
-            onClick = { }
+            onClick = { browserHandle?.showDevTools() }
         ))
     }
 }
