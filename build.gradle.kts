@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.20"
+version = "1.0.23"
 
 java {
     toolchain {
@@ -34,7 +34,7 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.23.jar"))
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.36.jar"))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
