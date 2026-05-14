@@ -821,16 +821,6 @@ internal fun FluckBrowserTabContent(
             }
         )
 
-        // Loading indicator
-        if (isLoading) {
-            LinearProgressIndicator(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(2.dp),
-                color = MaterialTheme.colors.primary
-            )
-        }
-
         // Browser content or Dashboard
         Box(modifier = Modifier.fillMaxSize()) {
             when {
@@ -1027,6 +1017,18 @@ internal fun FluckBrowserTabContent(
                         }
                         showQuickCreateDialog = false
                     }
+                )
+            }
+
+            // Loading indicator — overlay at the top of the browser content area so
+            // the 2.dp bar doesn't shift everything below it on every reload.
+            if (isLoading) {
+                LinearProgressIndicator(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.dp)
+                        .align(Alignment.TopCenter),
+                    color = MaterialTheme.colors.primary
                 )
             }
         }
