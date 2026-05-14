@@ -726,6 +726,10 @@ internal fun FluckBrowserTabContent(
                 }
             },
             onNavigate = { url ->
+                // Reflect the resolved URL in the bar BEFORE kicking off the load so
+                // the user sees the autocomplete commit immediately instead of waiting
+                // for the browser's NavigationStarted event to round-trip.
+                urlBarText = TextFieldValue(url, TextRange(url.length))
                 // Clear editing state to allow URL bar updates during navigation
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
@@ -1637,14 +1641,21 @@ internal fun BrowserToolbar(
                                 }
                             }
                             keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Enter -> {
-                                // Matches bundled browser exactly
+                                // Resolve the URL the user actually wants. Priority:
+                                //  1. Explicitly selected dropdown item (arrow-key navigation).
+                                //  2. Inline autocomplete suggestion (ghost text shown after the cursor).
+                                //     Picks the first urlSuggestion, which is what the inline ghost
+                                //     was previewing. Enter should commit it instead of forcing the
+                                //     user to press Tab/Right first and then Enter.
+                                //  3. Plain typed text run through processUrlInput.
                                 val urlToLoad = when {
                                     selectedDropdownIndex >= 0 && selectedDropdownIndex < urlSuggestions.size -> {
-                                        // Use selected dropdown item
                                         urlSuggestions[selectedDropdownIndex].url
                                     }
+                                    autocompleteSuggestion != null && urlSuggestions.isNotEmpty() -> {
+                                        urlSuggestions.first().url
+                                    }
                                     else -> {
-                                        // Use what the user actually typed
                                         val input = urlBarText.text.trim()
                                         processUrlInput(input)
                                     }
