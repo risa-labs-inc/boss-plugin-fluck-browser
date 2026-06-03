@@ -292,6 +292,36 @@ internal object TabHibernation {
         System.getenv("BOSS_TAB_HIBERNATION")?.trim()?.lowercase() in listOf("1", "true", "yes", "on")
     val idleMs: Long =
         System.getenv("BOSS_TAB_HIBERNATION_IDLE_MS")?.trim()?.toLongOrNull() ?: (10 * 60 * 1000L)
+
+    // Memory-pressure-driven hibernation (roadmap Phase 3): when free system memory is scarce,
+    // hibernate idle background tabs much sooner to give memory back while it's needed. Only ever
+    // SHORTENS the wait for already-backgrounded tabs — the foreground tab never arms the timer
+    // (see the DisposableEffect), so responsiveness is unaffected. Tunable, fails safe to idleMs.
+    private val pressureIdleMs: Long =
+        System.getenv("BOSS_TAB_HIBERNATION_PRESSURE_IDLE_MS")?.trim()?.toLongOrNull() ?: 60_000L
+    private val pressureFreeFraction: Double =
+        System.getenv("BOSS_TAB_HIBERNATION_PRESSURE_FRACTION")?.trim()?.toDoubleOrNull() ?: 0.15
+
+    private val osBean: com.sun.management.OperatingSystemMXBean? =
+        (java.lang.management.ManagementFactory.getOperatingSystemMXBean()
+            as? com.sun.management.OperatingSystemMXBean)
+
+    /**
+     * The idle delay to use right now: the short pressure delay when free system memory is below
+     * [pressureFreeFraction] of total, otherwise the normal [idleMs]. Never longer than [idleMs].
+     */
+    fun effectiveIdleMs(): Long {
+        val os = osBean ?: return idleMs
+        return try {
+            val total = os.totalMemorySize
+            val free = os.freeMemorySize
+            if (total > 0 && free.toDouble() / total.toDouble() < pressureFreeFraction)
+                minOf(pressureIdleMs, idleMs)
+            else idleMs
+        } catch (e: Throwable) {
+            idleMs
+        }
+    }
 }
 
 internal class FluckBrowserTabState {
@@ -674,7 +704,7 @@ internal fun FluckBrowserTabContent(
         onDispose {
             if (TabHibernation.enabled && browserHandle != null) {
                 hoistedState.hibernationJob = coroutineScope.launch {
-                    delay(TabHibernation.idleMs)
+                    delay(TabHibernation.effectiveIdleMs())
                     browserHandle?.dispose()
                     browserHandle = null
                     isInitializing = true
