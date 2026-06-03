@@ -302,25 +302,41 @@ internal object TabHibernation {
     private val pressureFreeFraction: Double =
         System.getenv("BOSS_TAB_HIBERNATION_PRESSURE_FRACTION")?.trim()?.toDoubleOrNull() ?: 0.15
 
+    // Battery-aware (roadmap Phase 2). On battery, hibernate idle background tabs sooner to save
+    // power. The AC/battery signal is detected in the host (PowerSource) and published to the
+    // boss.power.onBattery system property — read here with no dependency on the host module.
+    // Gated behind the same BOSS_BATTERY_AWARE opt-in the host uses; off by default.
+    private val batteryAwareEnabled: Boolean =
+        System.getenv("BOSS_BATTERY_AWARE")?.trim()?.lowercase() in listOf("1", "true", "yes", "on")
+    private val batteryIdleMs: Long =
+        System.getenv("BOSS_TAB_HIBERNATION_BATTERY_IDLE_MS")?.trim()?.toLongOrNull() ?: (2 * 60 * 1000L)
+
     private val osBean: com.sun.management.OperatingSystemMXBean? =
         (java.lang.management.ManagementFactory.getOperatingSystemMXBean()
             as? com.sun.management.OperatingSystemMXBean)
 
     /**
-     * The idle delay to use right now: the short pressure delay when free system memory is below
-     * [pressureFreeFraction] of total, otherwise the normal [idleMs]. Never longer than [idleMs].
+     * The idle delay to use right now. Starts at the normal [idleMs] and takes the shortest of any
+     * applicable accelerant: the memory-pressure delay when free system memory is below
+     * [pressureFreeFraction] of total, and the battery delay when running on battery (opt-in). Only
+     * ever shortens — never exceeds [idleMs] — and fails safe to [idleMs] on any read error.
      */
     fun effectiveIdleMs(): Long {
-        val os = osBean ?: return idleMs
-        return try {
-            val total = os.totalMemorySize
-            val free = os.freeMemorySize
-            if (total > 0 && free.toDouble() / total.toDouble() < pressureFreeFraction)
-                minOf(pressureIdleMs, idleMs)
-            else idleMs
+        var delay = idleMs
+        try {
+            val os = osBean
+            if (os != null) {
+                val total = os.totalMemorySize
+                val free = os.freeMemorySize
+                if (total > 0 && free.toDouble() / total.toDouble() < pressureFreeFraction)
+                    delay = minOf(delay, pressureIdleMs)
+            }
         } catch (e: Throwable) {
-            idleMs
+            // keep current delay
         }
+        if (batteryAwareEnabled && System.getProperty("boss.power.onBattery") == "true")
+            delay = minOf(delay, batteryIdleMs)
+        return delay
     }
 }
 
