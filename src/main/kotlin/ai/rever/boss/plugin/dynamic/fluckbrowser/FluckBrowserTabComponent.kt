@@ -281,8 +281,69 @@ private fun processUrlInput(input: String): String {
  * composition just read the same observable state and the UI re-syncs
  * without re-creating the browser.
  */
+/**
+ * Tab hibernation (memory saver) configuration. When [enabled], a browser tab that's been in the
+ * background past [idleMs] disposes its live browser (freeing the Chromium process tree) and is
+ * recreated from its current URL when shown again. Gated off by default; opt in with
+ * BOSS_TAB_HIBERNATION=true so it can be dogfooded before it becomes the default.
+ */
+internal object TabHibernation {
+    val enabled: Boolean =
+        System.getenv("BOSS_TAB_HIBERNATION")?.trim()?.lowercase() in listOf("1", "true", "yes", "on")
+    val idleMs: Long =
+        System.getenv("BOSS_TAB_HIBERNATION_IDLE_MS")?.trim()?.toLongOrNull() ?: (10 * 60 * 1000L)
+
+    // Memory-pressure-driven hibernation (roadmap Phase 3): when free system memory is scarce,
+    // hibernate idle background tabs much sooner to give memory back while it's needed. Only ever
+    // SHORTENS the wait for already-backgrounded tabs — the foreground tab never arms the timer
+    // (see the DisposableEffect), so responsiveness is unaffected. Tunable, fails safe to idleMs.
+    private val pressureIdleMs: Long =
+        System.getenv("BOSS_TAB_HIBERNATION_PRESSURE_IDLE_MS")?.trim()?.toLongOrNull() ?: 60_000L
+    private val pressureFreeFraction: Double =
+        System.getenv("BOSS_TAB_HIBERNATION_PRESSURE_FRACTION")?.trim()?.toDoubleOrNull() ?: 0.15
+
+    // Battery-aware (roadmap Phase 2). On battery, hibernate idle background tabs sooner to save
+    // power. The AC/battery signal is detected in the host (PowerSource) and published to the
+    // boss.power.onBattery system property — read here with no dependency on the host module.
+    // Gated behind the same BOSS_BATTERY_AWARE opt-in the host uses; off by default.
+    private val batteryAwareEnabled: Boolean =
+        System.getenv("BOSS_BATTERY_AWARE")?.trim()?.lowercase() in listOf("1", "true", "yes", "on")
+    private val batteryIdleMs: Long =
+        System.getenv("BOSS_TAB_HIBERNATION_BATTERY_IDLE_MS")?.trim()?.toLongOrNull() ?: (2 * 60 * 1000L)
+
+    private val osBean: com.sun.management.OperatingSystemMXBean? =
+        (java.lang.management.ManagementFactory.getOperatingSystemMXBean()
+            as? com.sun.management.OperatingSystemMXBean)
+
+    /**
+     * The idle delay to use right now. Starts at the normal [idleMs] and takes the shortest of any
+     * applicable accelerant: the memory-pressure delay when free system memory is below
+     * [pressureFreeFraction] of total, and the battery delay when running on battery (opt-in). Only
+     * ever shortens — never exceeds [idleMs] — and fails safe to [idleMs] on any read error.
+     */
+    fun effectiveIdleMs(): Long {
+        var delay = idleMs
+        try {
+            val os = osBean
+            if (os != null) {
+                val total = os.totalMemorySize
+                val free = os.freeMemorySize
+                if (total > 0 && free.toDouble() / total.toDouble() < pressureFreeFraction)
+                    delay = minOf(delay, pressureIdleMs)
+            }
+        } catch (e: Throwable) {
+            // keep current delay
+        }
+        if (batteryAwareEnabled && System.getProperty("boss.power.onBattery") == "true")
+            delay = minOf(delay, batteryIdleMs)
+        return delay
+    }
+}
+
 internal class FluckBrowserTabState {
     var browserHandle: BrowserHandle? by mutableStateOf<BrowserHandle?>(null)
+    // Pending idle-hibernation timer (armed when the tab is backgrounded, cancelled if it returns).
+    var hibernationJob: kotlinx.coroutines.Job? = null
     var isInitializing: Boolean by mutableStateOf(true)
     var isLoading: Boolean by mutableStateOf(false)
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
@@ -415,8 +476,10 @@ internal fun FluckBrowserTabContent(
 
             // Short timeout - if engine can't create a browser quickly, show error view
             val handle = kotlinx.coroutines.withTimeoutOrNull(3_000L) {
+                // Recreate at the CURRENT url (preserved in hoisted state), so a hibernation wake
+                // or crash-recovery returns to the page the user was on, not the tab's first URL.
                 browserService.createBrowser(
-                    BrowserConfig(url = initialUrl)
+                    BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
                 )
             }
             if (handle != null) {
@@ -639,6 +702,32 @@ internal fun FluckBrowserTabContent(
         }
     }
 
+    // No *immediate* DisposableEffect-disposal of the BrowserHandle here. Disposing it on every
+    // composition exit would kill the JxBrowser instance on every tab switch, forcing a full
+    // reload on the next switch back. The handle is owned by the parent Component and disposed in
+    // its lifecycle.onDestroy callback (i.e. only on tab close).
+    //
+    // Tab hibernation (memory saver), gated off by default. When a tab is backgrounded (this
+    // Composable leaves composition on a tab switch), arm an idle timer on the Component's
+    // surviving coroutineScope; if the tab is still in the background when it fires, dispose the
+    // live browser to free its Chromium process tree. The hoisted state (current URL, title,
+    // history) survives, so returning to the tab recreates the browser at the current URL via the
+    // create effect above (which runs on composition re-entry whenever browserHandle == null).
+    // Showing the tab again before the timer fires cancels it — no reload, no cost.
+    DisposableEffect(Unit) {
+        hoistedState.hibernationJob?.cancel()
+        hoistedState.hibernationJob = null
+        onDispose {
+            if (TabHibernation.enabled && browserHandle != null) {
+                hoistedState.hibernationJob = coroutineScope.launch {
+                    delay(TabHibernation.effectiveIdleMs())
+                    browserHandle?.dispose()
+                    browserHandle = null
+                    isInitializing = true
+                }
+            }
+        }
+    }
     // Keep the URL-bar star in sync with external collection edits — e.g. when the
     // user removes a bookmark from the bookmarks panel, isBookmarked must reflect that.
     val bookmarkCollections = bookmarkDataProvider?.collections?.collectAsState(initial = emptyList())?.value
