@@ -466,7 +466,7 @@ internal fun FluckBrowserTabContent(
                     // Check if URL is bookmarked
                     bookmarkDataProvider?.let { provider ->
                         val tabConfig = ai.rever.boss.plugin.workspace.TabConfig(
-                            type = "fluck",
+                            type = "browser",
                             title = pageTitle,
                             url = url
                         )
@@ -639,6 +639,20 @@ internal fun FluckBrowserTabContent(
         }
     }
 
+    // Keep the URL-bar star in sync with external collection edits — e.g. when the
+    // user removes a bookmark from the bookmarks panel, isBookmarked must reflect that.
+    val bookmarkCollections = bookmarkDataProvider?.collections?.collectAsState(initial = emptyList())?.value
+    LaunchedEffect(bookmarkCollections, currentUrl, pageTitle, bookmarkDataProvider) {
+        bookmarkDataProvider?.let { provider ->
+            val tabConfig = ai.rever.boss.plugin.workspace.TabConfig(
+                type = "browser",
+                title = pageTitle,
+                url = currentUrl
+            )
+            isBookmarked = provider.isTabBookmarked(tabConfig)
+        }
+    }
+
     // No DisposableEffect for the BrowserHandle here. Disposing it on
     // composition exit would kill the JxBrowser instance every time the
     // host removes the inactive tab from the composition (i.e. on every
@@ -758,7 +772,7 @@ internal fun FluckBrowserTabContent(
                 // Add or remove bookmark using the host API
                 bookmarkDataProvider?.let { provider ->
                     val tabConfig = TabConfig(
-                        type = "fluck",
+                        type = "browser",
                         title = pageTitle,
                         url = currentUrl
                     )
@@ -771,13 +785,19 @@ internal fun FluckBrowserTabContent(
                         }
                         isBookmarked = false
                     } else {
-                        // Add bookmark to default collection
-                        val bookmark = Bookmark(
-                            tabConfig = tabConfig,
-                            workspaceName = "Default"
-                        )
-                        provider.addBookmark("Favorites", bookmark)
-                        isBookmarked = true
+                        // Add bookmark to the favorites collection (by isFavorite flag, not literal name).
+                        // Falls back to the first available collection so the save never silently no-ops
+                        // when the user has renamed/removed "Favorites".
+                        val target = provider.collections.value.firstOrNull { it.isFavorite }
+                            ?: provider.collections.value.firstOrNull()
+                        if (target != null) {
+                            val bookmark = Bookmark(
+                                tabConfig = tabConfig,
+                                workspaceName = "Default"
+                            )
+                            provider.addBookmark(target.name, bookmark)
+                            isBookmarked = true
+                        }
                     }
                 } ?: run {
                     println("📚 BOOKMARK: provider is null, fallback toggle")
@@ -949,7 +969,7 @@ internal fun FluckBrowserTabContent(
                                 // Add or remove bookmark using the host API
                                 bookmarkDataProvider?.let { provider ->
                                     val tabConfig = TabConfig(
-                                        type = "fluck",
+                                        type = "browser",
                                         title = pageTitle,
                                         url = currentUrl
                                     )
@@ -962,13 +982,19 @@ internal fun FluckBrowserTabContent(
                                         }
                                         isBookmarked = false
                                     } else {
-                                        // Add bookmark to default collection
-                                        val bookmark = Bookmark(
-                                            tabConfig = tabConfig,
-                                            workspaceName = "Default"
-                                        )
-                                        provider.addBookmark("Favorites", bookmark)
-                                        isBookmarked = true
+                                        // Add bookmark to the favorites collection (by isFavorite flag,
+                                        // not literal name). Falls back to the first available collection
+                                        // so the save never silently no-ops when "Favorites" was renamed.
+                                        val target = provider.collections.value.firstOrNull { it.isFavorite }
+                                            ?: provider.collections.value.firstOrNull()
+                                        if (target != null) {
+                                            val bookmark = Bookmark(
+                                                tabConfig = tabConfig,
+                                                workspaceName = "Default"
+                                            )
+                                            provider.addBookmark(target.name, bookmark)
+                                            isBookmarked = true
+                                        }
                                     }
                                 }
                             }
