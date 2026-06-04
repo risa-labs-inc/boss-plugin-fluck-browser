@@ -825,8 +825,13 @@ internal fun FluckBrowserTabContent(
             }
         )
 
-        // Browser content or Dashboard
-        Box(modifier = Modifier.fillMaxSize()) {
+        // Browser content or Dashboard.
+        // weight(1f) (instead of fillMaxSize) reserves exactly the height REMAINING below the
+        // BrowserToolbar. In HARDWARE_ACCELERATED mode the browser is a heavyweight native
+        // surface whose on-screen bounds track this composable; a fillMaxSize child can be
+        // measured against the Column's full height and let that surface extend up over the
+        // lightweight URL bar (the Windows overlap). Weighting bounds it to the area under the bar.
+        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
             when {
                 error != null -> {
                     BrowserErrorContent(
