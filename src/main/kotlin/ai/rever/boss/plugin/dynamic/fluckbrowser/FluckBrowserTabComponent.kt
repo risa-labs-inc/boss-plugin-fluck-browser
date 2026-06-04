@@ -529,7 +529,7 @@ internal fun FluckBrowserTabContent(
                     // Check if URL is bookmarked
                     bookmarkDataProvider?.let { provider ->
                         val tabConfig = ai.rever.boss.plugin.workspace.TabConfig(
-                            type = "fluck",
+                            type = "browser",
                             title = pageTitle,
                             url = url
                         )
@@ -728,6 +728,26 @@ internal fun FluckBrowserTabContent(
             }
         }
     }
+    // Keep the URL-bar star in sync with external collection edits — e.g. when the
+    // user removes a bookmark from the bookmarks panel, isBookmarked must reflect that.
+    val bookmarkCollections = bookmarkDataProvider?.collections?.collectAsState(initial = emptyList())?.value
+    LaunchedEffect(bookmarkCollections, currentUrl, pageTitle, bookmarkDataProvider) {
+        bookmarkDataProvider?.let { provider ->
+            val tabConfig = ai.rever.boss.plugin.workspace.TabConfig(
+                type = "browser",
+                title = pageTitle,
+                url = currentUrl
+            )
+            isBookmarked = provider.isTabBookmarked(tabConfig)
+        }
+    }
+
+    // No DisposableEffect for the BrowserHandle here. Disposing it on
+    // composition exit would kill the JxBrowser instance every time the
+    // host removes the inactive tab from the composition (i.e. on every
+    // tab switch), forcing a full reload on the next switch back. The
+    // handle is owned by the parent Component and disposed in its
+    // lifecycle.onDestroy callback (i.e. only on tab close).
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -841,7 +861,7 @@ internal fun FluckBrowserTabContent(
                 // Add or remove bookmark using the host API
                 bookmarkDataProvider?.let { provider ->
                     val tabConfig = TabConfig(
-                        type = "fluck",
+                        type = "browser",
                         title = pageTitle,
                         url = currentUrl
                     )
@@ -854,13 +874,19 @@ internal fun FluckBrowserTabContent(
                         }
                         isBookmarked = false
                     } else {
-                        // Add bookmark to default collection
-                        val bookmark = Bookmark(
-                            tabConfig = tabConfig,
-                            workspaceName = "Default"
-                        )
-                        provider.addBookmark("Favorites", bookmark)
-                        isBookmarked = true
+                        // Add bookmark to the favorites collection (by isFavorite flag, not literal name).
+                        // Falls back to the first available collection so the save never silently no-ops
+                        // when the user has renamed/removed "Favorites".
+                        val target = provider.collections.value.firstOrNull { it.isFavorite }
+                            ?: provider.collections.value.firstOrNull()
+                        if (target != null) {
+                            val bookmark = Bookmark(
+                                tabConfig = tabConfig,
+                                workspaceName = "Default"
+                            )
+                            provider.addBookmark(target.name, bookmark)
+                            isBookmarked = true
+                        }
                     }
                 } ?: run {
                     println("📚 BOOKMARK: provider is null, fallback toggle")
@@ -908,8 +934,13 @@ internal fun FluckBrowserTabContent(
             }
         )
 
-        // Browser content or Dashboard
-        Box(modifier = Modifier.fillMaxSize()) {
+        // Browser content or Dashboard.
+        // weight(1f) (instead of fillMaxSize) reserves exactly the height REMAINING below the
+        // BrowserToolbar. In HARDWARE_ACCELERATED mode the browser is a heavyweight native
+        // surface whose on-screen bounds track this composable; a fillMaxSize child can be
+        // measured against the Column's full height and let that surface extend up over the
+        // lightweight URL bar (the Windows overlap). Weighting bounds it to the area under the bar.
+        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
             when {
                 error != null -> {
                     BrowserErrorContent(
@@ -1032,7 +1063,7 @@ internal fun FluckBrowserTabContent(
                                 // Add or remove bookmark using the host API
                                 bookmarkDataProvider?.let { provider ->
                                     val tabConfig = TabConfig(
-                                        type = "fluck",
+                                        type = "browser",
                                         title = pageTitle,
                                         url = currentUrl
                                     )
@@ -1045,13 +1076,19 @@ internal fun FluckBrowserTabContent(
                                         }
                                         isBookmarked = false
                                     } else {
-                                        // Add bookmark to default collection
-                                        val bookmark = Bookmark(
-                                            tabConfig = tabConfig,
-                                            workspaceName = "Default"
-                                        )
-                                        provider.addBookmark("Favorites", bookmark)
-                                        isBookmarked = true
+                                        // Add bookmark to the favorites collection (by isFavorite flag,
+                                        // not literal name). Falls back to the first available collection
+                                        // so the save never silently no-ops when "Favorites" was renamed.
+                                        val target = provider.collections.value.firstOrNull { it.isFavorite }
+                                            ?: provider.collections.value.firstOrNull()
+                                        if (target != null) {
+                                            val bookmark = Bookmark(
+                                                tabConfig = tabConfig,
+                                                workspaceName = "Default"
+                                            )
+                                            provider.addBookmark(target.name, bookmark)
+                                            isBookmarked = true
+                                        }
                                     }
                                 }
                             }
