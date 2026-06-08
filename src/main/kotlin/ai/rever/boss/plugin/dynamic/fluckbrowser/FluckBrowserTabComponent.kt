@@ -131,63 +131,25 @@ class FluckBrowserTabComponent(
         )
     }
 
-    @Composable
-    private fun RenderRemoteBrowser(tabId: String, windowId: String, initialUrl: String) {
-        val composer = androidx.compose.runtime.currentComposer
-        val remoteBrowserMethod = remember(tabId, windowId, initialUrl) {
-            try {
-                val cls = Class.forName("ai.rever.boss.components.plugin.tab_types.fluck.RemoteBrowserTabComponentKt")
-                val method = cls.getMethod(
-                    "RemoteBrowserTabComponent",
-                    String::class.java,
-                    String::class.java,
-                    String::class.java,
-                    androidx.compose.ui.Modifier::class.java,
-                    androidx.compose.runtime.Composer::class.java,
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType
-                )
-                Result.success(method)
-            } catch (e: Exception) {
-                Result.failure<java.lang.reflect.Method>(e)
-            }
-        }
-        
-        remoteBrowserMethod.fold(
-            onSuccess = { method ->
-                method.invoke(null, tabId, windowId, initialUrl, androidx.compose.ui.Modifier, composer, 0, 8)
-            },
-            onFailure = { e ->
-                Text("Error loading remote browser component: ${e.message}", color = Color.Red)
-            }
-        )
-    }
+    // Host browser provider — typed seam exposed by the platform. Non-null only
+    // when the platform compiled remote-host support. The plugin renders the
+    // remote browser through this provider (no gRPC/HostRegistry reflection).
+    private val hostBrowserProvider = pluginContext.hostBrowserProvider
 
     @Composable
     override fun Content() {
         var isRemote by remember { mutableStateOf(false) }
-        LaunchedEffect(pluginContext.windowId) {
-            try {
-                val hostRegistryClass = Class.forName("ai.rever.boss.host.registry.HostRegistry")
-                val hostRegistryInstance = hostRegistryClass.getField("INSTANCE").get(null)
-                val activeHostForMethod = hostRegistryClass.getMethod("activeHostFor", String::class.java)
-                val activeHostStateFlow = activeHostForMethod.invoke(hostRegistryInstance, pluginContext.windowId) as kotlinx.coroutines.flow.Flow<*>
-                
-                activeHostStateFlow.collect { host ->
-                    if (host != null) {
-                        val isRemoteMethod = host.javaClass.getMethod("isRemote")
-                        isRemote = isRemoteMethod.invoke(host) as Boolean
-                    }
-                }
-            } catch (e: Exception) {
-                isRemote = false
-            }
+        LaunchedEffect(hostBrowserProvider) {
+            hostBrowserProvider?.observeIsRemote()?.collect { isRemote = it }
         }
 
-        if (isRemote) {
-            val initialUrl = getInitialUrl(config)
-            val windowId = pluginContext.windowId ?: ""
-            RenderRemoteBrowser(tabId = config.id, windowId = windowId, initialUrl = initialUrl)
+        val provider = hostBrowserProvider
+        if (isRemote && provider != null) {
+            RemoteBrowserTabComponent(
+                provider = provider,
+                tabId = config.id,
+                initialUrl = getInitialUrl(config),
+            )
         } else if (browserService != null && browserService.isAvailable()) {
             // Extract initial URL from config - handle both FluckBrowserTabData and built-in FluckTabInfo
             val initialUrl = getInitialUrl(config)
