@@ -60,6 +60,7 @@ object BrowserShareManager {
     @Volatile private var context: PluginContext? = null
     @Volatile private var engine: EmbeddedServer<*, *>? = null
     @Volatile private var boundPort: Int? = null
+    @Volatile private var boundHost: String? = null
     @Volatile private var session: BrowserMirrorShare? = null
 
     /** Live registry of shareable (fluck) browser tabs → their handles. */
@@ -95,7 +96,7 @@ object BrowserShareManager {
         req.decision.complete(approve)
     }
 
-    private suspend fun awaitApproval(deviceName: String, wantsControl: Boolean): Boolean {
+    internal suspend fun awaitApproval(deviceName: String, wantsControl: Boolean): Boolean {
         val req = PendingShareRequest(UUID.randomUUID().toString(), deviceName, wantsControl)
         _pendingRequests.value = _pendingRequests.value + req
         val ok = withTimeoutOrNull(2 * 60_000L) { req.decision.await() } ?: false
@@ -118,6 +119,7 @@ object BrowserShareManager {
             val e = engine
             engine = null
             boundPort = null
+            boundHost = null
             if (e != null) scope.launch { runCatching { e.stop(300, 1000) } }
         }
         _pendingRequests.value.forEach { it.decision.complete(false) }
@@ -145,24 +147,30 @@ object BrowserShareManager {
         val e2eCode: String?,
         val secure: Boolean,
         val sessionName: String,
+        val maskInputs: Boolean,
     )
 
     fun isSharing(): Boolean = session != null
 
     /** Begin (or refresh) sharing, focusing [tabId] first. Returns the share links. */
-    fun share(tabId: String): ShareInfo? = synchronized(lock) {
+    fun share(tabId: String, maskInputs: Boolean = false): ShareInfo? = synchronized(lock) {
         if (!ensureServerLocked()) return null
         val s = ensureSessionLocked()
         s.initialActiveTabId = tabId
+        s.setMaskInputs(maskInputs)
         s.refreshLayout()
         val port = boundPort ?: return null
         val secretB64 = s.sessionSecretB64
+        val viewUrl = buildUrl(s.viewToken, secretB64, port)
+        val controlUrl = buildUrl(s.controlToken, secretB64, port)
+        val e2e = viewUrl.contains("#k=")
         ShareInfo(
-            viewUrl = "http://localhost:$port/?t=${s.viewToken}#k=$secretB64",
-            controlUrl = "http://localhost:$port/?t=${s.controlToken}#k=$secretB64",
-            e2eCode = BrowserSessionCrypto.fingerprint(s.sessionSecret),
-            secure = true,
+            viewUrl = viewUrl,
+            controlUrl = controlUrl,
+            e2eCode = if (e2e) BrowserSessionCrypto.fingerprint(s.sessionSecret) else null,
+            secure = e2e,
             sessionName = s.sessionName,
+            maskInputs = maskInputs,
         )
     }
 
@@ -215,7 +223,7 @@ object BrowserShareManager {
 
     private fun ensureServerLocked(): Boolean {
         if (engine != null) return true
-        val host = "127.0.0.1"
+        val host = resolveBindHost()
         for (offset in 0 until MAX_PORT_FALLBACK) {
             val port = DEFAULT_PORT + offset
             if (port > 65535) break
@@ -236,6 +244,7 @@ object BrowserShareManager {
                 started.start(wait = false)
                 engine = started
                 boundPort = port
+                boundHost = host
                 log.info("Co-browse server bound on $host:$port")
                 return true
             } catch (e: Throwable) {
@@ -291,6 +300,16 @@ object BrowserShareManager {
             if (helloText == null) { ws.close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "Wrong or missing encryption key")); return }
             hello = decodeClient(helloText) as? ClientMessage.Hello
         } else {
+            // Plaintext first frame is fine on loopback/LAN-http (no relay, no WebCrypto), but
+            // over a public/https reach it must be refused so nothing streams unencrypted.
+            if (requireE2E()) {
+                runCatching {
+                    ws.send(Frame.Text(encodeServer(ServerMessage.Denied(
+                        "This shared session is end-to-end encrypted. Open it over the secure link."))))
+                }
+                ws.close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "Encryption required"))
+                return
+            }
             hello = (first as? Frame.Text)?.let { decodeClient(it.readText()) } as? ClientMessage.Hello
         }
 
@@ -376,6 +395,59 @@ object BrowserShareManager {
     }
 
     // --- Helpers ---
+
+    // --- Bind / advertise / E2E (config via -Dboss.cobrowse.* or BOSS_COBROWSE_* env) ---
+
+    private fun cfg(prop: String, env: String, default: String): String =
+        System.getProperty(prop)?.takeIf { it.isNotBlank() }
+            ?: System.getenv(env)?.takeIf { it.isNotBlank() }
+            ?: default
+    private fun bindMode(): String = cfg("boss.cobrowse.bind", "BOSS_COBROWSE_BIND", "loopback").lowercase()
+    private fun customBindHost(): String = cfg("boss.cobrowse.bindHost", "BOSS_COBROWSE_BIND_HOST", "")
+    private fun publicUrl(): String = cfg("boss.cobrowse.publicUrl", "BOSS_COBROWSE_PUBLIC_URL", "")
+
+    private fun resolveBindHost(): String = when (bindMode()) {
+        "lan" -> "0.0.0.0"
+        "custom" -> customBindHost().ifBlank { "127.0.0.1" }
+        else -> "127.0.0.1"
+    }
+
+    private fun advertisedHost(): String {
+        val bound = boundHost ?: "127.0.0.1"
+        if (bound != "0.0.0.0") return bound
+        return siteLocalIpv4() ?: "localhost"
+    }
+
+    private fun siteLocalIpv4(): String? = runCatching {
+        java.net.NetworkInterface.getNetworkInterfaces().asSequence()
+            .filter { it.isUp && !it.isLoopback && !it.isVirtual }
+            .flatMap { it.inetAddresses.asSequence() }
+            .filterIsInstance<java.net.Inet4Address>()
+            .firstOrNull { it.isSiteLocalAddress }?.hostAddress
+    }.getOrNull()
+
+    private fun hostOf(url: String): String = runCatching { java.net.URI(url).host ?: "" }.getOrDefault("")
+
+    /** True when a browser opening [url] has WebCrypto (secure context: https or loopback). */
+    private fun e2eCapable(url: String): Boolean {
+        if (url.startsWith("https://", ignoreCase = true)) return true
+        val h = hostOf(url).lowercase()
+        return h == "localhost" || h == "::1" || h.startsWith("127.")
+    }
+
+    /** Refuse plaintext when reachable via a public/https URL (anti-downgrade). */
+    private fun requireE2E(): Boolean {
+        val pub = publicUrl()
+        return pub.isNotBlank() && e2eCapable(pub)
+    }
+
+    /** Build a share URL; append the #k secret only when the context can do WebCrypto. */
+    private fun buildUrl(token: String, secretB64: String, port: Int): String {
+        val pub = publicUrl()
+        val base = if (pub.isNotBlank()) "${pub.trimEnd('/')}/?t=$token"
+                   else "http://${advertisedHost()}:$port/?t=$token"
+        return if (e2eCapable(base)) "$base#k=$secretB64" else base
+    }
 
     private fun newToken(): String = ByteArray(16).also { rng.nextBytes(it) }.let { b64Url.encodeToString(it) }
 

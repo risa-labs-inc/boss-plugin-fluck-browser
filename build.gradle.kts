@@ -68,6 +68,11 @@ dependencies {
     implementation("io.ktor:ktor-server-websockets:3.4.3")
     // Serialization runtime is provided by the host (parent-first) — compile only.
     compileOnly("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+
+    // Tests
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.3.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
 }
 
 // Task to build plugin JAR with compiled classes only

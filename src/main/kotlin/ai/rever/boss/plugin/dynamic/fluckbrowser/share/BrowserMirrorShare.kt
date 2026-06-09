@@ -58,6 +58,9 @@ class BrowserMirrorShare(
 
     @Volatile private var activeStreamTabId: String? = null
     @Volatile private var anyController = false
+    // rrweb maskAllInputs for this session; re-applied by restarting the active capture.
+    @Volatile var maskInputs: Boolean = false
+        private set
     /** The tab to focus first (set by share()); used when the first viewer connects. */
     @Volatile var initialActiveTabId: String? = null
 
@@ -123,6 +126,13 @@ class BrowserMirrorShare(
         }
     }
 
+    /** Set rrweb input masking for the session; restarts the active capture to apply. */
+    fun setMaskInputs(enabled: Boolean) = synchronized(streamLock) {
+        if (maskInputs == enabled) return@synchronized
+        maskInputs = enabled
+        activeStreamTabId?.let { setActiveStream(it, forceRestart = true) }
+    }
+
     /** Grant control to a viewer mid-session (after host approval). */
     fun grantControl(vc: ViewerConnection) {
         synchronized(streamLock) {
@@ -148,11 +158,14 @@ class BrowserMirrorShare(
         // Tell viewers to reset their replayer before the fresh snapshot arrives.
         broadcast(ServerMessage.DomFocusAck(tabId))
         // Start capture; rrweb emits Meta + FullSnapshot first, then incrementals.
-        handle.startCoBrowseCapture { json ->
-            // Runs on a JxBrowser thread — non-blocking enqueue only.
-            val text = encode(ServerMessage.DomMutation(tabId, json))
-            viewers.forEach { runCatching { it.outbox.trySend(text) } }
-        }
+        handle.startCoBrowseCapture(
+            onEvent = { json ->
+                // Runs on a JxBrowser thread — non-blocking enqueue only.
+                val text = encode(ServerMessage.DomMutation(tabId, json))
+                viewers.forEach { runCatching { it.outbox.trySend(text) } }
+            },
+            maskInputs = maskInputs,
+        )
         handle.setCoBrowseControlEnabled(anyController)
         attachNavListeners(tabId, handle)
         pushNavStatus(tabId, handle)

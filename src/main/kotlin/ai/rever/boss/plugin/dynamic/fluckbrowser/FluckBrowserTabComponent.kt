@@ -24,8 +24,6 @@ import ai.rever.boss.plugin.browser.BrowserConfig
 import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
 import ai.rever.boss.plugin.browser.BrowserHandle
 import ai.rever.boss.plugin.browser.BrowserService
-import ai.rever.boss.plugin.api.NotificationDuration
-import ai.rever.boss.plugin.api.NotificationType
 import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -45,6 +43,8 @@ import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.runtime.*
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -151,32 +151,24 @@ class FluckBrowserTabComponent(
     }
 
     /**
-     * Start (or refresh) co-browse sharing of THIS tab. Copies the view link to
-     * the clipboard and toasts the E2E verification code; the action button copies
-     * the control link. Viewers are gated by host approval before anything streams.
+     * Prompt for a co-browse share link and open it as a remote-browser tab
+     * (the web viewer renders inside a JxBrowser tab — no native renderer).
      */
-    private fun shareCurrentTab() {
-        val info = BrowserShareManager.share(config.id)
-        val notifier = pluginContext.notificationProvider
-        if (info == null) {
-            notifier?.showError("Could not start browser sharing", title = "Browser tab sharing")
+    private fun connectToRemote() {
+        val dialogs = pluginContext.genericDialogProvider
+        val tabs = pluginContext.activeTabsProvider
+        if (dialogs == null || tabs == null) {
+            pluginContext.notificationProvider?.showError("Remote browser is not available here")
             return
         }
-        copyToClipboard(info.viewUrl)
-        notifier?.showToast(
-            message = "View link copied. Viewers need your approval. Verify code: ${info.e2eCode}",
-            type = NotificationType.SUCCESS,
-            duration = NotificationDuration.LONG,
-            title = "Sharing \"${info.sessionName}\"",
-            actionLabel = "Copy control link",
-            onAction = { copyToClipboard(info.controlUrl) }
-        )
-    }
-
-    private fun copyToClipboard(text: String) {
-        runCatching {
-            java.awt.Toolkit.getDefaultToolkit().systemClipboard
-                .setContents(java.awt.datatransfer.StringSelection(text), null)
+        coroutineScope.launch {
+            val link = dialogs.showTextInputDialog(
+                title = "Connect to remote browser",
+                message = "Paste a co-browse share link from another BOSS.",
+                placeholder = "http://…/?t=…#k=…",
+                validation = { v -> if (v.isBlank() || !v.contains("/?t=")) "Enter a valid co-browse link" else null }
+            ) ?: return@launch
+            tabs.createBrowserTab(link.trim(), "Remote browser")
         }
     }
 
@@ -188,7 +180,7 @@ class FluckBrowserTabComponent(
             val initialUrl = getInitialUrl(config)
 
             FluckBrowserTabContent(
-                onShareTab = { shareCurrentTab() },
+                onConnectRemote = { connectToRemote() },
                 initialUrl = initialUrl,
                 browserService = browserService,
                 coroutineScope = coroutineScope,
@@ -333,7 +325,7 @@ internal class FluckBrowserTabState {
 
 @Composable
 internal fun FluckBrowserTabContent(
-    onShareTab: () -> Unit = {},
+    onConnectRemote: () -> Unit = {},
     initialUrl: String,
     browserService: BrowserService,
     coroutineScope: CoroutineScope,
@@ -389,6 +381,21 @@ internal fun FluckBrowserTabContent(
     // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
+
+    // Co-browse share dialog state (null = closed).
+    var shareDialogInfo by remember { mutableStateOf<BrowserShareManager.ShareInfo?>(null) }
+    var shareMaskInputs by remember { mutableStateOf(false) }
+    shareDialogInfo?.let { info ->
+        ShareLinkDialog(
+            info = info,
+            maskInputs = shareMaskInputs,
+            onToggleMask = { checked ->
+                shareMaskInputs = checked
+                BrowserShareManager.share(tabId, checked)?.let { shareDialogInfo = it }
+            },
+            onDismiss = { shareDialogInfo = null },
+        )
+    }
 
     // URL history autocomplete state
     var showUrlSuggestions by remember { mutableStateOf(false) }
@@ -725,7 +732,8 @@ internal fun FluckBrowserTabContent(
         ) {
         // URL bar with navigation controls
         BrowserToolbar(
-            onShare = onShareTab,
+            onShare = { BrowserShareManager.share(tabId, shareMaskInputs)?.let { shareDialogInfo = it } },
+            onConnectRemote = onConnectRemote,
             urlBarText = urlBarText,
             onUrlBarTextChange = { newValue ->
                 isUserEditingUrl = true
@@ -1557,6 +1565,55 @@ private fun copyToClipboard(text: String) {
  * Design matches the main implementation with inline autocomplete and keyboard navigation.
  */
 @Composable
+private fun ShareLinkDialog(
+    info: BrowserShareManager.ShareInfo,
+    maskInputs: Boolean,
+    onToggleMask: (Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val clipboard = LocalClipboardManager.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Share \"${info.sessionName}\"") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Viewers must be approved on this device before anything streams.",
+                    style = MaterialTheme.typography.caption
+                )
+                info.e2eCode?.let {
+                    Text("\uD83D\uDD12 Verify code: $it", style = MaterialTheme.typography.caption)
+                }
+                ShareLinkRow("View link", info.viewUrl) { clipboard.setText(AnnotatedString(info.viewUrl)) }
+                ShareLinkRow("Control link", info.controlUrl) { clipboard.setText(AnnotatedString(info.controlUrl)) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = maskInputs, onCheckedChange = onToggleMask)
+                    Text("Mask typed input (hide form values)", style = MaterialTheme.typography.body2)
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
+    )
+}
+
+@Composable
+private fun ShareLinkRow(label: String, url: String, onCopy: () -> Unit) {
+    Column {
+        Text(label, style = MaterialTheme.typography.caption, color = MaterialTheme.colors.primary)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                url,
+                style = MaterialTheme.typography.body2,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = onCopy) { Text("Copy") }
+        }
+    }
+}
+
+@Composable
 internal fun BrowserToolbar(
     urlBarText: TextFieldValue,
     onUrlBarTextChange: (TextFieldValue) -> Unit,
@@ -1583,7 +1640,8 @@ internal fun BrowserToolbar(
     onAcceptAutocomplete: () -> Unit = {},
     onSelectedDropdownIndexChange: (Int) -> Unit = {},
     onFocusLost: () -> Unit = {},
-    onShare: (() -> Unit)? = null
+    onShare: (() -> Unit)? = null,
+    onConnectRemote: (() -> Unit)? = null
 ) {
     val coroutineScope = rememberCoroutineScope()
     // Auto-scroll to selected suggestion when using arrow keys
@@ -1609,6 +1667,21 @@ internal fun BrowserToolbar(
                 Icon(
                     imageVector = Icons.Filled.Share,
                     contentDescription = "Share this tab",
+                    tint = Color(0xFFCCCCCC),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+
+        // Connect to a remote (co-browse) session.
+        if (onConnectRemote != null) {
+            IconButton(
+                onClick = onConnectRemote,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Link,
+                    contentDescription = "Connect to remote browser",
                     tint = Color(0xFFCCCCCC),
                     modifier = Modifier.size(18.dp)
                 )
