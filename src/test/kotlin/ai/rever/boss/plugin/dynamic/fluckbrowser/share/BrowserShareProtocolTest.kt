@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser.share
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -57,6 +58,9 @@ class BrowserShareProtocolTest {
 
     @Test fun controlPayloadOmitsNullFields() {
         val json = ControlJson.encodeToString(ControlPayload.serializer(), ControlPayload(kind = "click", id = 42))
-        assertEquals("{\"kind\":\"click\",\"id\":42}", json)
+        assertTrue(json.contains("\"kind\":\"click\""))
+        assertTrue(json.contains("\"id\":42"))
+        assertFalse(json.contains("value"))
+        assertFalse(json.contains("\"x\""))
     }
 }

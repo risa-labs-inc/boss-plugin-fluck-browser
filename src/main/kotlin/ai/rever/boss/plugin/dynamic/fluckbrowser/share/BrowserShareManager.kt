@@ -41,9 +41,11 @@ import java.util.logging.Logger
  * rolling view/control tokens, Pending→Grant→Denied approval, E2E AES-GCM), but
  * slimmed for the browser domain and a single session-wide stream.
  *
- * v1 binds loopback and advertises `localhost` — a secure context, so the web
- * viewer's WebCrypto E2E works out of the box (same-machine web viewer or peer
- * BossConsole). Cross-machine sharing (LAN bind / tunnel) is a later enhancement.
+ * Binds loopback by default and advertises `localhost` (a secure context, so the
+ * web viewer's WebCrypto E2E works out of the box). For cross-machine sharing set
+ * `-Dboss.cobrowse.bind=lan` (or `boss.cobrowse.publicUrl` for a tunnel/proxy); the
+ * `#k` secret is appended only on secure contexts and a plaintext client is refused
+ * over a public/https reach (anti-downgrade).
  */
 object BrowserShareManager {
     private val log = Logger.getLogger("BrowserShareManager")
@@ -428,11 +430,16 @@ object BrowserShareManager {
 
     private fun hostOf(url: String): String = runCatching { java.net.URI(url).host ?: "" }.getOrDefault("")
 
-    /** True when a browser opening [url] has WebCrypto (secure context: https or loopback). */
+    /**
+     * True when a browser opening [url] has WebCrypto (a secure context: https or
+     * loopback). Detection is syntactic (scheme + host literal), not DNS-resolved —
+     * an http host that merely resolves to loopback is treated as non-secure.
+     */
     private fun e2eCapable(url: String): Boolean {
         if (url.startsWith("https://", ignoreCase = true)) return true
         val h = hostOf(url).lowercase()
-        return h == "localhost" || h == "::1" || h.startsWith("127.")
+        // URI.host keeps the brackets for IPv6 literals, hence "[::1]".
+        return h == "localhost" || h == "::1" || h == "[::1]" || h.startsWith("127.")
     }
 
     /** Refuse plaintext when reachable via a public/https URL (anti-downgrade). */
