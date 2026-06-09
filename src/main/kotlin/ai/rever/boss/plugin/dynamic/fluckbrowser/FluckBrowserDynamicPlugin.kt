@@ -1,24 +1,20 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.api.DynamicPlugin
+import ai.rever.boss.plugin.api.NotificationDuration
+import ai.rever.boss.plugin.api.NotificationType
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
+import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Fluck Browser dynamic plugin - Loaded from external JAR.
  *
  * Provides embedded web browser TAB (main panel) using BrowserService from PluginContext.
- * This plugin offers a full-featured browser experience with:
- * - URL bar with navigation controls
- * - Back/forward/reload buttons
- * - Zoom controls (dropdown with common zoom levels)
- * - Loading indicator (progress bar)
- * - Security indicator (HTTPS lock icon)
- * - Tab title and favicon updates
- * - Download management integration
- * - Secret/credential integration for form filling
- *
- * NOTE: This is a main panel TAB plugin, not a sidebar panel.
- * It registers as a TabType via tabRegistry.registerTabType().
+ * In addition to browsing it hosts the co-browse tab-sharing server
+ * ([BrowserShareManager]) so a tab's rendered DOM can be mirrored to a remote
+ * viewer (web link or peer BossConsole) with approval-gated control.
  *
  * PRIVATE: This plugin is proprietary and not open source.
  */
@@ -32,6 +28,9 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
 
     private var pluginContext: PluginContext? = null
 
+    // One INDEFINITE approval toast per pending share request, dismissed when it resolves.
+    private val approvalToastIds = ConcurrentHashMap<String, String>()
+
     override fun register(context: PluginContext) {
         pluginContext = context
 
@@ -39,11 +38,48 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         context.tabRegistry.registerTabType(FluckBrowserTabType) { tabInfo, ctx ->
             FluckBrowserTabComponent(ctx, tabInfo, context)
         }
+
+        // Co-browse tab sharing: store context + start surfacing approval toasts.
+        // The embedded server itself binds lazily on the first share() call.
+        BrowserShareManager.start(context)
+        wireApprovalNotifications(context)
     }
 
     override fun dispose() {
-        // Unregister tab type when plugin is unloaded
+        // Tear down the share server (stops any active capture) before unregistering.
+        BrowserShareManager.shutdown()
+        approvalToastIds.clear()
         pluginContext?.tabRegistry?.unregisterTabType(FluckBrowserTabType.typeId)
         pluginContext = null
+    }
+
+    /**
+     * Mirror [BrowserShareManager.pendingRequests] into host toasts: one
+     * INDEFINITE toast per pending viewer with a one-tap Approve action,
+     * dismissed automatically when the request resolves. Collected on
+     * [PluginContext.pluginScope], so plugin dispose cancels it.
+     */
+    private fun wireApprovalNotifications(context: PluginContext) {
+        val notifications = context.notificationProvider ?: return
+        context.pluginScope.launch {
+            BrowserShareManager.pendingRequests.collect { requests ->
+                val live = requests.map { it.id }.toSet()
+                approvalToastIds.keys.filter { it !in live }.forEach { id ->
+                    approvalToastIds.remove(id)?.let { notifications.dismiss(it) }
+                }
+                requests.filter { !approvalToastIds.containsKey(it.id) }.forEach { request ->
+                    val verb = if (request.wantsControl) "control of" else "to view"
+                    val toastId = notifications.showToast(
+                        message = "${request.deviceName} requests $verb your shared browser",
+                        type = NotificationType.WARNING,
+                        duration = NotificationDuration.INDEFINITE,
+                        title = "Browser tab sharing",
+                        actionLabel = "Approve",
+                        onAction = { BrowserShareManager.approveRequest(request.id) }
+                    )
+                    approvalToastIds[request.id] = toastId
+                }
+            }
+        }
     }
 }

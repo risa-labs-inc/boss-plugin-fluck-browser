@@ -24,6 +24,9 @@ import ai.rever.boss.plugin.browser.BrowserConfig
 import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
 import ai.rever.boss.plugin.browser.BrowserHandle
 import ai.rever.boss.plugin.browser.BrowserService
+import ai.rever.boss.plugin.api.NotificationDuration
+import ai.rever.boss.plugin.api.NotificationType
+import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -138,12 +141,43 @@ class FluckBrowserTabComponent(
         lifecycle.subscribe(
             callbacks = object : Callbacks {
                 override fun onDestroy() {
+                    BrowserShareManager.unregisterTab(config.id)
                     state.browserHandle?.dispose()
                     state.browserHandle = null
                     coroutineScope.cancel()
                 }
             }
         )
+    }
+
+    /**
+     * Start (or refresh) co-browse sharing of THIS tab. Copies the view link to
+     * the clipboard and toasts the E2E verification code; the action button copies
+     * the control link. Viewers are gated by host approval before anything streams.
+     */
+    private fun shareCurrentTab() {
+        val info = BrowserShareManager.share(config.id)
+        val notifier = pluginContext.notificationProvider
+        if (info == null) {
+            notifier?.showError("Could not start browser sharing", title = "Browser tab sharing")
+            return
+        }
+        copyToClipboard(info.viewUrl)
+        notifier?.showToast(
+            message = "View link copied. Viewers need your approval. Verify code: ${info.e2eCode}",
+            type = NotificationType.SUCCESS,
+            duration = NotificationDuration.LONG,
+            title = "Sharing \"${info.sessionName}\"",
+            actionLabel = "Copy control link",
+            onAction = { copyToClipboard(info.controlUrl) }
+        )
+    }
+
+    private fun copyToClipboard(text: String) {
+        runCatching {
+            java.awt.Toolkit.getDefaultToolkit().systemClipboard
+                .setContents(java.awt.datatransfer.StringSelection(text), null)
+        }
     }
 
     @Composable
@@ -154,6 +188,7 @@ class FluckBrowserTabComponent(
             val initialUrl = getInitialUrl(config)
 
             FluckBrowserTabContent(
+                onShareTab = { shareCurrentTab() },
                 initialUrl = initialUrl,
                 browserService = browserService,
                 coroutineScope = coroutineScope,
@@ -298,6 +333,7 @@ internal class FluckBrowserTabState {
 
 @Composable
 internal fun FluckBrowserTabContent(
+    onShareTab: () -> Unit = {},
     initialUrl: String,
     browserService: BrowserService,
     coroutineScope: CoroutineScope,
@@ -422,6 +458,10 @@ internal fun FluckBrowserTabContent(
             if (handle != null) {
                 browserHandle = handle
                 isInitializing = false
+
+                // Register this tab+handle so the co-browse share server can enumerate
+                // and stream it. Re-registers under the same tabId on a recovery re-init.
+                if (tabId.isNotEmpty()) BrowserShareManager.registerTab(tabId, handle)
 
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
@@ -685,6 +725,7 @@ internal fun FluckBrowserTabContent(
         ) {
         // URL bar with navigation controls
         BrowserToolbar(
+            onShare = onShareTab,
             urlBarText = urlBarText,
             onUrlBarTextChange = { newValue ->
                 isUserEditingUrl = true
@@ -1541,7 +1582,8 @@ internal fun BrowserToolbar(
     onDismissSuggestions: () -> Unit = {},
     onAcceptAutocomplete: () -> Unit = {},
     onSelectedDropdownIndexChange: (Int) -> Unit = {},
-    onFocusLost: () -> Unit = {}
+    onFocusLost: () -> Unit = {},
+    onShare: (() -> Unit)? = null
 ) {
     val coroutineScope = rememberCoroutineScope()
     // Auto-scroll to selected suggestion when using arrow keys
@@ -1558,6 +1600,21 @@ internal fun BrowserToolbar(
             .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        // Share (co-browse) button — only shown when a share handler is wired.
+        if (onShare != null) {
+            IconButton(
+                onClick = onShare,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Share,
+                    contentDescription = "Share this tab",
+                    tint = Color(0xFFCCCCCC),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+
         // Back button
         IconButton(
             onClick = onBack,

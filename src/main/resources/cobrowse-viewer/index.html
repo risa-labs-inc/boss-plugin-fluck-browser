@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>BOSS — Shared Browser</title>
+  <link rel="stylesheet" href="vendor/rrweb.min.css" />
+  <style>
+    :root { --bg:#1e1e1e; --panel:#252526; --border:#3c3c3c; --fg:#e6e6e6; --muted:#9a9a9a; --accent:#4a8cff; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:13px -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { display:flex; flex-direction:column; height:100%; }
+    #topbar { display:flex; align-items:center; gap:8px; padding:6px 8px; background:var(--panel); border-bottom:1px solid var(--border); }
+    #tabbar { display:flex; gap:4px; overflow-x:auto; flex:1; }
+    .tab { display:flex; align-items:center; gap:6px; padding:4px 10px; border:1px solid var(--border); border-radius:6px;
+           background:#2d2d2d; color:var(--muted); white-space:nowrap; cursor:pointer; max-width:240px; }
+    .tab.active { background:#37373d; color:var(--fg); border-color:var(--accent); }
+    .tab .ttl { overflow:hidden; text-overflow:ellipsis; max-width:180px; }
+    .tab img.fav { width:14px; height:14px; }
+    #navbar { display:flex; align-items:center; gap:6px; padding:6px 8px; background:var(--panel); border-bottom:1px solid var(--border); }
+    #navbar button { background:#333; color:var(--fg); border:1px solid var(--border); border-radius:5px; padding:3px 9px; cursor:pointer; }
+    #navbar button:disabled { opacity:.4; cursor:default; }
+    #url { flex:1; background:#1b1b1b; color:var(--fg); border:1px solid var(--border); border-radius:5px; padding:4px 8px; }
+    #stage { position:relative; flex:1; overflow:auto; background:#fff; }
+    #stage iframe { border:0; }
+    #overlay { position:absolute; inset:0; display:none; }
+    #overlay.on { display:block; }
+    #status { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; flex-direction:column;
+              gap:12px; background:rgba(20,20,20,.92); color:var(--fg); text-align:center; padding:24px; z-index:10; }
+    #status.hidden { display:none; }
+    .pill { font-size:11px; padding:2px 8px; border-radius:10px; background:#333; color:var(--muted); }
+    .pill.e2e { background:#15391f; color:#7fd99a; }
+    .pill.code { font-family:monospace; }
+    #ctlbtn { background:var(--accent); color:#fff; border:0; border-radius:5px; padding:4px 10px; cursor:pointer; }
+    #ctlbtn.granted { background:#15391f; color:#7fd99a; }
+    .spinner { width:28px; height:28px; border:3px solid #444; border-top-color:var(--accent); border-radius:50%; animation:spin 1s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    button:focus { outline:1px solid var(--accent); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <div id="tabbar"></div>
+      <span id="presence" class="pill">0 viewers</span>
+      <span id="e2e" class="pill e2e" style="display:none">&#128274; <span id="e2ecode" class="code"></span></span>
+      <button id="ctlbtn">Request control</button>
+    </div>
+    <div id="navbar">
+      <button id="back" title="Back">&#8249;</button>
+      <button id="fwd" title="Forward">&#8250;</button>
+      <button id="reload" title="Reload">&#10227;</button>
+      <input id="url" placeholder="Enter URL…" />
+    </div>
+    <div id="stage">
+      <div id="status"><div class="spinner"></div><div id="statustext">Connecting…</div></div>
+      <div id="overlay"></div>
+    </div>
+  </div>
+  <script src="vendor/rrweb.min.js"></script>
+  <script src="viewer.js"></script>
+</body>
+</html>
