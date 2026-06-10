@@ -79,6 +79,16 @@ object BrowserShareManager {
     )
     private val grants = ConcurrentHashMap<String, GrantRec>()
 
+    // --- Cloudflare quick tunnel (public remote reach, like BossTerm) ---
+    @Volatile private var remoteTunnel: CloudflaredExposer.QuickTunnel? = null
+    @Volatile private var tunnelStarting = false
+    private val _remoteUrl = MutableStateFlow<String?>(null)
+    /** The public https://&lt;rand&gt;.trycloudflare.com base once the tunnel is live, else null. */
+    val remoteUrl: StateFlow<String?> = _remoteUrl.asStateFlow()
+    private val _shareInfo = MutableStateFlow<ShareInfo?>(null)
+    /** Active share's links; updates reactively when the tunnel URL resolves. */
+    val shareInfo: StateFlow<ShareInfo?> = _shareInfo.asStateFlow()
+
     // --- Approval flow (plugin observes [pendingRequests] and shows toasts) ---
 
     data class PendingShareRequest(
@@ -118,6 +128,9 @@ object BrowserShareManager {
             session = null
             sharesByToken.clear()
             grants.clear()
+            remoteTunnel?.destroy(); remoteTunnel = null; tunnelStarting = false
+            _remoteUrl.value = null
+            _shareInfo.value = null
             val e = engine
             engine = null
             boundPort = null
@@ -150,6 +163,8 @@ object BrowserShareManager {
         val secure: Boolean,
         val sessionName: String,
         val maskInputs: Boolean,
+        /** True while a Cloudflare public link is still being established. */
+        val tunnelPending: Boolean = false,
     )
 
     fun isSharing(): Boolean = session != null
@@ -162,24 +177,76 @@ object BrowserShareManager {
         s.setMaskInputs(maskInputs)
         s.refreshLayout()
         val port = boundPort ?: return null
+        maybeStartTunnelLocked(port)
+        val info = buildShareInfoLocked(s, port)
+        _shareInfo.value = info
+        info
+    }
+
+    private fun buildShareInfoLocked(s: BrowserMirrorShare, port: Int): ShareInfo {
         val secretB64 = s.sessionSecretB64
         val viewUrl = buildUrl(s.viewToken, secretB64, port)
         val controlUrl = buildUrl(s.controlToken, secretB64, port)
         val e2e = viewUrl.contains("#k=")
-        ShareInfo(
+        return ShareInfo(
             viewUrl = viewUrl,
             controlUrl = controlUrl,
             e2eCode = if (e2e) BrowserSessionCrypto.fingerprint(s.sessionSecret) else null,
             secure = e2e,
             sessionName = s.sessionName,
-            maskInputs = maskInputs,
+            maskInputs = s.maskInputs,
+            tunnelPending = tunnelStarting,
         )
+    }
+
+    private fun republishShareInfo() {
+        val s = session ?: return
+        val p = boundPort ?: return
+        _shareInfo.value = buildShareInfoLocked(s, p)
+    }
+
+    /**
+     * Lazily start a Cloudflare quick tunnel (default mode, like BossTerm) so the
+     * share link is reachable from any network. Fully async — the URL resolves a few
+     * seconds later and is published via [shareInfo]/[remoteUrl]. Falls back to the
+     * loopback link if cloudflared isn't installed or the mode is "off".
+     */
+    private fun maybeStartTunnelLocked(port: Int) {
+        if (tunnelMode() != "cloudflare") return
+        if (remoteTunnel != null || _remoteUrl.value != null || tunnelStarting) return
+        tunnelStarting = true
+        scope.launch {
+            if (!CloudflaredExposer.isInstalled()) {
+                log.info("cloudflared not installed; co-browse stays on the loopback link")
+                synchronized(lock) { tunnelStarting = false; republishShareInfo() }
+                return@launch
+            }
+            val tunnel = CloudflaredExposer.start(port)
+            if (tunnel == null) {
+                synchronized(lock) { tunnelStarting = false; republishShareInfo() }
+                return@launch
+            }
+            synchronized(lock) { remoteTunnel = tunnel }
+            val url = tunnel.awaitUrl()
+            if (url != null) tunnel.awaitReady()
+            synchronized(lock) {
+                if (remoteTunnel === tunnel) {
+                    _remoteUrl.value = url
+                    tunnelStarting = false
+                    republishShareInfo()
+                    log.info("Co-browse tunnel " + (if (url != null) "live: $url" else "failed; loopback only"))
+                }
+            }
+        }
     }
 
     fun unshare() = synchronized(lock) {
         session?.shutdown()
         session = null
         sharesByToken.clear()
+        remoteTunnel?.destroy(); remoteTunnel = null; tunnelStarting = false
+        _remoteUrl.value = null
+        _shareInfo.value = null
         // Invalidate all 24h grants: a reshare mints a new secret/tokens, so old grant
         // keys must not silently re-admit a viewer to the new session without approval.
         grants.clear()
@@ -279,6 +346,7 @@ object BrowserShareManager {
             return
         }
         val share = ref.share
+        log.info("Co-browse viewer connecting (control-link=${ref.canControl})")
 
         // --- E2E handshake: first frame is a plaintext Kex (encrypted path) or Hello (legacy). ---
         val first = withTimeoutOrNull(10_000L) { runCatching { ws.incoming.receive() }.getOrNull() }
@@ -342,6 +410,7 @@ object BrowserShareManager {
             } else {
                 hello?.key?.let { grants.remove(it) }
                 val deviceName = hello?.name?.takeIf { it.isNotBlank() } ?: "Browser (${clientId.take(6)})"
+                log.info("Co-browse: sending Pending + awaiting host approval for '$deviceName'")
                 runCatching { send(ServerMessage.Pending) }
                 val approved = awaitApproval(deviceName, ref.canControl)
                 if (!approved) {
@@ -407,6 +476,7 @@ object BrowserShareManager {
     private fun bindMode(): String = cfg("boss.cobrowse.bind", "BOSS_COBROWSE_BIND", "loopback").lowercase()
     private fun customBindHost(): String = cfg("boss.cobrowse.bindHost", "BOSS_COBROWSE_BIND_HOST", "")
     private fun publicUrl(): String = cfg("boss.cobrowse.publicUrl", "BOSS_COBROWSE_PUBLIC_URL", "")
+    private fun tunnelMode(): String = cfg("boss.cobrowse.tunnel", "BOSS_COBROWSE_TUNNEL", "cloudflare").lowercase()
 
     private fun resolveBindHost(): String = when (bindMode()) {
         "lan" -> "0.0.0.0"
@@ -444,13 +514,14 @@ object BrowserShareManager {
 
     /** Refuse plaintext when reachable via a public/https URL (anti-downgrade). */
     private fun requireE2E(): Boolean {
-        val pub = publicUrl()
+        val pub = _remoteUrl.value ?: publicUrl()
         return pub.isNotBlank() && e2eCapable(pub)
     }
 
     /** Build a share URL; append the #k secret only when the context can do WebCrypto. */
     private fun buildUrl(token: String, secretB64: String, port: Int): String {
-        val pub = publicUrl()
+        // Prefer the live Cloudflare tunnel, then a user-supplied public URL, then loopback.
+        val pub = _remoteUrl.value ?: publicUrl()
         val base = if (pub.isNotBlank()) "${pub.trimEnd('/')}/?t=$token"
                    else "http://${advertisedHost()}:$port/?t=$token"
         return if (e2eCapable(base)) "$base#k=$secretB64" else base

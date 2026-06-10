@@ -382,18 +382,44 @@ internal fun FluckBrowserTabContent(
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
 
-    // Co-browse share dialog state (null = closed).
-    var shareDialogInfo by remember { mutableStateOf<BrowserShareManager.ShareInfo?>(null) }
+    // Co-browse share dialog. The links arrive reactively (the Cloudflare tunnel URL
+    // resolves a few seconds after Share), so observe the manager's shareInfo flow.
+    var shareDialogOpen by remember { mutableStateOf(false) }
     var shareMaskInputs by remember { mutableStateOf(false) }
-    shareDialogInfo?.let { info ->
-        ShareLinkDialog(
-            info = info,
-            maskInputs = shareMaskInputs,
-            onToggleMask = { checked ->
-                shareMaskInputs = checked
-                BrowserShareManager.share(tabId, checked)?.let { shareDialogInfo = it }
+    var thisTabInitiatedShare by remember { mutableStateOf(false) }
+    val liveShareInfo by BrowserShareManager.shareInfo.collectAsState()
+    if (shareDialogOpen) {
+        liveShareInfo?.let { info ->
+            ShareLinkDialog(
+                info = info,
+                maskInputs = shareMaskInputs,
+                onToggleMask = { checked ->
+                    shareMaskInputs = checked
+                    BrowserShareManager.share(tabId, checked)
+                },
+                onDismiss = { shareDialogOpen = false },
+            )
+        }
+    }
+
+    // Co-browse approval prompt: a modal in the tab that initiated the share, so a
+    // viewer request can't be missed (the host toast is also shown via
+    // notificationProvider, and remains the only surface if this tab is closed).
+    // Gated to the initiating tab so multiple open browser tabs don't stack
+    // duplicate dialogs for the same request.
+    val pendingApprovals by BrowserShareManager.pendingRequests.collectAsState()
+    if (thisTabInitiatedShare) pendingApprovals.firstOrNull()?.let { req ->
+        AlertDialog(
+            onDismissRequest = { BrowserShareManager.denyRequest(req.id) },
+            title = { Text("Allow remote access?") },
+            text = {
+                Text(
+                    "${req.deviceName} wants ${if (req.wantsControl) "to control" else "to view"} your " +
+                        "shared browser. Approve only if you recognize this request (verify the \uD83D\uDD12 code matches)."
+                )
             },
-            onDismiss = { shareDialogInfo = null },
+            confirmButton = { TextButton(onClick = { BrowserShareManager.approveRequest(req.id) }) { Text("Approve") } },
+            dismissButton = { TextButton(onClick = { BrowserShareManager.denyRequest(req.id) }) { Text("Deny") } }
         )
     }
 
@@ -732,7 +758,11 @@ internal fun FluckBrowserTabContent(
         ) {
         // URL bar with navigation controls
         BrowserToolbar(
-            onShare = { BrowserShareManager.share(tabId, shareMaskInputs)?.let { shareDialogInfo = it } },
+            onShare = {
+                BrowserShareManager.share(tabId, shareMaskInputs)
+                shareDialogOpen = true
+                thisTabInitiatedShare = true
+            },
             onConnectRemote = onConnectRemote,
             urlBarText = urlBarText,
             onUrlBarTextChange = { newValue ->
@@ -1584,8 +1614,12 @@ private fun ShareLinkDialog(
                 info.e2eCode?.let {
                     Text("\uD83D\uDD12 Verify code: $it", style = MaterialTheme.typography.caption)
                 }
-                ShareLinkRow("View link", info.viewUrl) { clipboard.setText(AnnotatedString(info.viewUrl)) }
-                ShareLinkRow("Control link", info.controlUrl) { clipboard.setText(AnnotatedString(info.controlUrl)) }
+                if (info.tunnelPending) {
+                    Text("Generating public link\u2026", style = MaterialTheme.typography.body2)
+                } else {
+                    ShareLinkRow("View link", info.viewUrl) { clipboard.setText(AnnotatedString(info.viewUrl)) }
+                    ShareLinkRow("Control link", info.controlUrl) { clipboard.setText(AnnotatedString(info.controlUrl)) }
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = maskInputs, onCheckedChange = onToggleMask)
                     Text("Mask typed input (hide form values)", style = MaterialTheme.typography.body2)
