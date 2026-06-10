@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.26"
+version = "1.1.0"
 
 java {
     toolchain {
@@ -99,8 +99,12 @@ tasks.register<Jar>("buildPluginJar") {
     // in BossConsole's parent-first shared set, so they must ride in the plugin JAR.
     // kotlinx-serialization / kotlinx-coroutines / slf4j / Compose are deliberately
     // omitted — the host provides them parent-first. (Mirrors terminal-tab.)
-    from({
-        configurations.runtimeClasspath.get().filter { jar ->
+    // Resolve via a Provider so it survives Gradle's configuration cache. A plain
+    // `from({ configurations.runtimeClasspath.get()... })` closure is skipped on a
+    // config-cache HIT, silently dropping ktor from the JAR (the embedded WebSocket
+    // server then NoClassDefFounds at runtime).
+    from(configurations.named("runtimeClasspath").map { cp ->
+        cp.filter { jar ->
             val name = jar.name
             name.startsWith("ktor-") ||
                 name.startsWith("atomicfu") ||
@@ -108,6 +112,14 @@ tasks.register<Jar>("buildPluginJar") {
                 name.startsWith("kotlinx-io-")
         }.map { zipTree(it) }
     })
+}
+
+// The default `jar` (classes-only) writes the SAME archive path as buildPluginJar
+// and silently clobbers the bundled plugin JAR whenever it runs later in the task
+// graph (e.g. `test` resolving the runtime classpath triggers :jar). Classify it
+// so the two archives never collide; buildPluginJar's output stays canonical.
+tasks.named<Jar>("jar") {
+    archiveClassifier.set("thin")
 }
 
 // Sync version from build.gradle.kts into plugin.json (single source of truth)
