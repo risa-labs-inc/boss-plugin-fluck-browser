@@ -2,10 +2,12 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser.share
 
 import ai.rever.boss.plugin.browser.BrowserHandle
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.logging.Logger
 
 /**
  * One co-browse share session. Fans rrweb DOM events from the host's *focused*
@@ -22,14 +24,18 @@ import java.util.concurrent.CopyOnWriteArrayList
  * @param handleFor resolves a tabId to its live [BrowserHandle], or null if gone.
  * @param scope coroutine scope for non-blocking outbox sends / control round-trips.
  */
+private val log = Logger.getLogger("BrowserMirrorShare")
+
 class BrowserMirrorShare(
     val viewToken: String,
     val controlToken: String,
     val sessionSecret: ByteArray,
     val sessionSecretB64: String,
-    val sessionName: String,
+    @Volatile var sessionName: String,
     private val tabsSnapshot: () -> List<TabEntry>,
     private val handleFor: (String) -> BrowserHandle?,
+    private val closeTab: (String) -> Boolean,
+    private val newTab: (String) -> String?,
     private val scope: CoroutineScope,
 ) {
     data class TabEntry(
@@ -48,6 +54,12 @@ class BrowserMirrorShare(
         // Bounded, drop-oldest: a slow viewer never blocks the capture thread.
         val outbox = Channel<String>(capacity = 512, onBufferOverflow = BufferOverflow.DROP_OLDEST)
         @Volatile var grantKey: String? = null
+        // When a WebRTC data channel is live, DOM frames go here (peer.sendDom)
+        // instead of the WS outbox — lower latency, no relay. Null = use the socket.
+        @Volatile var domSink: ((String) -> Unit)? = null
+        // Notified with the active tab's title when the stream switches tabs, so an
+        // RTC video track can re-capture the newly focused tab. Null = no video.
+        @Volatile var onActiveTab: ((String) -> Unit)? = null
     }
 
     private val viewers = CopyOnWriteArrayList<ViewerConnection>()
@@ -78,10 +90,24 @@ class BrowserMirrorShare(
 
     private fun broadcast(m: ServerMessage) {
         val text = encode(m)
-        viewers.forEach { runCatching { it.outbox.trySend(text) } }
+        viewers.forEach { deliver(it, text) }
+    }
+
+    /** Send an already-encoded frame to one viewer, preferring its RTC sink. */
+    private fun deliver(vc: ViewerConnection, text: String) {
+        val sink = vc.domSink
+        if (sink != null) runCatching { sink(text) }
+        else runCatching { vc.outbox.trySend(text) }
     }
 
     /** Messages a freshly-admitted viewer receives before the live stream. */
+    /** Rename the session and rebroadcast the layout so viewers update their header. */
+    fun rename(name: String) {
+        if (sessionName == name) return
+        sessionName = name
+        broadcast(buildLayout())
+    }
+
     fun initialMessages(): List<ServerMessage> = listOf(buildLayout())
 
     private fun buildLayout(): ServerMessage.Layout {
@@ -162,7 +188,7 @@ class BrowserMirrorShare(
             onEvent = { json ->
                 // Runs on a JxBrowser thread — non-blocking enqueue only.
                 val text = encode(ServerMessage.DomMutation(tabId, json))
-                viewers.forEach { runCatching { it.outbox.trySend(text) } }
+                viewers.forEach { deliver(it, text) }
             },
             maskInputs = maskInputs,
         )
@@ -170,6 +196,19 @@ class BrowserMirrorShare(
         attachNavListeners(tabId, handle)
         pushNavStatus(tabId, handle)
         broadcast(buildLayout())
+        // Let any RTC video tracks re-capture the newly active tab.
+        val title = runCatching { handle.getTitle() }.getOrNull()
+        if (!title.isNullOrBlank()) viewers.forEach { runCatching { it.onActiveTab?.invoke(title) } }
+    }
+
+    /** Title of the currently streamed tab (for RTC video capture selection). */
+    fun activeTabTitle(): String? = synchronized(streamLock) {
+        activeStreamTabId?.let { tid -> runCatching { handleFor(tid)?.getTitle() }.getOrNull() }
+    }
+
+    /** Re-emit a fresh snapshot of the active tab (e.g. after a viewer's RTC channel opens). */
+    fun resnapshotActive() = synchronized(streamLock) {
+        activeStreamTabId?.let { setActiveStream(it, forceRestart = true) }
     }
 
     private fun stopActiveStream() = synchronized(streamLock) {
@@ -231,8 +270,43 @@ class BrowserMirrorShare(
             is ClientMessage.Input -> ifControlActive(vc, msg.tabId) { applyControl(msg.tabId, ControlPayload(kind = "input", id = msg.id, value = msg.value)) }
             is ClientMessage.Key -> ifControlActive(vc, msg.tabId) { applyControl(msg.tabId, ControlPayload(kind = "key", id = msg.id, key = msg.key, code = msg.code)) }
             is ClientMessage.Scroll -> ifControlActive(vc, msg.tabId) { applyControl(msg.tabId, ControlPayload(kind = "scroll", id = msg.id, x = msg.x, y = msg.y)) }
+            // Native input: trusted events through the engine's input pipeline.
+            is ClientMessage.Pointer -> ifControlActive(vc, msg.tabId) {
+                dispatchNative(msg.tabId, """{"kind":"${msg.kind}","x":${msg.x},"y":${msg.y},"button":${msg.button},"clicks":${msg.clicks}}""")
+            }
+            is ClientMessage.Wheel -> ifControlActive(vc, msg.tabId) {
+                dispatchNative(msg.tabId, """{"kind":"wheel","x":${msg.x},"y":${msg.y},"dx":${msg.dx},"dy":${msg.dy}}""")
+            }
+            is ClientMessage.KeyNative -> ifControlActive(vc, msg.tabId) {
+                val payload = ControlJson.encodeToString(
+                    NativeKeyPayload.serializer(),
+                    NativeKeyPayload(msg.kind, msg.key, msg.code, msg.ch, msg.shift, msg.ctrl, msg.alt, msg.meta)
+                )
+                dispatchNative(msg.tabId, payload)
+            }
             is ClientMessage.Hello -> { /* handshake handled before stream loop */ }
-            is ClientMessage.NewTab, is ClientMessage.CloseTab -> { /* tab ops are a later phase */ }
+            // Tab management is control-gated but not stream-gated — a controller may
+            // close any tab, including a background one. The closed tab's lifecycle
+            // teardown calls unregisterTab → refreshLayout, so viewers' tab bars update;
+            // if the closed tab was the one being streamed, the viewer re-focuses on the
+            // new active tab from that Layout.
+            is ClientMessage.CloseTab -> {
+                if (vc.canControl) scope.launch(Dispatchers.Main) {
+                    val ok = runCatching { closeTab(msg.tabId) }.getOrDefault(false)
+                    log.info("Co-browse close tab ${msg.tabId} -> $ok")
+                }
+                else log.warning("Co-browse close-tab dropped (canControl=false, tab=${msg.tabId})")
+            }
+            is ClientMessage.NewTab -> {
+                if (vc.canControl) scope.launch(Dispatchers.Main) {
+                    // Null/blank URL → a fresh tab (about:blank shows the browser's new-tab page).
+                    val url = msg.url?.takeIf { it.isNotBlank() } ?: "about:blank"
+                    val id = runCatching { newTab(url) }.getOrNull()
+                    log.info("Co-browse new tab ($url) -> $id")
+                }
+                else log.warning("Co-browse new-tab dropped (canControl=false)")
+            }
+            is ClientMessage.RtcOffer, is ClientMessage.RtcIce -> { /* WebRTC signaling handled by the manager */ }
         }
     }
 
@@ -240,12 +314,22 @@ class BrowserMirrorShare(
     // being streamed — background tabs are never "armed" for remote control.
     private inline fun ifControlActive(vc: ViewerConnection, tabId: String, block: () -> Unit) {
         if (vc.canControl && tabId == activeStreamTabId) block()
+        else log.warning("Co-browse control dropped (canControl=${vc.canControl}, msgTab=$tabId, activeTab=$activeStreamTabId)")
+    }
+
+    /** Dispatch one native input event (already-encoded JSON) to [tabId]'s handle. */
+    private fun dispatchNative(tabId: String, inputJson: String) {
+        val handle = handleFor(tabId) ?: return
+        scope.launch { runCatching { handle.dispatchCoBrowseInput(inputJson) } }
     }
 
     private fun applyControl(tabId: String, payload: ControlPayload) {
         val handle = handleFor(tabId) ?: return
         val json = ControlJson.encodeToString(ControlPayload.serializer(), payload)
-        scope.launch { runCatching { handle.applyCoBrowseControl(json) } }
+        scope.launch {
+            val status = runCatching { handle.applyCoBrowseControl(json) }.getOrElse { "exc:${it.message}" }
+            log.info("Co-browse control '${payload.kind}' -> ${status ?: "refused (host guard)"}")
+        }
     }
 
     /** Stop everything (called on unshare / server stop). */

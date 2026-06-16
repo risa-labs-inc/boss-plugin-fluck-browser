@@ -1,12 +1,8 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.api.DynamicPlugin
-import ai.rever.boss.plugin.api.NotificationDuration
-import ai.rever.boss.plugin.api.NotificationType
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
-import kotlinx.coroutines.launch
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Fluck Browser dynamic plugin - Loaded from external JAR.
@@ -28,9 +24,6 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
 
     private var pluginContext: PluginContext? = null
 
-    // One INDEFINITE approval toast per pending share request, dismissed when it resolves.
-    private val approvalToastIds = ConcurrentHashMap<String, String>()
-
     override fun register(context: PluginContext) {
         pluginContext = context
 
@@ -39,47 +32,17 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
             FluckBrowserTabComponent(ctx, tabInfo, context)
         }
 
-        // Co-browse tab sharing: store context + start surfacing approval toasts.
-        // The embedded server itself binds lazily on the first share() call.
+        // Co-browse tab sharing: store context. The embedded server binds lazily on
+        // the first share() call. Approval is surfaced BossTerm-style — the in-tab
+        // ShareRequestToast banner + the Share window's PendingRequestsList — so no
+        // host notification toast is posted (it duplicated those and looked off-style).
         BrowserShareManager.start(context)
-        wireApprovalNotifications(context)
     }
 
     override fun dispose() {
         // Tear down the share server (stops any active capture) before unregistering.
         BrowserShareManager.shutdown()
-        approvalToastIds.clear()
         pluginContext?.tabRegistry?.unregisterTabType(FluckBrowserTabType.typeId)
         pluginContext = null
-    }
-
-    /**
-     * Mirror [BrowserShareManager.pendingRequests] into host toasts: one
-     * INDEFINITE toast per pending viewer with a one-tap Approve action,
-     * dismissed automatically when the request resolves. Collected on
-     * [PluginContext.pluginScope], so plugin dispose cancels it.
-     */
-    private fun wireApprovalNotifications(context: PluginContext) {
-        val notifications = context.notificationProvider ?: return
-        context.pluginScope.launch {
-            BrowserShareManager.pendingRequests.collect { requests ->
-                val live = requests.map { it.id }.toSet()
-                approvalToastIds.keys.filter { it !in live }.forEach { id ->
-                    approvalToastIds.remove(id)?.let { notifications.dismiss(it) }
-                }
-                requests.filter { !approvalToastIds.containsKey(it.id) }.forEach { request ->
-                    val verb = if (request.wantsControl) "control of" else "to view"
-                    val toastId = notifications.showToast(
-                        message = "${request.deviceName} requests $verb your shared browser",
-                        type = NotificationType.WARNING,
-                        duration = NotificationDuration.INDEFINITE,
-                        title = "Browser tab sharing",
-                        actionLabel = "Approve",
-                        onAction = { BrowserShareManager.approveRequest(request.id) }
-                    )
-                    approvalToastIds[request.id] = toastId
-                }
-            }
-        }
     }
 }

@@ -69,6 +69,10 @@ dependencies {
     // Serialization runtime is provided by the host (parent-first) — compile only.
     compileOnly("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 
+    // ZXing for the share-dialog QR code (bundled child-first; com.google.zxing.* is
+    // not in the host's parent-first set). Matches the host's zxing line (3.5.4).
+    implementation("com.google.zxing:core:3.5.4")
+
     // Tests
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.3.0")
     testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
@@ -109,7 +113,8 @@ tasks.register<Jar>("buildPluginJar") {
             name.startsWith("ktor-") ||
                 name.startsWith("atomicfu") ||
                 name.startsWith("config-") ||
-                name.startsWith("kotlinx-io-")
+                name.startsWith("kotlinx-io-") ||
+                name.startsWith("core-") // com.google.zxing:core (QR code)
         }.map { zipTree(it) }
     })
 }

@@ -25,10 +25,13 @@ import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
 import ai.rever.boss.plugin.browser.BrowserHandle
 import ai.rever.boss.plugin.browser.BrowserService
 import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.*
@@ -59,6 +62,9 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.withStyle
@@ -66,9 +72,14 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.DpOffset
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.Window
+import androidx.compose.ui.window.rememberWindowState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
@@ -150,37 +161,13 @@ class FluckBrowserTabComponent(
         )
     }
 
-    /**
-     * Prompt for a co-browse share link and open it as a remote-browser tab
-     * (the web viewer renders inside a JxBrowser tab — no native renderer).
-     */
-    private fun connectToRemote() {
-        val dialogs = pluginContext.genericDialogProvider
-        val tabs = pluginContext.activeTabsProvider
-        if (dialogs == null || tabs == null) {
-            pluginContext.notificationProvider?.showError("Remote browser is not available here")
-            return
-        }
-        coroutineScope.launch {
-            val link = dialogs.showTextInputDialog(
-                title = "Connect to remote browser",
-                message = "Paste a co-browse share link from another BOSS.",
-                placeholder = "http://…/?t=…#k=…",
-                validation = { v -> if (v.isBlank() || !v.contains("/?t=")) "Enter a valid co-browse link" else null }
-            ) ?: return@launch
-            tabs.createBrowserTab(link.trim(), "Remote browser")
-        }
-    }
-
     @Composable
     override fun Content() {
-        println("[FluckBrowser-DEBUG] browserService=${browserService}, isAvailable=${browserService?.isAvailable()}")
         if (browserService != null && browserService.isAvailable()) {
             // Extract initial URL from config - handle both FluckBrowserTabData and built-in FluckTabInfo
             val initialUrl = getInitialUrl(config)
 
             FluckBrowserTabContent(
-                onConnectRemote = { connectToRemote() },
                 initialUrl = initialUrl,
                 browserService = browserService,
                 coroutineScope = coroutineScope,
@@ -325,7 +312,6 @@ internal class FluckBrowserTabState {
 
 @Composable
 internal fun FluckBrowserTabContent(
-    onConnectRemote: () -> Unit = {},
     initialUrl: String,
     browserService: BrowserService,
     coroutineScope: CoroutineScope,
@@ -389,39 +375,31 @@ internal fun FluckBrowserTabContent(
     var thisTabInitiatedShare by remember { mutableStateOf(false) }
     val liveShareInfo by BrowserShareManager.shareInfo.collectAsState()
     if (shareDialogOpen) {
-        liveShareInfo?.let { info ->
-            ShareLinkDialog(
-                info = info,
-                maskInputs = shareMaskInputs,
-                onToggleMask = { checked ->
-                    shareMaskInputs = checked
-                    BrowserShareManager.share(tabId, checked)
-                },
-                onDismiss = { shareDialogOpen = false },
-            )
-        }
-    }
-
-    // Co-browse approval prompt: a modal in the tab that initiated the share, so a
-    // viewer request can't be missed (the host toast is also shown via
-    // notificationProvider, and remains the only surface if this tab is closed).
-    // Gated to the initiating tab so multiple open browser tabs don't stack
-    // duplicate dialogs for the same request.
-    val pendingApprovals by BrowserShareManager.pendingRequests.collectAsState()
-    if (thisTabInitiatedShare) pendingApprovals.firstOrNull()?.let { req ->
-        AlertDialog(
-            onDismissRequest = { BrowserShareManager.denyRequest(req.id) },
-            title = { Text("Allow remote access?") },
-            text = {
-                Text(
-                    "${req.deviceName} wants ${if (req.wantsControl) "to control" else "to view"} your " +
-                        "shared browser. Approve only if you recognize this request (verify the \uD83D\uDD12 code matches)."
-                )
+        // The dialog collects shareInfo/viewerCount itself (inside its Window) so its
+        // own composition subscribes — a separate Window does NOT reliably recompose
+        // on the parent's collectAsState, which broke the live link/QR hot-reload
+        // when the Cloudflare tunnel resolves.
+        ShareLinkDialog(
+            maskInputs = shareMaskInputs,
+            onToggleMask = { checked ->
+                shareMaskInputs = checked
+                BrowserShareManager.share(tabId, checked)
             },
-            confirmButton = { TextButton(onClick = { BrowserShareManager.approveRequest(req.id) }) { Text("Approve") } },
-            dismissButton = { TextButton(onClick = { BrowserShareManager.denyRequest(req.id) }) { Text("Deny") } }
+            onRefreshLink = { BrowserShareManager.refreshLink() },
+            onStopSharing = {
+                BrowserShareManager.unshare()
+                shareDialogOpen = false
+                thisTabInitiatedShare = false
+            },
+            onDismiss = { shareDialogOpen = false },
         )
     }
+
+    // Co-browse approval prompts: rendered as non-modal floating banners in the
+    // tab's top-right overlay (see the root Box below), BossTerm-style. Gated to the
+    // initiating tab so multiple open browser tabs don't stack duplicate banners; the
+    // host notificationProvider toast remains the fallback when no tab is visible.
+    val pendingApprovals by BrowserShareManager.pendingRequests.collectAsState()
 
     // URL history autocomplete state
     var showUrlSuggestions by remember { mutableStateOf(false) }
@@ -756,14 +734,20 @@ internal fun FluckBrowserTabContent(
                     }
                 }
         ) {
-        // URL bar with navigation controls
+        // URL bar with navigation controls.
+        // The co-browse share (QR) button is opt-in: hidden unless enabled in
+        // Settings > Browser > Tab Sharing. The host mirrors that toggle to this JVM
+        // system property (read inline so a recompose after toggling reflects it).
+        val shareButtonEnabled = System.getProperty("boss.fluck.showShareButton") == "true"
         BrowserToolbar(
-            onShare = {
-                BrowserShareManager.share(tabId, shareMaskInputs)
-                shareDialogOpen = true
-                thisTabInitiatedShare = true
-            },
-            onConnectRemote = onConnectRemote,
+            onShare = if (shareButtonEnabled) {
+                {
+                    BrowserShareManager.share(tabId, shareMaskInputs)
+                    shareDialogOpen = true
+                    thisTabInitiatedShare = true
+                }
+            } else null,
+            isSharing = liveShareInfo != null,
             urlBarText = urlBarText,
             onUrlBarTextChange = { newValue ->
                 isUserEditingUrl = true
@@ -1188,6 +1172,26 @@ internal fun FluckBrowserTabContent(
                 }
             }
         }
+
+        // Co-browse approval banners (BossTerm-style): non-modal cards in the
+        // top-right, one per waiting viewer. Shown in the tab that initiated the
+        // share; the Share window's PendingRequestsList covers the no-visible-tab case.
+        if (thisTabInitiatedShare && pendingApprovals.isNotEmpty()) {
+            Column(
+                modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                pendingApprovals.forEach { req ->
+                    ShareRequestToast(
+                        deviceName = req.deviceName,
+                        wantsControl = req.wantsControl,
+                        verifyCode = liveShareInfo?.e2eCode,
+                        onApprove = { BrowserShareManager.approveRequest(req.id) },
+                        onDeny = { BrowserShareManager.denyRequest(req.id) },
+                    )
+                }
+            }
+        }
     } // End Box
 }
 
@@ -1590,59 +1594,383 @@ private fun copyToClipboard(text: String) {
     }
 }
 
+// Share window palette (matches BossTerm's SettingsTheme).
+private val ShareBg = Color(0xFF1E1E1E)
+private val ShareSurface = Color(0xFF2B2B2B)
+private val ShareAccent = Color(0xFF4A90E2)
+private val ShareBorder = Color(0xFF404040)
+private val ShareTextMuted = Color(0xFF707070)
+private val ShareDanger = Color(0xFFE57373)
+private val ShareApprove = Color(0xFF4CAF50)
+
 /**
- * Browser toolbar with URL bar, navigation controls, bookmark star, zoom indicator, and URL autocomplete.
- * Design matches the main implementation with inline autocomplete and keyboard navigation.
+ * Full-width pending-request row for the share window (BossTerm's PendingRequestsList
+ * style): device name + what it asked for on the left, Deny / Approve on the right.
+ */
+@Composable
+private fun PendingRequestRow(
+    deviceName: String,
+    wantsControl: Boolean,
+    verifyCode: String?,
+    onApprove: () -> Unit,
+    onDeny: () -> Unit,
+) {
+    Surface(color = ShareSurface, shape = RoundedCornerShape(6.dp), modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(deviceName, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    "wants to ${if (wantsControl) "control" else "view"}" + (verifyCode?.let { " · 🔒 $it" } ?: ""),
+                    color = ShareTextMuted, fontSize = 11.sp
+                )
+            }
+            TextButton(onClick = onDeny, colors = ButtonDefaults.textButtonColors(contentColor = ShareDanger)) {
+                Text("Deny")
+            }
+            Button(
+                onClick = onApprove,
+                colors = ButtonDefaults.buttonColors(backgroundColor = ShareApprove, contentColor = Color.White)
+            ) { Text("Approve") }
+        }
+    }
+}
+
+/**
+ * BossTerm-style non-modal approval banner: a floating dark card prompting the host
+ * to approve/deny one viewer's request. Stacked in the shared tab's top-right overlay.
+ */
+@Composable
+private fun ShareRequestToast(
+    deviceName: String,
+    wantsControl: Boolean,
+    verifyCode: String?,
+    onApprove: () -> Unit,
+    onDeny: () -> Unit,
+) {
+    Surface(
+        color = ShareSurface,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, ShareBorder),
+        elevation = 6.dp,
+    ) {
+        Column(Modifier.widthIn(max = 320.dp).padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Text("Browser sharing", color = ShareTextMuted, fontSize = 11.sp)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "$deviceName wants to ${if (wantsControl) "control" else "view"} this tab",
+                color = Color.White, fontSize = 13.sp
+            )
+            verifyCode?.let { code ->
+                Spacer(Modifier.height(2.dp))
+                Text("🔒 Approve only if their code is $code", color = ShareTextMuted, fontSize = 11.sp)
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = onDeny, colors = ButtonDefaults.textButtonColors(contentColor = ShareDanger)) {
+                    Text("Deny")
+                }
+                Button(
+                    onClick = onApprove,
+                    colors = ButtonDefaults.buttonColors(backgroundColor = ShareApprove, contentColor = Color.White)
+                ) { Text("Approve") }
+            }
+        }
+    }
+}
+
+/**
+ * Co-browse share window — a separate OS window (BossTerm-style): QR + View/Control
+ * toggle, live status with a hot-reloading link, E2E code, links, mask, Stop sharing.
  */
 @Composable
 private fun ShareLinkDialog(
-    info: BrowserShareManager.ShareInfo,
     maskInputs: Boolean,
     onToggleMask: (Boolean) -> Unit,
+    onRefreshLink: () -> Unit,
+    onStopSharing: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val clipboard = LocalClipboardManager.current
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Share \"${info.sessionName}\"") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Window(
+        onCloseRequest = onDismiss,
+        title = "BOSS — Share Tab",
+        resizable = false,
+        state = rememberWindowState(size = DpSize(560.dp, 720.dp)),
+    ) {
+      MaterialTheme(
+          colors = darkColors(
+              primary = ShareAccent, onPrimary = Color.White,
+              surface = ShareSurface, onSurface = Color.White,
+              background = ShareBg, error = ShareDanger,
+          )
+      ) {
+        // Collected INSIDE the Window so this composition subscribes directly —
+        // makes the link/QR hot-reload when the Cloudflare tunnel resolves.
+        val info by BrowserShareManager.shareInfo.collectAsState()
+        val viewerCount by BrowserShareManager.viewerCount.collectAsState()
+        val pending by BrowserShareManager.pendingRequests.collectAsState()
+        val current = info
+        if (current == null) {
+            Surface(color = ShareBg, modifier = Modifier.fillMaxSize()) {}
+            return@MaterialTheme
+        }
+        val loopbackOnly = current.viewUrl.contains("://127.0.0.1") || current.viewUrl.contains("://localhost")
+        val muted = ShareTextMuted
+        // View vs Control: the QR + links update to whichever is selected.
+        var showControl by remember { mutableStateOf(false) }
+        val link = if (showControl) current.controlUrl else current.viewUrl
+        val qr = remember(link) { qrImageBitmap(link) }
+        Surface(color = ShareBg, modifier = Modifier.fillMaxSize()) {
+          Column(Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                // Headline = the editable session name (what viewers see). Compact
+                // BasicTextField (BossTerm-style), not Material's tall OutlinedTextField.
+                var nameField by remember { mutableStateOf(current.sessionName) }
+                Column {
+                    Text("Session name", color = muted, fontSize = 11.sp)
+                    BasicTextField(
+                        value = nameField,
+                        onValueChange = { nameField = it; BrowserShareManager.setSessionName(it) },
+                        singleLine = true,
+                        textStyle = TextStyle(color = Color.White, fontSize = 13.sp),
+                        cursorBrush = SolidColor(ShareAccent),
+                        decorationBox = { inner ->
+                            Box(
+                                Modifier.fillMaxWidth()
+                                    .background(ShareBg, RoundedCornerShape(6.dp))
+                                    .border(1.dp, ShareBorder, RoundedCornerShape(6.dp))
+                                    .padding(horizontal = 10.dp, vertical = 7.dp)
+                            ) { inner() }
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                    )
+                }
                 Text(
-                    "Viewers must be approved on this device before anything streams.",
-                    style = MaterialTheme.typography.caption
+                    "Open a link on another device to watch live; the control link also lets it click and type.",
+                    style = MaterialTheme.typography.caption, color = muted
                 )
-                info.e2eCode?.let {
-                    Text("\uD83D\uDD12 Verify code: $it", style = MaterialTheme.typography.caption)
+
+                // --- Pending approval requests (full-width rows, like BossTerm) ---
+                if (pending.isNotEmpty()) {
+                    Text("Pending requests", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    pending.forEach { req ->
+                        PendingRequestRow(
+                            deviceName = req.deviceName,
+                            wantsControl = req.wantsControl,
+                            verifyCode = current.e2eCode,
+                            onApprove = { BrowserShareManager.approveRequest(req.id) },
+                            onDeny = { BrowserShareManager.denyRequest(req.id) },
+                        )
+                    }
                 }
-                if (info.tunnelPending) {
-                    Text("Generating public link\u2026", style = MaterialTheme.typography.body2)
-                } else {
-                    ShareLinkRow("View link", info.viewUrl) { clipboard.setText(AnnotatedString(info.viewUrl)) }
-                    ShareLinkRow("Control link", info.controlUrl) { clipboard.setText(AnnotatedString(info.controlUrl)) }
+
+                // --- QR section (QR, then View/Control toggle, then caption) ---
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    if (qr != null) {
+                        Image(
+                            bitmap = qr,
+                            contentDescription = if (showControl) "Control link QR" else "View link QR",
+                            modifier = Modifier.size(200.dp).background(Color.White).padding(8.dp)
+                        )
+                    }
+                    ShareModeToggle(showControl = showControl, onChange = { showControl = it })
+                    Text(
+                        if (showControl) "QR encodes the Control link \u2014 scanning grants click/type access."
+                        else "QR encodes the View link (read-only).",
+                        style = MaterialTheme.typography.caption,
+                        color = if (showControl) MaterialTheme.colors.error else muted,
+                        textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+                    )
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = maskInputs, onCheckedChange = onToggleMask)
-                    Text("Mask typed input (hide form values)", style = MaterialTheme.typography.body2)
+
+                // --- Live status + refresh ---
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (current.tunnelPending) {
+                            CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 2.dp)
+                            Text("Creating public link\u2026", style = MaterialTheme.typography.caption, color = muted)
+                        } else {
+                            Box(Modifier.size(8.dp).background(Color(0xFF4CAF50), CircleShape))
+                            Text(
+                                when (viewerCount) {
+                                    0 -> "Live \u2014 waiting for viewers"
+                                    1 -> "Live \u2014 1 viewer"
+                                    else -> "Live \u2014 $viewerCount viewers"
+                                },
+                                style = MaterialTheme.typography.caption
+                            )
+                        }
+                    }
+                    TextButton(onClick = onRefreshLink, enabled = !current.tunnelPending) {
+                        Text(if (current.tunnelPending) "Refreshing\u2026" else "\u21BB Refresh link", style = MaterialTheme.typography.caption)
+                    }
                 }
+
+                // --- Links section: E2E code, both rows, reachability ---
+                current.e2eCode?.let { code ->
+                    Text(
+                        "\uD83D\uDD12 End-to-end encrypted \u00B7 code $code \u2014 the relay can't read this session. " +
+                            "The same code shows on the viewer; matching codes confirm the key.",
+                        style = MaterialTheme.typography.caption, color = MaterialTheme.colors.primary
+                    )
+                }
+                ShareLinkRow("View (read-only)", current.viewUrl)
+                ShareLinkRow("Control (can type)", current.controlUrl)
+                Text(
+                    if (loopbackOnly)
+                        "Reachable only on this machine \u2014 a public link is being created (or cloudflared isn't installed)."
+                    else
+                        "Public link is ephemeral \u2014 use \u21BB Refresh link to mint a new one.",
+                    style = MaterialTheme.typography.caption, color = muted
+                )
+                if (!current.secure) {
+                    Text(
+                        "\u26A0 Not encrypted \u2014 this link is plaintext. Use it only on a trusted LAN.",
+                        style = MaterialTheme.typography.caption, color = MaterialTheme.colors.error
+                    )
+                }
+
+                // --- Privacy: input masking (fluck-specific) ---
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = maskInputs, onCheckedChange = onToggleMask)
+                        Text("Mask typed input", style = MaterialTheme.typography.body2)
+                    }
+                    Text(
+                        "Form values stream as \u2022\u2022\u2022 (passwords are always masked).",
+                        style = MaterialTheme.typography.caption, color = muted,
+                        modifier = Modifier.padding(start = 48.dp)
+                    )
+                }
+            } // end scrollable content
+
+            // Pinned footer \u2014 always visible without scrolling.
+            Box(Modifier.fillMaxWidth().height(1.dp).background(ShareBorder))
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = onStopSharing, colors = ButtonDefaults.textButtonColors(contentColor = ShareDanger)) {
+                    Text("Stop sharing")
+                }
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(backgroundColor = ShareAccent, contentColor = Color.White)
+                ) { Text("Close") }
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } }
-    )
+          }
+        }
+      }
+    }
 }
 
+/** Two-segment View/Control toggle shown under the share QR. */
 @Composable
-private fun ShareLinkRow(label: String, url: String, onCopy: () -> Unit) {
-    Column {
+private fun ShareModeToggle(showControl: Boolean, onChange: (Boolean) -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colors.onSurface.copy(alpha = 0.06f),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(modifier = Modifier.padding(3.dp)) {
+            listOf(false to "View", true to "Control").forEach { (control, label) ->
+                val selected = showControl == control
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (selected) MaterialTheme.colors.primary else Color.Transparent,
+                    modifier = Modifier.weight(1f).clickable { onChange(control) }
+                ) {
+                    Text(
+                        label,
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.body2,
+                        color = if (selected) MaterialTheme.colors.onPrimary else MaterialTheme.colors.onSurface,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Render [text] as a crisp QR code (tight modules, integer upscale) into a Compose ImageBitmap. */
+private fun qrImageBitmap(text: String, target: Int = 480): ImageBitmap? = runCatching {
+    val hints = mapOf(com.google.zxing.EncodeHintType.MARGIN to 1)
+    val matrix = com.google.zxing.qrcode.QRCodeWriter()
+        .encode(text, com.google.zxing.BarcodeFormat.QR_CODE, 1, 1, hints)
+    val n = matrix.width
+    val scale = (target / n).coerceAtLeast(1)
+    val px = n * scale
+    val image = java.awt.image.BufferedImage(px, px, java.awt.image.BufferedImage.TYPE_INT_RGB)
+    val black = 0xFF000000.toInt(); val white = 0xFFFFFFFF.toInt()
+    for (my in 0 until n) for (mx in 0 until n) {
+        val color = if (matrix.get(mx, my)) black else white
+        for (dy in 0 until scale) for (dx in 0 until scale) image.setRGB(mx * scale + dx, my * scale + dy, color)
+    }
+    image.toComposeImageBitmap()
+}.getOrNull()
+
+@Composable
+private fun ShareLinkRow(label: String, url: String) {
+    val clipboard = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1600)
+            copied = false
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(label, style = MaterialTheme.typography.caption, color = MaterialTheme.colors.primary)
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                url,
-                style = MaterialTheme.typography.body2,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            TextButton(onClick = onCopy) { Text("Copy") }
+        Surface(
+            shape = RoundedCornerShape(6.dp),
+            color = MaterialTheme.colors.onSurface.copy(alpha = 0.06f)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 10.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    url,
+                    style = MaterialTheme.typography.caption.copy(fontFamily = FontFamily.Monospace),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(url))
+                        copied = true
+                    },
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+                        contentDescription = if (copied) "Copied" else "Copy link",
+                        tint = if (copied) Color(0xFF4CAF50) else MaterialTheme.colors.onSurface.copy(alpha = 0.7f),
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
         }
     }
 }
@@ -1675,7 +2003,7 @@ internal fun BrowserToolbar(
     onSelectedDropdownIndexChange: (Int) -> Unit = {},
     onFocusLost: () -> Unit = {},
     onShare: (() -> Unit)? = null,
-    onConnectRemote: (() -> Unit)? = null
+    isSharing: Boolean = false
 ) {
     val coroutineScope = rememberCoroutineScope()
     // Auto-scroll to selected suggestion when using arrow keys
@@ -1692,31 +2020,18 @@ internal fun BrowserToolbar(
             .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Share (co-browse) button — only shown when a share handler is wired.
+        // Share (co-browse) button — a QR icon, like BossTerm. Green while a share
+        // session is live so an active stream is always visible. (Connecting to a
+        // remote session is handled at the workspace level, not here.)
         if (onShare != null) {
             IconButton(
                 onClick = onShare,
                 modifier = Modifier.size(32.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Filled.Share,
-                    contentDescription = "Share this tab",
-                    tint = Color(0xFFCCCCCC),
-                    modifier = Modifier.size(18.dp)
-                )
-            }
-        }
-
-        // Connect to a remote (co-browse) session.
-        if (onConnectRemote != null) {
-            IconButton(
-                onClick = onConnectRemote,
-                modifier = Modifier.size(32.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Link,
-                    contentDescription = "Connect to remote browser",
-                    tint = Color(0xFFCCCCCC),
+                    imageVector = Icons.Filled.QrCode2,
+                    contentDescription = if (isSharing) "Sharing is live — manage" else "Share this tab",
+                    tint = if (isSharing) Color(0xFF4CAF50) else Color(0xFFCCCCCC),
                     modifier = Modifier.size(18.dp)
                 )
             }

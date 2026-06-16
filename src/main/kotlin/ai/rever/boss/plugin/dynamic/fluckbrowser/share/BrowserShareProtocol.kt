@@ -116,7 +116,26 @@ sealed class ServerMessage {
     @Serializable
     @SerialName("denied")
     data class Denied(val reason: String? = null) : ServerMessage()
+
+    // --- WebRTC signaling (host → viewer) ---
+    /** ICE server config so the viewer can build its RTCPeerConnection. */
+    @Serializable
+    @SerialName("rtcConfig")
+    data class RtcConfig(val iceServers: List<RtcIceServer> = emptyList(), val enabled: Boolean = true) : ServerMessage()
+
+    /** Host peer's SDP answer to the viewer's offer. */
+    @Serializable
+    @SerialName("rtcAnswer")
+    data class RtcAnswer(val sdp: String) : ServerMessage()
+
+    /** Trickled ICE candidate from the host peer. */
+    @Serializable
+    @SerialName("rtcIce")
+    data class RtcIce(val candidate: String) : ServerMessage()
 }
+
+@Serializable
+data class RtcIceServer(val urls: String, val username: String? = null, val credential: String? = null)
 
 /** Viewer → host messages. */
 @Serializable
@@ -171,6 +190,42 @@ sealed class ClientMessage {
     @SerialName("scroll")
     data class Scroll(val tabId: String, val id: Int? = null, val x: Int = 0, val y: Int = 0) : ClientMessage()
 
+    // --- native input (control-only; dispatched through the engine's input
+    // pipeline as TRUSTED events — preferred over the semantic Click/Input/Key
+    // path, which synthesizes untrusted DOM events) ---
+
+    /** Mouse event at viewport CSS-px (x, y). kind: down|up|move|drag. button: 0=primary 1=middle 2=secondary. */
+    @Serializable
+    @SerialName("ptr")
+    data class Pointer(
+        val tabId: String,
+        val kind: String,
+        val x: Int,
+        val y: Int,
+        val button: Int = 0,
+        val clicks: Int = 1,
+    ) : ClientMessage()
+
+    /** Wheel rotation at viewport (x, y) with CSS-px deltas. */
+    @Serializable
+    @SerialName("whl")
+    data class Wheel(val tabId: String, val x: Int, val y: Int, val dx: Float = 0f, val dy: Float = 0f) : ClientMessage()
+
+    /** Raw keystroke for native dispatch. kind: keydown|keyup. [ch] is the printable char, if any. */
+    @Serializable
+    @SerialName("keyn")
+    data class KeyNative(
+        val tabId: String,
+        val kind: String,
+        val key: String = "",
+        val code: String = "",
+        val ch: String = "",
+        val shift: Boolean = false,
+        val ctrl: Boolean = false,
+        val alt: Boolean = false,
+        val meta: Boolean = false,
+    ) : ClientMessage()
+
     @Serializable
     @SerialName("newTab")
     data class NewTab(val url: String? = null) : ClientMessage()
@@ -178,6 +233,17 @@ sealed class ClientMessage {
     @Serializable
     @SerialName("closeTab")
     data class CloseTab(val tabId: String) : ClientMessage()
+
+    // --- WebRTC signaling (viewer → host); viewer is the offerer ---
+    /** Viewer's SDP offer (creates the data channels). */
+    @Serializable
+    @SerialName("rtcOffer")
+    data class RtcOffer(val sdp: String) : ClientMessage()
+
+    /** Trickled ICE candidate from the viewer. */
+    @Serializable
+    @SerialName("rtcIce")
+    data class RtcIce(val candidate: String) : ClientMessage()
 }
 
 /**
@@ -185,6 +251,22 @@ sealed class ClientMessage {
  * `BrowserHandle.applyCoBrowseControl`. Encoded with [ControlJson] so absent
  * fields are omitted (e.g. `{"kind":"click","id":42}`).
  */
+/**
+ * Native keystroke payload for `BrowserHandle.dispatchCoBrowseInput` — encoded
+ * with [ControlJson] so key/char strings are JSON-escaped properly.
+ */
+@Serializable
+data class NativeKeyPayload(
+    val kind: String,
+    val key: String = "",
+    val code: String = "",
+    val ch: String = "",
+    val shift: Boolean = false,
+    val ctrl: Boolean = false,
+    val alt: Boolean = false,
+    val meta: Boolean = false,
+)
+
 @Serializable
 data class ControlPayload(
     val kind: String,

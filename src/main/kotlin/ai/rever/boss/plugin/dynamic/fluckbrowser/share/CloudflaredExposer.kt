@@ -69,7 +69,7 @@ object CloudflaredExposer {
      * [awaitUrl] when the public URL prints and [awaitReady] when an edge connection
      * registers (the point at which the URL actually routes to us).
      */
-    class QuickTunnel internal constructor(val process: Process) {
+    class QuickTunnel internal constructor(val process: Process) : RemoteTunnel {
         private val urlFuture = CompletableFuture<String?>()
         private val readyFuture = CompletableFuture<Boolean>()
         private val urlRe = Regex("""https://[a-z0-9-]+\.trycloudflare\.com""")
@@ -89,15 +89,15 @@ object CloudflaredExposer {
         }
 
         /** The assigned `*.trycloudflare.com` URL, or null on timeout / early exit. */
-        fun awaitUrl(timeoutMs: Long = 30_000): String? =
+        override fun awaitUrl(timeoutMs: Long): String? =
             runCatching { urlFuture.get(timeoutMs, TimeUnit.MILLISECONDS) }.getOrNull()
 
         /** True once cloudflared registers an edge connection (the tunnel is routable). */
-        fun awaitReady(timeoutMs: Long = 20_000): Boolean =
+        override fun awaitReady(timeoutMs: Long): Boolean =
             runCatching { readyFuture.get(timeoutMs, TimeUnit.MILLISECONDS) }.getOrDefault(false)
 
         /** Kill the tunnel (ends the public URL). */
-        fun destroy() { runCatching { process.destroyForcibly() } }
+        override fun destroy() { runCatching { process.destroyForcibly() } }
     }
 
     private fun runCmd(cmd: List<String>, timeoutSec: Long): String? = try {
