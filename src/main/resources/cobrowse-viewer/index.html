@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>BOSS — Shared Browser</title>
+  <link rel="stylesheet" href="vendor/rrweb.min.css" />
+  <style>
+    :root { --bg:#1e1e1e; --panel:#252526; --border:#3c3c3c; --fg:#e6e6e6; --muted:#9a9a9a; --accent:#4a8cff; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:13px -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { display:flex; flex-direction:column; height:100%; }
+    #topbar { display:flex; align-items:center; gap:8px; padding:6px 8px; background:var(--panel); border-bottom:1px solid var(--border); }
+    #tabbar { display:flex; gap:4px; overflow-x:auto; flex:1; }
+    .tab { display:flex; align-items:center; gap:6px; padding:4px 10px; border:1px solid var(--border); border-radius:6px;
+           background:#2d2d2d; color:var(--muted); white-space:nowrap; cursor:pointer; max-width:240px; }
+    .tab.active { background:#37373d; color:var(--fg); border-color:var(--accent); }
+    .tab .ttl { overflow:hidden; text-overflow:ellipsis; max-width:180px; }
+    .tab img.fav { width:14px; height:14px; }
+    .tab .x { display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px; margin-left:2px;
+              border-radius:4px; font-size:13px; line-height:1; color:var(--muted); flex:none; }
+    .tab .x:hover { background:#5a1d1d; color:#fff; }
+    .newtab { display:flex; align-items:center; justify-content:center; min-width:28px; padding:4px 8px; flex:none;
+              border:1px solid var(--border); border-radius:6px; background:#2d2d2d; color:var(--muted);
+              cursor:pointer; font-size:16px; line-height:1; }
+    .newtab:hover { color:var(--fg); border-color:var(--accent); }
+    /* BOSS-style address bar: flat icon buttons + a rectangular address field with
+       a green lock when the page is secure. */
+    #navbar { display:flex; align-items:center; gap:2px; padding:5px 8px; background:var(--panel); border-bottom:1px solid var(--border); }
+    #navbar button { background:transparent; color:#cccccc; border:0; border-radius:6px; width:30px; height:30px;
+                     font-size:16px; line-height:1; cursor:pointer; }
+    #navbar button:hover:not(:disabled) { background:rgba(255,255,255,.08); color:var(--fg); }
+    #navbar button:disabled { color:#5a5a5a; cursor:default; }
+    .addrbar { flex:1; display:flex; align-items:center; gap:6px; margin-left:6px; height:30px; padding:0 10px;
+               background:var(--bg); border:1px solid var(--border); border-radius:6px; }
+    .addrbar:focus-within { border-color:var(--accent); }
+    .addrbar .lock { font-size:12px; color:#4CAF50; display:none; flex:none; }
+    .addrbar.secure .lock { display:inline; }
+    #url { flex:1; background:transparent; color:var(--fg); border:0; outline:none; padding:0; font-size:13px; }
+    #url::placeholder { color:var(--muted); }
+    /* DevTools device-mode-style stage: dark backdrop, the remote screen scaled to
+       fit and centered inside a framed container (host viewport ≠ client viewport). */
+    #stage { position:relative; flex:1; overflow:hidden; background:#141414;
+             display:flex; align-items:center; justify-content:center; }
+    #screen { position:relative; flex:none; background:#fff; transform-origin:center center;
+              box-shadow:0 0 0 1px #000, 0 10px 40px rgba(0,0,0,.55); }
+    /* rrweb mounts .replayer-wrapper here; pin it to fill the frame from the top-left
+       so the iframe, video and overlay all share one coordinate space under the scale. */
+    #screen .replayer-wrapper { position:absolute !important; top:0 !important; left:0 !important; margin:0 !important; }
+    #screen iframe { border:0; display:block; }
+    #overlay { position:absolute; inset:0; display:none; }
+    #overlay.on { display:block; }
+    /* While controlling, your own OS cursor is the authoritative pointer (instant,
+       1:1 with clicks). Hide rrweb's echoed host cursor — it's a full round-trip
+       behind and just reads as lag. When view-only we keep it (useful to watch). */
+    #stage.controlling .replayer-mouse,
+    #stage.controlling .replayer-mouse-tail { display:none !important; }
+    #status { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; flex-direction:column;
+              gap:12px; background:rgba(20,20,20,.92); color:var(--fg); text-align:center; padding:24px; z-index:10; }
+    #status.hidden { display:none; }
+    .pill { font-size:11px; padding:2px 8px; border-radius:10px; background:#333; color:var(--muted); }
+    .pill.e2e { background:#15391f; color:#7fd99a; }
+    .pill.code { font-family:monospace; }
+    #ctlbtn { background:var(--accent); color:#fff; border:0; border-radius:5px; padding:4px 10px; cursor:pointer; }
+    #ctlbtn.granted { background:#15391f; color:#7fd99a; }
+    .spinner { width:28px; height:28px; border:3px solid #444; border-top-color:var(--accent); border-radius:50%; animation:spin 1s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    button:focus { outline:1px solid var(--accent); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <div id="tabbar"></div>
+      <span id="presence" class="pill">0 viewers</span>
+      <span id="e2e" class="pill e2e" style="display:none">&#128274; <span id="e2ecode" class="code"></span></span>
+      <button id="ctlbtn">Request control</button>
+    </div>
+    <div id="navbar">
+      <button id="back" title="Back">&#8249;</button>
+      <button id="fwd" title="Forward">&#8250;</button>
+      <button id="reload" title="Reload">&#10227;</button>
+      <div class="addrbar" id="addrbar">
+        <span class="lock" title="Secure">&#128274;</span>
+        <input id="url" placeholder="Enter URL or search" />
+      </div>
+    </div>
+    <div id="stage">
+      <div id="screen"></div>
+      <div id="status"><div class="spinner"></div><div id="statustext">Connecting…</div></div>
+      <div id="overlay"></div>
+    </div>
+  </div>
+  <script src="vendor/rrweb.min.js"></script>
+  <script src="viewer.js"></script>
+</body>
+</html>

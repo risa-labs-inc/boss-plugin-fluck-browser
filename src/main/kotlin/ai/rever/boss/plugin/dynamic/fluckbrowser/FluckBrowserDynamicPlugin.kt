@@ -2,23 +2,15 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
 
 /**
  * Fluck Browser dynamic plugin - Loaded from external JAR.
  *
  * Provides embedded web browser TAB (main panel) using BrowserService from PluginContext.
- * This plugin offers a full-featured browser experience with:
- * - URL bar with navigation controls
- * - Back/forward/reload buttons
- * - Zoom controls (dropdown with common zoom levels)
- * - Loading indicator (progress bar)
- * - Security indicator (HTTPS lock icon)
- * - Tab title and favicon updates
- * - Download management integration
- * - Secret/credential integration for form filling
- *
- * NOTE: This is a main panel TAB plugin, not a sidebar panel.
- * It registers as a TabType via tabRegistry.registerTabType().
+ * In addition to browsing it hosts the co-browse tab-sharing server
+ * ([BrowserShareManager]) so a tab's rendered DOM can be mirrored to a remote
+ * viewer (web link or peer BossConsole) with approval-gated control.
  *
  * PRIVATE: This plugin is proprietary and not open source.
  */
@@ -39,10 +31,17 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         context.tabRegistry.registerTabType(FluckBrowserTabType) { tabInfo, ctx ->
             FluckBrowserTabComponent(ctx, tabInfo, context)
         }
+
+        // Co-browse tab sharing: store context. The embedded server binds lazily on
+        // the first share() call. Approval is surfaced BossTerm-style — the in-tab
+        // ShareRequestToast banner + the Share window's PendingRequestsList — so no
+        // host notification toast is posted (it duplicated those and looked off-style).
+        BrowserShareManager.start(context)
     }
 
     override fun dispose() {
-        // Unregister tab type when plugin is unloaded
+        // Tear down the share server (stops any active capture) before unregistering.
+        BrowserShareManager.shutdown()
         pluginContext?.tabRegistry?.unregisterTabType(FluckBrowserTabType.typeId)
         pluginContext = null
     }
