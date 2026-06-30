@@ -19,6 +19,8 @@ import ai.rever.boss.plugin.api.UrlHistoryEntry
 import ai.rever.boss.plugin.api.UrlHistoryProvider
 import ai.rever.boss.plugin.api.ZoomSettingsProvider
 import ai.rever.boss.plugin.bookmark.Bookmark
+import ai.rever.boss.plugin.ui.BossTheme
+import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.boss.plugin.workspace.TabConfig
 import ai.rever.boss.plugin.browser.BrowserConfig
 import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
@@ -800,6 +802,7 @@ internal fun FluckBrowserTabContent(
     // handle is owned by the parent Component and disposed in its
     // lifecycle.onDestroy callback (i.e. only on tab close).
 
+    BossTheme {
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
@@ -1313,6 +1316,7 @@ internal fun FluckBrowserTabContent(
             }
         }
     } // End Box
+    } // End BossTheme
 }
 
 /**
@@ -1714,14 +1718,16 @@ private fun copyToClipboard(text: String) {
     }
 }
 
-// Share window palette (matches BossTerm's SettingsTheme).
-private val ShareBg = Color(0xFF1E1E1E)
-private val ShareSurface = Color(0xFF2B2B2B)
-private val ShareAccent = Color(0xFF4A90E2)
-private val ShareBorder = Color(0xFF404040)
-private val ShareTextMuted = Color(0xFF707070)
-private val ShareDanger = Color(0xFFE57373)
-private val ShareApprove = Color(0xFF4CAF50)
+// Share window palette — sourced from the reactive BOSS theme tokens so the
+// co-browse window re-skins with the host (previously hardcoded to match
+// BossTerm's SettingsTheme).
+private val ShareBg get() = BossThemeColors.BackgroundColor
+private val ShareSurface get() = BossThemeColors.SurfaceColor
+private val ShareAccent get() = BossThemeColors.AccentColor
+private val ShareBorder get() = BossThemeColors.BorderColor
+private val ShareTextMuted get() = BossThemeColors.TextMuted
+private val ShareDanger get() = BossThemeColors.ErrorColor
+private val ShareApprove get() = BossThemeColors.SuccessColor
 
 /**
  * Full-width pending-request row for the share window (BossTerm's PendingRequestsList
@@ -1742,7 +1748,7 @@ private fun PendingRequestRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Column(Modifier.weight(1f)) {
-                Text(deviceName, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(deviceName, color = BossThemeColors.TextPrimary, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
                     "wants to ${if (wantsControl) "control" else "view"}" + (verifyCode?.let { " · 🔒 $it" } ?: ""),
                     color = ShareTextMuted, fontSize = 11.sp
@@ -1753,7 +1759,7 @@ private fun PendingRequestRow(
             }
             Button(
                 onClick = onApprove,
-                colors = ButtonDefaults.buttonColors(backgroundColor = ShareApprove, contentColor = Color.White)
+                colors = ButtonDefaults.buttonColors(backgroundColor = ShareApprove, contentColor = BossThemeColors.TextPrimary)
             ) { Text("Approve") }
         }
     }
@@ -1782,7 +1788,7 @@ private fun ShareRequestToast(
             Spacer(Modifier.height(2.dp))
             Text(
                 "$deviceName wants to ${if (wantsControl) "control" else "view"} this tab",
-                color = Color.White, fontSize = 13.sp
+                color = BossThemeColors.TextPrimary, fontSize = 13.sp
             )
             verifyCode?.let { code ->
                 Spacer(Modifier.height(2.dp))
@@ -1799,7 +1805,7 @@ private fun ShareRequestToast(
                 }
                 Button(
                     onClick = onApprove,
-                    colors = ButtonDefaults.buttonColors(backgroundColor = ShareApprove, contentColor = Color.White)
+                    colors = ButtonDefaults.buttonColors(backgroundColor = ShareApprove, contentColor = BossThemeColors.TextPrimary)
                 ) { Text("Approve") }
             }
         }
@@ -1826,8 +1832,8 @@ private fun ShareLinkDialog(
     ) {
       MaterialTheme(
           colors = darkColors(
-              primary = ShareAccent, onPrimary = Color.White,
-              surface = ShareSurface, onSurface = Color.White,
+              primary = ShareAccent, onPrimary = BossThemeColors.TextPrimary,
+              surface = ShareSurface, onSurface = BossThemeColors.TextPrimary,
               background = ShareBg, error = ShareDanger,
           )
       ) {
@@ -1862,7 +1868,7 @@ private fun ShareLinkDialog(
                         value = nameField,
                         onValueChange = { nameField = it; BrowserShareManager.setSessionName(it) },
                         singleLine = true,
-                        textStyle = TextStyle(color = Color.White, fontSize = 13.sp),
+                        textStyle = TextStyle(color = BossThemeColors.TextPrimary, fontSize = 13.sp),
                         cursorBrush = SolidColor(ShareAccent),
                         decorationBox = { inner ->
                             Box(
@@ -1882,7 +1888,7 @@ private fun ShareLinkDialog(
 
                 // --- Pending approval requests (full-width rows, like BossTerm) ---
                 if (pending.isNotEmpty()) {
-                    Text("Pending requests", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Pending requests", color = BossThemeColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     pending.forEach { req ->
                         PendingRequestRow(
                             deviceName = req.deviceName,
@@ -1928,7 +1934,7 @@ private fun ShareLinkDialog(
                             CircularProgressIndicator(modifier = Modifier.size(13.dp), strokeWidth = 2.dp)
                             Text("Creating public link\u2026", style = MaterialTheme.typography.caption, color = muted)
                         } else {
-                            Box(Modifier.size(8.dp).background(Color(0xFF4CAF50), CircleShape))
+                            Box(Modifier.size(8.dp).background(BossThemeColors.SuccessColor, CircleShape))
                             Text(
                                 when (viewerCount) {
                                     0 -> "Live \u2014 waiting for viewers"
@@ -1994,7 +2000,7 @@ private fun ShareLinkDialog(
                 }
                 Button(
                     onClick = onDismiss,
-                    colors = ButtonDefaults.buttonColors(backgroundColor = ShareAccent, contentColor = Color.White)
+                    colors = ButtonDefaults.buttonColors(backgroundColor = ShareAccent, contentColor = BossThemeColors.TextPrimary)
                 ) { Text("Close") }
             }
           }
@@ -2086,7 +2092,7 @@ private fun ShareLinkRow(label: String, url: String) {
                     Icon(
                         imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
                         contentDescription = if (copied) "Copied" else "Copy link",
-                        tint = if (copied) Color(0xFF4CAF50) else MaterialTheme.colors.onSurface.copy(alpha = 0.7f),
+                        tint = if (copied) BossThemeColors.SuccessColor else MaterialTheme.colors.onSurface.copy(alpha = 0.7f),
                         modifier = Modifier.size(14.dp)
                     )
                 }
@@ -2151,7 +2157,7 @@ internal fun BrowserToolbar(
                 Icon(
                     imageVector = Icons.Filled.QrCode2,
                     contentDescription = if (isSharing) "Sharing is live — manage" else "Share this tab",
-                    tint = if (isSharing) Color(0xFF4CAF50) else Color(0xFFCCCCCC),
+                    tint = if (isSharing) BossThemeColors.SuccessColor else BossThemeColors.TextPrimary,
                     modifier = Modifier.size(18.dp)
                 )
             }
@@ -2166,7 +2172,7 @@ internal fun BrowserToolbar(
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                 contentDescription = "Back",
-                tint = if (canGoBack) Color(0xFFCCCCCC) else Color(0xFF666666),
+                tint = if (canGoBack) BossThemeColors.TextPrimary else BossThemeColors.TextMuted,
                 modifier = Modifier.size(18.dp)
             )
         }
@@ -2180,7 +2186,7 @@ internal fun BrowserToolbar(
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                 contentDescription = "Forward",
-                tint = if (canGoForward) Color(0xFFCCCCCC) else Color(0xFF666666),
+                tint = if (canGoForward) BossThemeColors.TextPrimary else BossThemeColors.TextMuted,
                 modifier = Modifier.size(18.dp)
             )
         }
@@ -2210,7 +2216,7 @@ internal fun BrowserToolbar(
             Icon(
                 imageVector = if (isLoading) Icons.Default.Close else Icons.Default.Refresh,
                 contentDescription = if (isLoading) "Stop" else "Refresh",
-                tint = Color(0xFFCCCCCC),
+                tint = BossThemeColors.TextPrimary,
                 modifier = Modifier.size(18.dp)
             )
         }
@@ -2316,7 +2322,7 @@ internal fun BrowserToolbar(
                             Icon(
                                 imageVector = Icons.Default.Lock,
                                 contentDescription = "Secure connection",
-                                tint = Color(0xFF4CAF50),
+                                tint = BossThemeColors.SuccessColor,
                                 modifier = Modifier.size(14.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
@@ -2429,7 +2435,7 @@ internal fun BrowserErrorContent(
                 Icon(
                     imageVector = Icons.Default.Warning,
                     contentDescription = "Error",
-                    tint = Color(0xFFFFA726),
+                    tint = BossThemeColors.WarningColor,
                     modifier = Modifier.size(48.dp)
                 )
             }
@@ -2555,9 +2561,9 @@ internal fun FluckBrowserStubContent() {
 // SECRET DIALOGS
 // ============================================================
 
-private val BossDarkBackground = Color(0xFF1E1F22)
-private val BossDarkBorder = Color(0xFF3C3F41)
-private val BossDarkTextSecondary = Color(0xFF9E9E9E)
+private val BossDarkBackground get() = BossThemeColors.BackgroundColor
+private val BossDarkBorder get() = BossThemeColors.BorderColor
+private val BossDarkTextSecondary get() = BossThemeColors.TextSecondary
 
 /**
  * Dialog for browsing and selecting secrets for auto-fill.
@@ -2964,13 +2970,13 @@ private fun QuickCreateSecretDialog(
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             modifier = Modifier.width(380.dp),
-            color = Color(0xFF2D2D2D),
+            color = BossThemeColors.SurfaceColor,
             shape = RoundedCornerShape(8.dp)
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
                     "Save Credentials",
-                    color = Color.White,
+                    color = BossThemeColors.TextPrimary,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -3021,7 +3027,7 @@ private fun QuickCreateSecretDialog(
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         errorMessage!!,
-                        color = Color(0xFFFF5252),
+                        color = BossThemeColors.ErrorColor,
                         fontSize = 12.sp
                     )
                 }
@@ -3067,16 +3073,16 @@ private fun QuickCreateSecretDialog(
                             }
                         },
                         enabled = !isLoading && website.isNotBlank() && username.isNotBlank() && password.isNotBlank(),
-                        colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF4CAF50))
+                        colors = ButtonDefaults.buttonColors(backgroundColor = BossThemeColors.SuccessColor)
                     ) {
                         if (isLoading) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(16.dp),
-                                color = Color.White,
+                                color = BossThemeColors.TextPrimary,
                                 strokeWidth = 2.dp
                             )
                         } else {
-                            Text("Save", color = Color.White)
+                            Text("Save", color = BossThemeColors.TextPrimary)
                         }
                     }
                 }
@@ -3116,8 +3122,8 @@ private fun QuickDialogTextField(
                 onValueChange = onValueChange,
                 modifier = Modifier.weight(1f),
                 singleLine = true,
-                textStyle = MaterialTheme.typography.body2.copy(color = Color.White),
-                cursorBrush = SolidColor(Color(0xFF4CAF50)),
+                textStyle = MaterialTheme.typography.body2.copy(color = BossThemeColors.TextPrimary),
+                cursorBrush = SolidColor(BossThemeColors.SuccessColor),
                 visualTransformation = if (isPassword && !showPassword)
                     PasswordVisualTransformation() else VisualTransformation.None,
                 decorationBox = { innerTextField ->
@@ -3164,7 +3170,7 @@ private fun FullscreenPlaceholder(onExitClick: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF1E1E1E))
+            .background(BossThemeColors.BackgroundColor)
             .clickable { onExitClick() },
         contentAlignment = Alignment.Center
     ) {
@@ -3176,17 +3182,17 @@ private fun FullscreenPlaceholder(onExitClick: () -> Unit) {
                 imageVector = Icons.Outlined.Fullscreen,
                 contentDescription = null,
                 modifier = Modifier.size(64.dp),
-                tint = Color(0xFF888888)
+                tint = BossThemeColors.TextSecondary
             )
             Text(
                 text = "Tab is in fullscreen mode",
                 style = MaterialTheme.typography.h6,
-                color = Color.White
+                color = BossThemeColors.TextPrimary
             )
             Text(
                 text = "Click here or press ESC to exit fullscreen",
                 style = MaterialTheme.typography.body2,
-                color = Color(0xFF888888)
+                color = BossThemeColors.TextSecondary
             )
         }
     }
