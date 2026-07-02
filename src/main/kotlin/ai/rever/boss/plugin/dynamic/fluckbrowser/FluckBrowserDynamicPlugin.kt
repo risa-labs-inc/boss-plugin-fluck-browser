@@ -32,6 +32,9 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
             FluckBrowserTabComponent(ctx, tabInfo, context)
         }
 
+        // Contribute browser_get_url/navigate/run_js MCP tools; auto-removed on disable/unload.
+        context.registerMcpToolProvider(FluckBrowserMcpToolProvider(pluginId, context.activeTabsProvider))
+
         // Co-browse tab sharing: store context. The embedded server binds lazily on
         // the first share() call. Approval is surfaced BossTerm-style — the in-tab
         // ShareRequestToast banner + the Share window's PendingRequestsList — so no
