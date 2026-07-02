@@ -12,7 +12,7 @@
   "description": "Full-featured embedded web browser tab with zoom controls, loading indicator, and security indicator",
   "author": "Risa Labs",
   "url": "https://github.com/risa-labs-inc/boss-plugin-fluck-browser",
-  "minBossVersion": "8.16.30",
+  "minBossVersion": "9.2.20",
   "tab": {
     "typeId": "fluck",
     "displayName": "Browser",
