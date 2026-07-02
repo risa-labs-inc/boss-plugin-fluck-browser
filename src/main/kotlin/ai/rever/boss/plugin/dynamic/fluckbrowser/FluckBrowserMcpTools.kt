@@ -23,7 +23,7 @@ internal class FluckBrowserMcpToolProvider(
             description = "Get the current URL of a browser tab (tab id from tabs_list).",
             inputSchema = tabSchema(),
             handler = McpToolHandler { args ->
-                val bi = integration(args) ?: return@McpToolHandler noBrowser()
+                val bi = integration(args) ?: return@McpToolHandler missingOrUnknownTab(args)
                 val url = bi.getCurrentUrl()
                 McpToolResult(url ?: "(no url)")
             },
@@ -34,7 +34,7 @@ internal class FluckBrowserMcpToolProvider(
             inputSchema = """{"type":"object","properties":{"tab_id":{"type":"string","description":"Browser tab id."},"url":{"type":"string","description":"URL to load."}},"required":["tab_id","url"]}""",
             readOnly = false,
             handler = McpToolHandler { args ->
-                val bi = integration(args) ?: return@McpToolHandler noBrowser()
+                val bi = integration(args) ?: return@McpToolHandler missingOrUnknownTab(args)
                 val url = args.string("url")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: url", isError = true)
                 bi.navigate(url)
@@ -47,7 +47,7 @@ internal class FluckBrowserMcpToolProvider(
             inputSchema = """{"type":"object","properties":{"tab_id":{"type":"string","description":"Browser tab id."},"script":{"type":"string","description":"JavaScript to evaluate."}},"required":["tab_id","script"]}""",
             readOnly = false,
             handler = McpToolHandler { args ->
-                val bi = integration(args) ?: return@McpToolHandler noBrowser()
+                val bi = integration(args) ?: return@McpToolHandler missingOrUnknownTab(args)
                 val script = args.string("script")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: script", isError = true)
                 val result = bi.executeJavaScript(script)
@@ -58,6 +58,14 @@ internal class FluckBrowserMcpToolProvider(
 
     private fun integration(args: ai.rever.boss.plugin.api.McpToolArgs) =
         args.string("tab_id")?.let { activeTabsProvider?.getBrowserIntegration(it) }
+
+    /** Distinguish a missing tab_id argument from an unknown/non-browser tab. */
+    private fun missingOrUnknownTab(args: ai.rever.boss.plugin.api.McpToolArgs): McpToolResult =
+        if (args.string("tab_id") == null) {
+            McpToolResult("Missing required argument: tab_id", isError = true)
+        } else {
+            noBrowser()
+        }
 
     private fun noBrowser(): McpToolResult =
         McpToolResult("No browser tab for that tab_id (or browser unavailable).", isError = true)
