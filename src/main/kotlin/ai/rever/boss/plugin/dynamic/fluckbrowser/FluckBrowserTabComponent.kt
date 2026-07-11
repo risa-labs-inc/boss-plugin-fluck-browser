@@ -567,14 +567,18 @@ internal fun FluckBrowserTabContent(
                     // Update the tab's URL in the host (for bookmark/workspace persistence)
                     tabUpdateProvider?.updateUrl(url)
 
-                    // Load saved zoom level for this domain (zoom persistence feature)
+                    // Load saved zoom level for this domain (zoom persistence feature).
+                    // Zoom is scoped per browser (host sets ZoomMode.PER_BROWSER), so a
+                    // tab keeps its current level across navigations. A domain with no
+                    // saved zoom must therefore reset to the default level — otherwise
+                    // the previous domain's zoom carries over to the new site.
                     zoomSettingsProvider?.let { provider ->
                         val domain = provider.extractDomain(url)
                         if (domain != null) {
-                            val savedZoom = provider.getZoomForDomain(domain)
-                            if (savedZoom != null && abs(savedZoom - zoomLevel) > 0.001) {
-                                zoomLevel = savedZoom
-                                handle.setZoomLevel(savedZoom)
+                            val targetZoom = provider.getZoomForDomain(domain) ?: 1.0
+                            if (abs(targetZoom - zoomLevel) > 0.001) {
+                                zoomLevel = targetZoom
+                                handle.setZoomLevel(targetZoom)
                             }
                         }
                     }
