@@ -90,13 +90,15 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.Lifecycle.Callbacks
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.awt.Color as AwtColor
 import java.awt.Font
 import java.awt.KeyboardFocusManager
@@ -155,23 +157,27 @@ class FluckBrowserTabComponent(
     init {
         lifecycle.subscribe(
             callbacks = object : Callbacks {
+                @OptIn(ExperimentalCoroutinesApi::class)
                 override fun onDestroy() {
                     BrowserShareManager.unregisterTab(config.id)
                     val handle = state.browserHandle
                     state.browserHandle = null
-                    coroutineScope.cancel()
-                    if (handle != null) {
-                        // dispose() ends in browser.close() — a blocking Chromium IPC
-                        // round-trip. Run it off the UI thread so closing a tab never
-                        // hitches the app. Dedicated daemon thread: the Component's
-                        // scope is already cancelled at this point.
-                        Thread({
-                            try {
-                                handle.dispose()
-                            } catch (_: Throwable) {
-                            }
-                        }, "fluck-browser-dispose").apply { isDaemon = true }.start()
+                    // Off the UI thread so closing a tab never hitches the app.
+                    if (handle != null) disposeBrowserHandleOffThread(handle)
+                    // Adopt any in-flight (or completed-but-unconsumed) creation:
+                    // it runs on the never-cancelled browserCreationScope precisely
+                    // so its result stays retrievable here — dispose whatever it
+                    // eventually produces instead of leaking the browser + renderer
+                    // process. invokeOnCompletion fires immediately if the creation
+                    // already completed.
+                    state.browserCreation?.let { pending ->
+                        state.browserCreation = null
+                        pending.invokeOnCompletion {
+                            val orphan = runCatching { pending.getCompleted() }.getOrNull()
+                            if (orphan != null) disposeBrowserHandleOffThread(orphan)
+                        }
                     }
+                    coroutineScope.cancel()
                 }
             }
         )
@@ -374,12 +380,34 @@ internal object TabHibernation {
     }
 }
 
+/**
+ * Browser creations run on their own never-cancelled scope: createBrowser() is a
+ * blocking Chromium IPC call with no cancellation points, so cancelling its
+ * coroutine can only orphan the browser it eventually returns (a cancelled
+ * Deferred discards its result — the live browser and renderer process would
+ * leak). Instead the creation always runs to completion, and whoever owns the
+ * Deferred — the tab effect, or onDestroy for a closing tab — disposes the
+ * result.
+ */
+private val browserCreationScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+/** Dispose a handle off the UI thread — dispose() ends in a blocking Chromium IPC round-trip. */
+internal fun disposeBrowserHandleOffThread(handle: BrowserHandle) {
+    Thread({
+        try {
+            handle.dispose()
+        } catch (t: Throwable) {
+            println("[FluckBrowser] Browser dispose failed: ${t.message}")
+        }
+    }, "fluck-browser-dispose").apply { isDaemon = true }.start()
+}
+
 internal class FluckBrowserTabState {
     var browserHandle: BrowserHandle? by mutableStateOf<BrowserHandle?>(null)
-    // In-flight (or completed-but-unconsumed) browser creation. Runs on the
-    // Component's scope so a tab switch mid-boot neither cancels it nor spawns
-    // a duplicate when the tab re-enters composition.
-    var browserCreation: kotlinx.coroutines.Deferred<BrowserHandle?>? = null
+    // In-flight (or completed-but-unconsumed) browser creation. Runs on
+    // [browserCreationScope] so a tab switch mid-boot neither cancels it nor
+    // spawns a duplicate when the tab re-enters composition.
+    var browserCreation: Deferred<BrowserHandle?>? = null
     // Pending idle-hibernation timer (armed when the tab is backgrounded, cancelled if it returns).
     var hibernationJob: kotlinx.coroutines.Job? = null
     var isInitializing: Boolean by mutableStateOf(true)
@@ -550,23 +578,26 @@ internal fun FluckBrowserTabContent(
             // process — blocking work that used to run inside this LaunchedEffect on
             // Dispatchers.Main and freeze the entire app UI (which also meant the old
             // 3s timeout could never fire: the timer ran on the very thread that was
-            // blocked). The deferred lives on the Component's scope and is stashed in
-            // hoisted state, so a mid-boot tab switch neither cancels the creation nor
-            // starts a duplicate when the tab comes back — re-entry awaits the same
-            // in-flight (or already-completed-but-unconsumed) creation. The timeout is
-            // generous because a slow boot now only delays this tab's spinner, not the
-            // app.
+            // blocked). The deferred runs on the never-cancelled browserCreationScope
+            // and is stashed in hoisted state, so a mid-boot tab switch neither
+            // cancels the creation nor starts a duplicate when the tab comes back —
+            // re-entry awaits the same in-flight (or completed-but-unconsumed)
+            // creation. The timeout is generous because a slow boot now only delays
+            // this tab's spinner, not the app.
             //
-            // Recreate at the CURRENT url (preserved in hoisted state), so a hibernation
-            // wake or crash-recovery returns to the page the user was on, not the tab's
-            // first URL.
-            val creation = hoistedState.browserCreation?.takeIf { !it.isCancelled }
-                ?: coroutineScope.async(kotlinx.coroutines.Dispatchers.IO) {
+            // Fresh creations start at the CURRENT url (preserved in hoisted state),
+            // so a hibernation wake or crash-recovery returns to the page the user
+            // was on, not the tab's first URL. A REUSED deferred deliberately keeps
+            // the URL captured when it was launched: it exists only while a boot is
+            // already in flight, and the browser it produces reports its real
+            // location through the navigation listener anyway.
+            val creation = hoistedState.browserCreation
+                ?: browserCreationScope.async {
                     browserService.createBrowser(
                         BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
                     )
                 }.also { hoistedState.browserCreation = it }
-            val handle = kotlinx.coroutines.withTimeoutOrNull(20_000L) { creation.await() }
+            val handle = withTimeoutOrNull(20_000L) { creation.await() }
             if (creation.isCompleted) hoistedState.browserCreation = null
             if (handle != null) {
                 browserHandle = handle
@@ -818,11 +849,9 @@ internal fun FluckBrowserTabContent(
                     val handle = browserHandle
                     browserHandle = null
                     isInitializing = true
-                    // Blocking Chromium IPC — keep it off the main dispatcher so
-                    // hibernating a background tab can't hitch the foreground UI.
-                    if (handle != null) {
-                        withContext(Dispatchers.IO) { handle.dispose() }
-                    }
+                    // Off the UI thread so hibernating a background tab can't hitch
+                    // the foreground UI.
+                    if (handle != null) disposeBrowserHandleOffThread(handle)
                 }
             }
         }
