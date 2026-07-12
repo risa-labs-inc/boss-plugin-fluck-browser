@@ -62,19 +62,29 @@ class FluckBrowserCreationOwnershipTest {
     }
 
     @Test
-    fun `abandon disposes nothing for null or exceptional completions`() {
-        val disposedNull = CountDownLatch(1)
+    fun `abandon disposes nothing for a null completion`() {
+        val disposed = CountDownLatch(1)
         val nullCreation = CompletableDeferred<BrowserHandle?>()
         abandonBrowserCreation(nullCreation)
         nullCreation.complete(null)
 
+        // No handle exists — nothing must be disposed (the latch never counts
+        // down because no dispose can run against a null result).
+        assertFalse(disposed.await(300, TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun `abandon survives an exceptional completion without disposing anything`() {
+        // The abandonment callback must swallow the failure (invokeOnCompletion +
+        // runCatching around getCompleted) rather than throw on the completer's
+        // thread, and there is no handle to dispose. Completing exceptionally
+        // after abandonment must therefore be a no-op that doesn't blow up.
         val failedCreation = CompletableDeferred<BrowserHandle?>()
         abandonBrowserCreation(failedCreation)
         failedCreation.completeExceptionally(IllegalStateException("boot failed"))
 
-        // No handle exists in either case — nothing must be disposed (the latch
-        // never counts down because no fake handle was ever produced).
-        assertFalse(disposedNull.await(300, TimeUnit.MILLISECONDS))
+        assertTrue(failedCreation.isCompleted)
+        assertNull(completedBrowserOrNull(failedCreation))
     }
 
     @Test
