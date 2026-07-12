@@ -391,15 +391,21 @@ internal object TabHibernation {
  */
 private val browserCreationScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+// Cached pool (not one raw Thread per call): threads are reused under bursts of
+// tab closes and expire after 60s idle, so nothing lingers in the steady state.
+private val browserDisposeExecutor = java.util.concurrent.Executors.newCachedThreadPool { r ->
+    Thread(r, "fluck-browser-dispose").apply { isDaemon = true }
+}
+
 /** Dispose a handle off the UI thread — dispose() ends in a blocking Chromium IPC round-trip. */
 internal fun disposeBrowserHandleOffThread(handle: BrowserHandle) {
-    Thread({
+    browserDisposeExecutor.execute {
         try {
             handle.dispose()
         } catch (t: Throwable) {
             println("[FluckBrowser] Browser dispose failed: ${t.message}")
         }
-    }, "fluck-browser-dispose").apply { isDaemon = true }.start()
+    }
 }
 
 internal class FluckBrowserTabState {
@@ -743,17 +749,32 @@ internal fun FluckBrowserTabContent(
 
                 // Initialize zoom level from browser
                 zoomLevel = handle.getZoomLevel()
-            } else {
-                // Browser creation returned null — show error immediately
+            } else if (creation.isCompleted) {
+                // createBrowser() returned null — the engine reported failure.
                 error = "Failed to create browser instance. The browser engine may not be available."
                 isInitializing = false
+            } else {
+                // The 20s watchdog fired while the boot is still wedged in flight.
+                // (withTimeoutOrNull returns null rather than throwing, so this is
+                // the timeout path — there is no TimeoutCancellationException to
+                // catch.) The in-flight deferred stays cached: Retry re-awaits it
+                // instead of stacking a duplicate boot.
+                println("[FluckBrowser] Browser creation timed out after 20s")
+                error = "Browser initialization timed out. The browser engine may not be available in this environment."
+                isInitializing = false
             }
-        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-            // Timeout — show error immediately
-            println("[FluckBrowser] Browser creation timed out (attempt ${retryCount + 1}/$maxRetries)")
-            error = "Browser initialization timed out. The browser engine may not be available in this environment."
-            isInitializing = false
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // The effect itself was cancelled (tab switch / tab close mid-boot).
+            // Do NOT clear browserCreation: re-entry must reuse the in-flight
+            // creation (or onDestroy adopts it), otherwise we'd boot a duplicate
+            // and leak the first browser.
+            throw e
         } catch (e: Exception) {
+            // The creation completed exceptionally. Drop it — a failed deferred
+            // must never be reused, or every auto-retry (and the Retry button)
+            // would just re-throw this same cached failure instead of calling
+            // createBrowser() again.
+            hoistedState.browserCreation = null
             if (retryCount < maxRetries) {
                 retryCount++
             } else {
