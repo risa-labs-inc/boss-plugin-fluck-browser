@@ -795,8 +795,11 @@ internal fun FluckBrowserTabContent(
                 zoomLevel = handle.getZoomLevel()
             } else if (completed) {
                 // createBrowser() returned null — the engine reported failure.
-                // (Exceptional completions land here too when recovered late; the
-                // deferred was already dropped above, so Retry starts fresh.)
+                // (An exceptionally-completed deferred normally rethrows from
+                // await() into the catch below; it reaches here only via the
+                // late-completion recovery window, where completedBrowserOrNull
+                // maps the failure to null. The deferred was dropped above either
+                // way, so Retry starts fresh.)
                 error = "Failed to create browser instance. The browser engine may not be available."
                 isInitializing = false
             } else {
