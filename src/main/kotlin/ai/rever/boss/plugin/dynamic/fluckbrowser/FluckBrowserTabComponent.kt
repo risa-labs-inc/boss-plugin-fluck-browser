@@ -301,6 +301,17 @@ private fun processUrlInput(input: String): String {
 }
 
 /**
+ * The home (dashboard) state: an empty URL or about:blank renders the host
+ * dashboard instead of web content. Home has no document title or favicon of
+ * its own — Chromium reports a blank title and never fires FaviconChanged for
+ * it — so the tab's identity must be asserted explicitly (see
+ * applyHomeTabIdentity in [FluckBrowserTabContent]).
+ */
+internal const val HOME_TITLE = "Home"
+
+internal fun isHomeUrl(url: String): Boolean = url.isEmpty() || url == "about:blank"
+
+/**
  * Main browser tab content with URL bar, toolbar, and browser view.
  * Shows Dashboard for about:blank pages and browser content otherwise.
  */
@@ -592,7 +603,7 @@ internal fun FluckBrowserTabContent(
 
     // Show dashboard for about:blank pages - matches bundled browser exactly
     val currentUrl = urlBarText.text
-    val showDashboard = currentUrl.isEmpty() || currentUrl == "about:blank"
+    val showDashboard = isHomeUrl(currentUrl)
 
     // Security indicator derived from current URL
     val isSecure = currentUrl.startsWith("https://")
@@ -666,6 +677,19 @@ internal fun FluckBrowserTabContent(
                 // and stream it. Re-registers under the same tabId on a recovery re-init.
                 if (tabId.isNotEmpty()) BrowserShareManager.registerTab(tabId, handle)
 
+                // Home (the dashboard) has no document title or favicon, so no
+                // TitleChanged/FaviconChanged follows a navigation to it — set the
+                // tab's own identity and drop the previous page's stale favicon.
+                fun applyHomeTabIdentity() {
+                    pageTitle = HOME_TITLE
+                    tabUpdateProvider?.updateTitle(HOME_TITLE)
+                    tabUpdateProvider?.updateFavicon(null)
+                }
+
+                // A tab that opens directly on home (e.g. a restored dashboard tab)
+                // may never fire navigation events for about:blank — apply up front.
+                if (isHomeUrl(urlBarText.text)) applyHomeTabIdentity()
+
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
                     // Only update URL bar if user isn't actively editing
@@ -694,6 +718,10 @@ internal fun FluckBrowserTabContent(
                     // Update the tab's URL in the host (for bookmark/workspace persistence)
                     tabUpdateProvider?.updateUrl(url)
 
+                    // Back/forward can land on home (about:blank) — give the tab the
+                    // home identity instead of a blank title + the last page's favicon.
+                    if (isHomeUrl(url)) applyHomeTabIdentity()
+
                     // Load saved zoom level for this domain (zoom persistence feature).
                     // Zoom is scoped per browser (host sets ZoomMode.PER_BROWSER), so a
                     // tab keeps its current level across navigations. A domain with no
@@ -721,6 +749,11 @@ internal fun FluckBrowserTabContent(
                     }
                 }
                 handle.addTitleListener { title ->
+                    // Home (about:blank) reports a blank or literal "about:blank"
+                    // title — never let it blank the tab chip; the navigation
+                    // listener already applied the home identity.
+                    if (title.isBlank() || title == "about:blank") return@addTitleListener
+
                     pageTitle = title
 
                     // Update the tab's title in the tab bar via the host
