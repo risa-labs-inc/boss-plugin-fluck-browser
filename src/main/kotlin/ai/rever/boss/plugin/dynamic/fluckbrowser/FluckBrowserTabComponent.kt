@@ -301,7 +301,7 @@ private fun processUrlInput(input: String): String {
 }
 
 /**
- * The home (dashboard) state: an empty URL or about:blank renders the host
+ * The home (dashboard) state: a blank URL or about:blank renders the host
  * dashboard instead of web content. Home has no document title or favicon of
  * its own — Chromium reports a blank title and never fires FaviconChanged for
  * it — so the tab's identity must be asserted explicitly (see
@@ -309,7 +309,7 @@ private fun processUrlInput(input: String): String {
  */
 internal const val HOME_TITLE = "Home"
 
-internal fun isHomeUrl(url: String): Boolean = url.isEmpty() || url == "about:blank"
+internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:blank"
 
 /**
  * Main browser tab content with URL bar, toolbar, and browser view.
@@ -702,6 +702,12 @@ internal fun FluckBrowserTabContent(
                     canGoBack = handle.canGoBack()
                     canGoForward = handle.canGoForward()
 
+                    // Back/forward can land on home (about:blank) — apply the home
+                    // identity BEFORE history tracking below, so the history entry
+                    // records "Home" (not the previous page's title) and the tab
+                    // never keeps a blank title + the last page's favicon.
+                    if (isHomeUrl(url)) applyHomeTabIdentity()
+
                     // Track navigation history for workspace persistence
                     // Only add new entry if URL is different from current position
                     if (navigationHistory.isEmpty() || navigationHistory.lastOrNull()?.second != url) {
@@ -717,10 +723,6 @@ internal fun FluckBrowserTabContent(
 
                     // Update the tab's URL in the host (for bookmark/workspace persistence)
                     tabUpdateProvider?.updateUrl(url)
-
-                    // Back/forward can land on home (about:blank) — give the tab the
-                    // home identity instead of a blank title + the last page's favicon.
-                    if (isHomeUrl(url)) applyHomeTabIdentity()
 
                     // Load saved zoom level for this domain (zoom persistence feature).
                     // Zoom is scoped per browser (host sets ZoomMode.PER_BROWSER), so a
@@ -771,9 +773,9 @@ internal fun FluckBrowserTabContent(
                         isInitializing = false
                     }
 
-                    // Save history when page finishes loading
+                    // Save history when page finishes loading (home has no history entry)
                     val currentUrlText = urlBarText.text
-                    if (!loading && currentUrlText.isNotBlank() && currentUrlText != "about:blank") {
+                    if (!loading && !isHomeUrl(currentUrlText)) {
                         coroutineScope.launch {
                             urlHistoryProvider?.saveHistory()
                         }
@@ -917,9 +919,9 @@ internal fun FluckBrowserTabContent(
                         isInitializing = true
                         error = "Browser crashed. Recovering..."
 
-                        // Restore URL after small delay
+                        // Restore URL after small delay (home needs no restore)
                         delay(100)
-                        if (currentUrl.isNotBlank() && currentUrl != "about:blank") {
+                        if (!isHomeUrl(currentUrl)) {
                             urlBarText = TextFieldValue(currentUrl, TextRange(currentUrl.length))
                         }
 
