@@ -157,7 +157,6 @@ class FluckBrowserTabComponent(
     init {
         lifecycle.subscribe(
             callbacks = object : Callbacks {
-                @OptIn(ExperimentalCoroutinesApi::class)
                 override fun onDestroy() {
                     BrowserShareManager.unregisterTab(config.id)
                     val handle = state.browserHandle
@@ -168,14 +167,10 @@ class FluckBrowserTabComponent(
                     // it runs on the never-cancelled browserCreationScope precisely
                     // so its result stays retrievable here — dispose whatever it
                     // eventually produces instead of leaking the browser + renderer
-                    // process. invokeOnCompletion fires immediately if the creation
-                    // already completed.
+                    // process.
                     state.browserCreation?.let { pending ->
                         state.browserCreation = null
-                        pending.invokeOnCompletion {
-                            val orphan = runCatching { pending.getCompleted() }.getOrNull()
-                            if (orphan != null) disposeBrowserHandleOffThread(orphan)
-                        }
+                        abandonBrowserCreation(pending)
                     }
                     coroutineScope.cancel()
                 }
@@ -393,6 +388,13 @@ private val browserCreationScope = CoroutineScope(Dispatchers.IO + SupervisorJob
 
 // Cached pool (not one raw Thread per call): threads are reused under bursts of
 // tab closes and expire after 60s idle, so nothing lingers in the steady state.
+//
+// Lifetime note (applies to browserCreationScope above too): these are top-level
+// and intentionally never shut down. Fluck Browser is a system plugin the host
+// refuses to unload, so the classloader lives for the process; the pool holds no
+// non-daemon threads and the scope holds no threads at all when idle. If the
+// plugin ever becomes unloadable, wire cancellation/shutdown into
+// FluckBrowserDynamicPlugin.dispose().
 private val browserDisposeExecutor = java.util.concurrent.Executors.newCachedThreadPool { r ->
     Thread(r, "fluck-browser-dispose").apply { isDaemon = true }
 }
@@ -405,6 +407,19 @@ internal fun disposeBrowserHandleOffThread(handle: BrowserHandle) {
         } catch (t: Throwable) {
             println("[FluckBrowser] Browser dispose failed: ${t.message}")
         }
+    }
+}
+
+/**
+ * Abandon a pending browser creation nobody will consume: whenever it completes
+ * (immediately, if it already has), dispose whatever browser it produced so the
+ * handle can't leak. Used by tab close and by an explicit Retry on a wedged boot.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+internal fun abandonBrowserCreation(pending: Deferred<BrowserHandle?>) {
+    pending.invokeOnCompletion {
+        val orphan = runCatching { pending.getCompleted() }.getOrNull()
+        if (orphan != null) disposeBrowserHandleOffThread(orphan)
     }
 }
 
@@ -543,8 +558,12 @@ internal fun FluckBrowserTabContent(
     // Fullscreen state - tracks when browser content is displayed in a fullscreen window
     var isInFullscreen by remember { mutableStateOf(false) }
 
-    // Retry state for browser creation
+    // Retry state for browser creation. retryCount drives the auto-retry backoff;
+    // initNonce exists because the Retry button resets retryCount to 0, which is a
+    // no-op restart key when the first attempt already failed at retryCount == 0 —
+    // bumping the nonce guarantees the init effect re-runs on every explicit Retry.
     var retryCount by remember { mutableStateOf(0) }
+    var initNonce by remember { mutableStateOf(0) }
     val maxRetries = 3
 
     // Recovery state - prevents infinite recovery loops
@@ -564,7 +583,7 @@ internal fun FluckBrowserTabContent(
     var tabUpdateProvider by remember { mutableStateOf<TabUpdateProvider?>(null) }
 
     // Initialize browser with retry mechanism
-    LaunchedEffect(retryCount) {
+    LaunchedEffect(retryCount, initNonce) {
         if (browserHandle != null) return@LaunchedEffect
 
         try {
@@ -757,8 +776,9 @@ internal fun FluckBrowserTabContent(
                 // The 20s watchdog fired while the boot is still wedged in flight.
                 // (withTimeoutOrNull returns null rather than throwing, so this is
                 // the timeout path — there is no TimeoutCancellationException to
-                // catch.) The in-flight deferred stays cached: Retry re-awaits it
-                // instead of stacking a duplicate boot.
+                // catch.) The in-flight deferred stays cached so a tab-switch
+                // re-entry keeps waiting on the same boot; an explicit Retry
+                // abandons it (see onRetry) and starts fresh.
                 println("[FluckBrowser] Browser creation timed out after 20s")
                 error = "Browser initialization timed out. The browser engine may not be available in this environment."
                 isInitializing = false
@@ -1110,7 +1130,16 @@ internal fun FluckBrowserTabContent(
                         isLoading = isInitializing,
                         onRetry = {
                             error = "Initializing browser..."
+                            // An explicit Retry abandons any cached creation — for a
+                            // wedged (timed-out) boot, re-awaiting it would just time
+                            // out forever. Its eventual result gets adopted and
+                            // disposed, then a fresh boot starts.
+                            hoistedState.browserCreation?.let { pending ->
+                                hoistedState.browserCreation = null
+                                abandonBrowserCreation(pending)
+                            }
                             retryCount = 0
+                            initNonce++
                             isInitializing = true
                         },
                         onResetTab = {
