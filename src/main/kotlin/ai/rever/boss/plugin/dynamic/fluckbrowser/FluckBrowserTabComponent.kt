@@ -423,11 +423,22 @@ internal fun abandonBrowserCreation(pending: Deferred<BrowserHandle?>) {
     }
 }
 
+/** The result of an already-completed creation, or null if it completed exceptionally. */
+@OptIn(ExperimentalCoroutinesApi::class)
+internal fun completedBrowserOrNull(creation: Deferred<BrowserHandle?>): BrowserHandle? =
+    runCatching { creation.getCompleted() }.getOrNull()
+
 internal class FluckBrowserTabState {
     var browserHandle: BrowserHandle? by mutableStateOf<BrowserHandle?>(null)
     // In-flight (or completed-but-unconsumed) browser creation. Runs on
     // [browserCreationScope] so a tab switch mid-boot neither cancels it nor
     // spawns a duplicate when the tab re-enters composition.
+    //
+    // Thread confinement: this var is read/written only from the main thread —
+    // the init effect (composition), onRetry (a click handler), and onDestroy
+    // (Essenty lifecycle callbacks fire on the main thread). Only the Deferred
+    // OBJECT crosses threads (invokeOnCompletion is thread-safe), never this
+    // field, so no @Volatile is needed.
     var browserCreation: Deferred<BrowserHandle?>? = null
     // Pending idle-hibernation timer (armed when the tab is backgrounded, cancelled if it returns).
     var hibernationJob: kotlinx.coroutines.Job? = null
@@ -622,8 +633,19 @@ internal fun FluckBrowserTabContent(
                         BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
                     )
                 }.also { hoistedState.browserCreation = it }
-            val handle = withTimeoutOrNull(20_000L) { creation.await() }
-            if (creation.isCompleted) hoistedState.browserCreation = null
+            var handle = withTimeoutOrNull(20_000L) { creation.await() }
+            // Snapshot completion ONCE. The deferred completes on an IO thread, so
+            // re-reading isCompleted later races the boot finishing right after the
+            // watchdog fired: a stale read could clear the deferred while a live
+            // browser sits inside it — a permanent renderer leak plus a wrong
+            // "failed to create" error. With a single snapshot: completed==true
+            // recovers the late result below; completed==false keeps the deferred
+            // cached, where re-entry, Retry, or onDestroy all own it safely.
+            val completed = creation.isCompleted
+            if (handle == null && completed) {
+                handle = completedBrowserOrNull(creation)
+            }
+            if (completed) hoistedState.browserCreation = null
             if (handle != null) {
                 browserHandle = handle
                 isInitializing = false
@@ -768,8 +790,10 @@ internal fun FluckBrowserTabContent(
 
                 // Initialize zoom level from browser
                 zoomLevel = handle.getZoomLevel()
-            } else if (creation.isCompleted) {
+            } else if (completed) {
                 // createBrowser() returned null — the engine reported failure.
+                // (Exceptional completions land here too when recovered late; the
+                // deferred was already dropped above, so Retry starts fresh.)
                 error = "Failed to create browser instance. The browser engine may not be available."
                 isInitializing = false
             } else {
