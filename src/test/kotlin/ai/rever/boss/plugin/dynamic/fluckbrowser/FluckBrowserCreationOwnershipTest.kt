@@ -6,7 +6,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlin.test.Test
-import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -62,27 +61,20 @@ class FluckBrowserCreationOwnershipTest {
     }
 
     @Test
-    fun `abandon disposes nothing for a null completion`() {
-        val disposed = CountDownLatch(1)
+    fun `abandon survives null and exceptional completions without throwing`() {
+        // Neither completion carries a handle, so "disposes nothing" is
+        // structural (abandonBrowserCreation guards on orphan != null) — what
+        // this locks in is that the abandonment callback swallows the failure
+        // (invokeOnCompletion + runCatching around getCompleted) instead of
+        // throwing on the completer's thread.
         val nullCreation = CompletableDeferred<BrowserHandle?>()
         abandonBrowserCreation(nullCreation)
         nullCreation.complete(null)
+        assertNull(completedBrowserOrNull(nullCreation))
 
-        // No handle exists — nothing must be disposed (the latch never counts
-        // down because no dispose can run against a null result).
-        assertFalse(disposed.await(300, TimeUnit.MILLISECONDS))
-    }
-
-    @Test
-    fun `abandon survives an exceptional completion without disposing anything`() {
-        // The abandonment callback must swallow the failure (invokeOnCompletion +
-        // runCatching around getCompleted) rather than throw on the completer's
-        // thread, and there is no handle to dispose. Completing exceptionally
-        // after abandonment must therefore be a no-op that doesn't blow up.
         val failedCreation = CompletableDeferred<BrowserHandle?>()
         abandonBrowserCreation(failedCreation)
         failedCreation.completeExceptionally(IllegalStateException("boot failed"))
-
         assertTrue(failedCreation.isCompleted)
         assertNull(completedBrowserOrNull(failedCreation))
     }

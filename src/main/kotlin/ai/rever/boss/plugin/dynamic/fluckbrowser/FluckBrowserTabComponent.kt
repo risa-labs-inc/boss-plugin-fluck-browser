@@ -875,8 +875,12 @@ internal fun FluckBrowserTabContent(
                         // Save current URL for recovery
                         val currentUrl = urlBarText.text
 
-                        // Reset state to trigger reinitialization
+                        // Reset state to trigger reinitialization. Dispose the
+                        // invalid handle too — even a crashed/stale handle still
+                        // holds listener registrations and view state worth
+                        // releasing, and dispose() is safe on invalid handles.
                         browserHandle = null
+                        disposeBrowserHandleOffThread(handle)
                         isInitializing = true
                         error = "Browser crashed. Recovering..."
 
@@ -892,6 +896,7 @@ internal fun FluckBrowserTabContent(
                         // Max recovery attempts reached
                         error = "Browser recovery failed after $maxRecoveryAttempts attempts. Please close and reopen this tab."
                         browserHandle = null
+                        disposeBrowserHandleOffThread(handle)
                         isInitializing = false
                     }
                     break
