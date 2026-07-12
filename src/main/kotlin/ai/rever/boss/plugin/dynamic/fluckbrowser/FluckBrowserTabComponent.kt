@@ -440,6 +440,14 @@ internal class FluckBrowserTabState {
     // OBJECT crosses threads (invokeOnCompletion is thread-safe), never this
     // field, so no @Volatile is needed.
     var browserCreation: Deferred<BrowserHandle?>? = null
+    // Restart key for the init effect: bumped by Retry (retryCount = 0 is a
+    // no-op key when the first attempt failed at 0) and by the late-adoption
+    // nudge. Hoisted — NOT remember-scoped — so the single state instance
+    // survives tab switches and one nudge registration per deferred suffices.
+    var initNonce: Int by mutableStateOf(0)
+    // One-shot guard: the deferred that already has a late-adoption nudge
+    // registered, so repeated timeout passes don't pile callbacks onto it.
+    var lateAdoptNudged: Deferred<BrowserHandle?>? = null
     // Pending idle-hibernation timer (armed when the tab is backgrounded, cancelled if it returns).
     var hibernationJob: kotlinx.coroutines.Job? = null
     var isInitializing: Boolean by mutableStateOf(true)
@@ -570,11 +578,10 @@ internal fun FluckBrowserTabContent(
     var isInFullscreen by remember { mutableStateOf(false) }
 
     // Retry state for browser creation. retryCount drives the auto-retry backoff;
-    // initNonce exists because the Retry button resets retryCount to 0, which is a
-    // no-op restart key when the first attempt already failed at retryCount == 0 —
-    // bumping the nonce guarantees the init effect re-runs on every explicit Retry.
+    // initNonce (hoisted, see FluckBrowserTabState) guarantees the init effect
+    // re-runs on every explicit Retry and on a late-completing boot.
     var retryCount by remember { mutableStateOf(0) }
-    var initNonce by remember { mutableStateOf(0) }
+    var initNonce by hoistedState::initNonce
     val maxRetries = 3
 
     // Recovery state - prevents infinite recovery loops
@@ -603,9 +610,11 @@ internal fun FluckBrowserTabContent(
                 tabUpdateProvider = tabUpdateProviderFactory?.createProvider(tabId, tabTypeId)
             }
 
-            // Apply exponential backoff delay for retries
+            // Apply exponential backoff delay for retries. The shift is capped:
+            // crash-recovery reuses this counter and could otherwise drive the
+            // shift toward overflow.
             if (retryCount > 0) {
-                val delayMs = 100L * (1 shl (retryCount - 1)) // 100ms, 200ms, 400ms
+                val delayMs = 100L * (1 shl (retryCount - 1).coerceAtMost(6)) // 100ms..6.4s
                 delay(delayMs)
             }
 
@@ -818,10 +827,15 @@ internal fun FluckBrowserTabContent(
                 // Without this, a late success idles unconsumed until Retry/close —
                 // and Retry would dispose it and boot a second renderer for
                 // nothing. Snapshot-state writes are thread-safe, so bumping the
-                // nonce from the completer's IO thread is fine; redundant bumps
-                // (already-adopted, tab closed) hit the browserHandle != null
-                // early-return or a dead composition and are harmless.
-                creation.invokeOnCompletion { initNonce++ }
+                // nonce from the completer's IO thread is fine; a stale bump
+                // (already-adopted, tab closed) hits the browserHandle != null
+                // early-return or a dead composition and is harmless. One nudge
+                // per deferred: initNonce is hoisted (survives tab switches), so
+                // repeated timeout passes don't need to re-register.
+                if (hoistedState.lateAdoptNudged !== creation) {
+                    hoistedState.lateAdoptNudged = creation
+                    creation.invokeOnCompletion { hoistedState.initNonce++ }
+                }
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             // The effect itself was cancelled (tab switch / tab close mid-boot).
