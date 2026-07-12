@@ -629,6 +629,9 @@ internal fun FluckBrowserTabContent(
             // location through the navigation listener anyway.
             val creation = hoistedState.browserCreation
                 ?: browserCreationScope.async {
+                    // urlBarText is Compose state read here on an IO thread — safe
+                    // (snapshot reads are thread-consistent), and deliberately
+                    // snapshotted at launch time per the comment above.
                     browserService.createBrowser(
                         BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
                     )
@@ -806,6 +809,16 @@ internal fun FluckBrowserTabContent(
                 println("[FluckBrowser] Browser creation timed out after 20s")
                 error = "Browser initialization timed out. The browser engine may not be available in this environment."
                 isInitializing = false
+                // If the wedged boot completes AFTER the error is shown while the
+                // tab just sits there, nudge the init effect to re-run: it awaits
+                // the completed deferred instantly and adopts the browser in place.
+                // Without this, a late success idles unconsumed until Retry/close —
+                // and Retry would dispose it and boot a second renderer for
+                // nothing. Snapshot-state writes are thread-safe, so bumping the
+                // nonce from the completer's IO thread is fine; redundant bumps
+                // (already-adopted, tab closed) hit the browserHandle != null
+                // early-return or a dead composition and are harmless.
+                creation.invokeOnCompletion { initNonce++ }
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             // The effect itself was cancelled (tab switch / tab close mid-boot).
