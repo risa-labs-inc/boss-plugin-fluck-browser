@@ -92,9 +92,11 @@ import com.arkivanov.essenty.lifecycle.Lifecycle.Callbacks
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.awt.Color as AwtColor
 import java.awt.Font
 import java.awt.KeyboardFocusManager
@@ -155,9 +157,21 @@ class FluckBrowserTabComponent(
             callbacks = object : Callbacks {
                 override fun onDestroy() {
                     BrowserShareManager.unregisterTab(config.id)
-                    state.browserHandle?.dispose()
+                    val handle = state.browserHandle
                     state.browserHandle = null
                     coroutineScope.cancel()
+                    if (handle != null) {
+                        // dispose() ends in browser.close() — a blocking Chromium IPC
+                        // round-trip. Run it off the UI thread so closing a tab never
+                        // hitches the app. Dedicated daemon thread: the Component's
+                        // scope is already cancelled at this point.
+                        Thread({
+                            try {
+                                handle.dispose()
+                            } catch (_: Throwable) {
+                            }
+                        }, "fluck-browser-dispose").apply { isDaemon = true }.start()
+                    }
                 }
             }
         )
@@ -165,7 +179,11 @@ class FluckBrowserTabComponent(
 
     @Composable
     override fun Content() {
-        if (browserService != null && browserService.isAvailable()) {
+        // NOTE: no isAvailable() call here. On hosts before the lazy-availability
+        // fix, isAvailable() booted the whole Chromium engine synchronously inside
+        // this composition — a multi-second UI freeze on cold start. Engine problems
+        // now surface through createBrowser's error/retry UI instead.
+        if (browserService != null) {
             // Extract initial URL from config - handle both FluckBrowserTabData and built-in FluckTabInfo
             val initialUrl = getInitialUrl(config)
 
@@ -358,6 +376,10 @@ internal object TabHibernation {
 
 internal class FluckBrowserTabState {
     var browserHandle: BrowserHandle? by mutableStateOf<BrowserHandle?>(null)
+    // In-flight (or completed-but-unconsumed) browser creation. Runs on the
+    // Component's scope so a tab switch mid-boot neither cancels it nor spawns
+    // a duplicate when the tab re-enters composition.
+    var browserCreation: kotlinx.coroutines.Deferred<BrowserHandle?>? = null
     // Pending idle-hibernation timer (armed when the tab is backgrounded, cancelled if it returns).
     var hibernationJob: kotlinx.coroutines.Job? = null
     var isInitializing: Boolean by mutableStateOf(true)
@@ -523,14 +545,29 @@ internal fun FluckBrowserTabContent(
                 delay(delayMs)
             }
 
-            // Short timeout - if engine can't create a browser quickly, show error view
-            val handle = kotlinx.coroutines.withTimeoutOrNull(3_000L) {
-                // Recreate at the CURRENT url (preserved in hoisted state), so a hibernation wake
-                // or crash-recovery returns to the page the user was on, not the tab's first URL.
-                browserService.createBrowser(
-                    BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
-                )
-            }
+            // Create the browser OFF the main dispatcher: on a cold start this call
+            // boots the whole Chromium engine, and even warm it spawns a renderer
+            // process — blocking work that used to run inside this LaunchedEffect on
+            // Dispatchers.Main and freeze the entire app UI (which also meant the old
+            // 3s timeout could never fire: the timer ran on the very thread that was
+            // blocked). The deferred lives on the Component's scope and is stashed in
+            // hoisted state, so a mid-boot tab switch neither cancels the creation nor
+            // starts a duplicate when the tab comes back — re-entry awaits the same
+            // in-flight (or already-completed-but-unconsumed) creation. The timeout is
+            // generous because a slow boot now only delays this tab's spinner, not the
+            // app.
+            //
+            // Recreate at the CURRENT url (preserved in hoisted state), so a hibernation
+            // wake or crash-recovery returns to the page the user was on, not the tab's
+            // first URL.
+            val creation = hoistedState.browserCreation?.takeIf { !it.isCancelled }
+                ?: coroutineScope.async(kotlinx.coroutines.Dispatchers.IO) {
+                    browserService.createBrowser(
+                        BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
+                    )
+                }.also { hoistedState.browserCreation = it }
+            val handle = kotlinx.coroutines.withTimeoutOrNull(20_000L) { creation.await() }
+            if (creation.isCompleted) hoistedState.browserCreation = null
             if (handle != null) {
                 browserHandle = handle
                 isInitializing = false
@@ -778,9 +815,14 @@ internal fun FluckBrowserTabContent(
             if (TabHibernation.enabled && browserHandle != null) {
                 hoistedState.hibernationJob = coroutineScope.launch {
                     delay(TabHibernation.effectiveIdleMs())
-                    browserHandle?.dispose()
+                    val handle = browserHandle
                     browserHandle = null
                     isInitializing = true
+                    // Blocking Chromium IPC — keep it off the main dispatcher so
+                    // hibernating a background tab can't hitch the foreground UI.
+                    if (handle != null) {
+                        withContext(Dispatchers.IO) { handle.dispose() }
+                    }
                 }
             }
         }
