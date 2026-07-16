@@ -301,6 +301,17 @@ private fun processUrlInput(input: String): String {
 }
 
 /**
+ * The home (dashboard) state: a blank URL or about:blank renders the host
+ * dashboard instead of web content. Home has no document title or favicon of
+ * its own — Chromium reports a blank title and never fires FaviconChanged for
+ * it — so the tab's identity must be asserted explicitly (see
+ * applyHomeTabIdentity in [FluckBrowserTabContent]).
+ */
+internal const val HOME_TITLE = "Home"
+
+internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:blank"
+
+/**
  * Main browser tab content with URL bar, toolbar, and browser view.
  * Shows Dashboard for about:blank pages and browser content otherwise.
  */
@@ -592,7 +603,7 @@ internal fun FluckBrowserTabContent(
 
     // Show dashboard for about:blank pages - matches bundled browser exactly
     val currentUrl = urlBarText.text
-    val showDashboard = currentUrl.isEmpty() || currentUrl == "about:blank"
+    val showDashboard = isHomeUrl(currentUrl)
 
     // Security indicator derived from current URL
     val isSecure = currentUrl.startsWith("https://")
@@ -666,6 +677,19 @@ internal fun FluckBrowserTabContent(
                 // and stream it. Re-registers under the same tabId on a recovery re-init.
                 if (tabId.isNotEmpty()) BrowserShareManager.registerTab(tabId, handle)
 
+                // Home (the dashboard) has no document title or favicon, so no
+                // TitleChanged/FaviconChanged follows a navigation to it — set the
+                // tab's own identity and drop the previous page's stale favicon.
+                fun applyHomeTabIdentity() {
+                    pageTitle = HOME_TITLE
+                    tabUpdateProvider?.updateTitle(HOME_TITLE)
+                    tabUpdateProvider?.updateFavicon(null)
+                }
+
+                // A tab that opens directly on home (e.g. a restored dashboard tab)
+                // may never fire navigation events for about:blank — apply up front.
+                if (isHomeUrl(urlBarText.text)) applyHomeTabIdentity()
+
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
                     // Only update URL bar if user isn't actively editing
@@ -677,6 +701,12 @@ internal fun FluckBrowserTabContent(
 
                     canGoBack = handle.canGoBack()
                     canGoForward = handle.canGoForward()
+
+                    // Back/forward can land on home (about:blank) — apply the home
+                    // identity BEFORE history tracking below, so the history entry
+                    // records "Home" (not the previous page's title) and the tab
+                    // never keeps a blank title + the last page's favicon.
+                    if (isHomeUrl(url)) applyHomeTabIdentity()
 
                     // Track navigation history for workspace persistence
                     // Only add new entry if URL is different from current position
@@ -721,6 +751,11 @@ internal fun FluckBrowserTabContent(
                     }
                 }
                 handle.addTitleListener { title ->
+                    // Home (about:blank) reports a blank or literal "about:blank"
+                    // title — never let it blank the tab chip; the navigation
+                    // listener already applied the home identity.
+                    if (title.isBlank() || title == "about:blank") return@addTitleListener
+
                     pageTitle = title
 
                     // Update the tab's title in the tab bar via the host
@@ -738,9 +773,9 @@ internal fun FluckBrowserTabContent(
                         isInitializing = false
                     }
 
-                    // Save history when page finishes loading
+                    // Save history when page finishes loading (home has no history entry)
                     val currentUrlText = urlBarText.text
-                    if (!loading && currentUrlText.isNotBlank() && currentUrlText != "about:blank") {
+                    if (!loading && !isHomeUrl(currentUrlText)) {
                         coroutineScope.launch {
                             urlHistoryProvider?.saveHistory()
                         }
@@ -884,9 +919,9 @@ internal fun FluckBrowserTabContent(
                         isInitializing = true
                         error = "Browser crashed. Recovering..."
 
-                        // Restore URL after small delay
+                        // Restore URL after small delay (home needs no restore)
                         delay(100)
-                        if (currentUrl.isNotBlank() && currentUrl != "about:blank") {
+                        if (!isHomeUrl(currentUrl)) {
                             urlBarText = TextFieldValue(currentUrl, TextRange(currentUrl.length))
                         }
 
