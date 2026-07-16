@@ -130,7 +130,7 @@ object BrowserShareManager {
     }
 
     fun shutdown() {
-        synchronized(lock) {
+        val engineToStop = synchronized(lock) {
             session?.shutdown()
             session = null
             sharesByToken.clear()
@@ -143,8 +143,26 @@ object BrowserShareManager {
             engine = null
             boundPort = null
             boundHost = null
-            if (e != null) scope.launch { runCatching { e.stop(300, 1000) } }
+            e
         }
+        // Stop the Ktor CIO engine SYNCHRONOUSLY here, not via scope.launch.
+        // shutdown() is called from the plugin's dispose(), which the host runs
+        // just before it force-closes this plugin's classloader (on app quit and
+        // on a hot-swap update). A fire-and-forget stop() raced that close: the
+        // engine's stop path lazily loads CIO inner classes it hadn't needed yet
+        // (the accept-loop's cancellation cleanup `initServerJob$1$5`, and
+        // `stopSuspend$result$1`), and once the plugin classloader is closed those
+        // loads fell through to the host loader — which has its own copy of the
+        // child-first-bundled Ktor — producing a cross-classloader
+        // IllegalAccessError that surfaced as two crash dialogs on quit.
+        //
+        // Running stop() synchronously while the classloader is still open both
+        // tears the server down cleanly AND resolves those teardown classes into
+        // THIS loader, so even Ktor's own JVM shutdown hook (which fires late, on
+        // the KtorShutdownHook thread, after the loader is gone) reuses the
+        // already-loaded classes instead of triggering a fresh cross-loader load.
+        // Grace/timeout are bounded so a slow drain can't wedge app quit.
+        if (engineToStop != null) runCatching { engineToStop.stop(300, 1000) }
         _pendingRequests.value.forEach { it.decision.complete(false) }
         _pendingRequests.value = emptyList()
         context = null
