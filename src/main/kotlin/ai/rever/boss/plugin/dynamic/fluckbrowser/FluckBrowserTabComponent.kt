@@ -60,7 +60,6 @@ import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
@@ -107,13 +106,14 @@ import java.awt.KeyboardFocusManager
 import java.awt.Toolkit
 import java.awt.Window
 import java.awt.datatransfer.StringSelection
+import java.net.URI
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicLong
 import javax.swing.BorderFactory
 import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
 import javax.swing.JSeparator
 import kotlin.math.abs
-import kotlin.math.roundToInt
 
 /**
  * Fluck Browser tab component (Dynamic Plugin)
@@ -286,13 +286,22 @@ internal fun browserMouseNavigationForButton(awtButton: Int?): BrowserMouseNavig
 
 /**
  * Resolves a middle-click target from the pressed viewport point.
+ *
+ * Compose reports backing-pixel coordinates for the off-screen browser view.
+ * Chromium's own devicePixelRatio is the authoritative conversion to CSS
+ * pixels and also accounts for fractional display scaling and page zoom.
+ *
  * Links return a `link:` result for direct BOSS-tab creation; submit controls
  * submit through a temporary `_blank` target so the popup bridge can preserve
  * POST data.
  */
-internal fun middleClickTargetAtPointScript(x: Int, y: Int): String = """
+internal fun middleClickTargetAtPointScript(x: Float, y: Float): String = """
     (() => {
-        let element = document.elementFromPoint($x, $y);
+        const deviceScale = window.devicePixelRatio || 1;
+        let element = document.elementFromPoint(
+            $x / deviceScale,
+            $y / deviceScale
+        );
         if (!element) return null;
         const closest = (selector) => {
             let current = element;
@@ -304,7 +313,18 @@ internal fun middleClickTargetAtPointScript(x: Int, y: Int): String = """
         };
 
         const link = closest('a[href], area[href]');
-        if (link && link.href) return 'link:' + link.href;
+        if (link && link.href) {
+            const rawHref = typeof link.href === 'string'
+                ? link.href
+                : link.href.baseVal;
+            if (!rawHref) return null;
+
+            const resolvedUrl = new URL(rawHref, document.baseURI);
+            if (resolvedUrl.protocol !== 'http:' && resolvedUrl.protocol !== 'https:') {
+                return null;
+            }
+            return 'link:' + resolvedUrl.href;
+        }
 
         const submitter = closest(
             'button[type="submit"], input[type="submit"], input[type="image"]'
@@ -314,6 +334,10 @@ internal fun middleClickTargetAtPointScript(x: Int, y: Int): String = """
         const previousTarget = submitter.getAttribute('formtarget');
         submitter.setAttribute('formtarget', '_blank');
         try {
+            // Deliberate side effect: this is the only path that preserves POST
+            // data through the browser popup callback. The coordinate lookup is
+            // exact (no rounding), and the attribute restore below is best-effort
+            // if the page or renderer disappears during submission.
             if (typeof submitter.form.requestSubmit === 'function') {
                 submitter.form.requestSubmit(submitter);
             } else {
@@ -331,6 +355,42 @@ internal fun middleClickTargetAtPointScript(x: Int, y: Int): String = """
         return 'submitted';
     })();
 """.trimIndent()
+
+internal fun middleClickUrlFromScriptResult(result: Any?): String? {
+    val url = (result as? String)
+        ?.takeIf { it.startsWith("link:") }
+        ?.removePrefix("link:")
+        ?.takeIf { it.isNotBlank() }
+        ?: return null
+    val scheme = runCatching { URI(url).scheme?.lowercase() }.getOrNull()
+    return url.takeIf { scheme == "http" || scheme == "https" }
+}
+
+/**
+ * One-shot guard for the native Chromium popup that may follow a handled
+ * middle-click. The press handler opens the resolved URL directly; consuming
+ * the next popup prevents a second tab (often pointed at a telemetry URL) on
+ * hosts where the native browser surface receives the same mouse gesture.
+ */
+internal class MiddleClickPopupGuard(
+    private val nowNanos: () -> Long = System::nanoTime,
+    private val suppressionWindowNanos: Long = 1_000_000_000L
+) {
+    private val suppressUntilNanos = AtomicLong(NO_DEADLINE)
+
+    fun arm() {
+        suppressUntilNanos.set(nowNanos() + suppressionWindowNanos)
+    }
+
+    fun consumeIfArmed(): Boolean {
+        val deadline = suppressUntilNanos.getAndSet(NO_DEADLINE)
+        return deadline != NO_DEADLINE && nowNanos() <= deadline
+    }
+
+    private companion object {
+        const val NO_DEADLINE = Long.MIN_VALUE
+    }
+}
 
 /**
  * Process URL input with smart detection for:
@@ -600,6 +660,7 @@ internal fun FluckBrowserTabContent(
     // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
+    val middleClickPopupGuard = remember { MiddleClickPopupGuard() }
 
     // Co-browse share dialog. The links arrive reactively (the Cloudflare tunnel URL
     // resolves a few seconds after Share), so observe the manager's shareInfo flow.
@@ -883,6 +944,9 @@ internal fun FluckBrowserTabContent(
                 // preserve their POST body across the handoff — without this, the
                 // destination server sees a GET and can't reconstruct the print job.
                 handle.setOpenInNewTabWithDataCallback { nav ->
+                    if (middleClickPopupGuard.consumeIfArmed()) {
+                        return@setOpenInNewTabWithDataCallback
+                    }
                     val body = nav.postData
                     val contentType = nav.contentType
                     if (body != null && contentType != null) {
@@ -1333,8 +1397,6 @@ internal fun FluckBrowserTabContent(
                     )
                 }
                 browserHandle != null -> {
-                    val displayDensity = LocalDensity.current.density
-
                     // Resolve middle-click targets on press, before page-level auxclick
                     // handlers can rewrite hrefs to telemetry endpoints.
                     // Back/forward auxiliary buttons remain owned by the overlay as well.
@@ -1354,16 +1416,17 @@ internal fun FluckBrowserTabContent(
                                     event.changes.forEach { it.consume() }
                                     if (position != null) {
                                         coroutineScope.launch {
-                                            val target = browserHandle?.executeJavaScript(
-                                                middleClickTargetAtPointScript(
-                                                    (position.x / displayDensity).roundToInt(),
-                                                    (position.y / displayDensity).roundToInt()
+                                            val target = middleClickUrlFromScriptResult(
+                                                browserHandle?.executeJavaScript(
+                                                    middleClickTargetAtPointScript(
+                                                        position.x,
+                                                        position.y
+                                                    )
                                                 )
-                                            ) as? String
-                                            if (target?.startsWith("link:") == true) {
-                                                target.removePrefix("link:")
-                                                    .takeIf { it.isNotBlank() }
-                                                    ?.let(onOpenInNewTab)
+                                            )
+                                            if (target != null) {
+                                                middleClickPopupGuard.arm()
+                                                onOpenInNewTab(target)
                                             }
                                         }
                                     }
