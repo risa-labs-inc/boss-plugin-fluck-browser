@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import ai.rever.boss.plugin.browser.PopupNavigation
 import java.awt.event.MouseEvent
 import kotlin.test.Test
 import kotlin.test.assertContains
@@ -32,6 +33,7 @@ class BrowserMouseNavigationTest {
         assertContains(script, "24.0 / deviceScale")
         assertContains(script, "42.0 / deviceScale")
         assertContains(script, "window.devicePixelRatio || 1")
+        assertContains(script, "element.closest('a[href], area[href]')")
         assertContains(script, "link.href.baseVal")
         assertContains(script, "resolvedUrl.protocol !== 'http:'")
         assertContains(script, "return 'link:' + resolvedUrl.href")
@@ -56,21 +58,89 @@ class BrowserMouseNavigationTest {
     }
 
     @Test
-    fun `middle click popup suppression is one shot and expires`() {
-        var now = 100L
-        val guard = MiddleClickPopupGuard(
-            nowNanos = { now },
-            suppressionWindowNanos = 10L
+    fun `native popup racing link resolution is buffered then suppressed`() {
+        val coordinator = MiddleClickPopupCoordinator()
+        val gesture = coordinator.begin()
+        val trackingPopup = PopupNavigation("https://www.google.com/gen_204")
+
+        assertEquals(
+            MiddleClickPopupDisposition.BUFFERED,
+            coordinator.onPopup(trackingPopup)
+        )
+        assertNull(coordinator.release())
+
+        val resolution = coordinator.complete(
+            token = gesture.token,
+            directLinkResolved = true
+        )
+        assertTrue(resolution.accepted)
+        assertTrue(resolution.popupsToForward.isEmpty())
+        assertEquals(gesture.token, resolution.finishAfterReleaseToken)
+        assertEquals(
+            MiddleClickPopupDisposition.SUPPRESS,
+            coordinator.onPopup(trackingPopup)
         )
 
-        assertFalse(guard.consumeIfArmed())
+        coordinator.finish(gesture.token)
+        assertEquals(
+            MiddleClickPopupDisposition.FORWARD,
+            coordinator.onPopup(PopupNavigation("https://example.com/next"))
+        )
+    }
 
-        guard.arm()
-        assertTrue(guard.consumeIfArmed())
-        assertFalse(guard.consumeIfArmed())
+    @Test
+    fun `native popup is forwarded when direct resolution fails`() {
+        val coordinator = MiddleClickPopupCoordinator()
+        val gesture = coordinator.begin()
+        val popup = PopupNavigation("https://example.com/from-chromium")
 
-        guard.arm()
-        now = 111L
-        assertFalse(guard.consumeIfArmed())
+        assertEquals(MiddleClickPopupDisposition.BUFFERED, coordinator.onPopup(popup))
+
+        val resolution = coordinator.complete(
+            token = gesture.token,
+            directLinkResolved = false
+        )
+        assertTrue(resolution.accepted)
+        assertEquals(listOf(popup), resolution.popupsToForward)
+        assertEquals(
+            MiddleClickPopupDisposition.FORWARD,
+            coordinator.onPopup(PopupNavigation("https://example.com/later"))
+        )
+    }
+
+    @Test
+    fun `subsequent pointer gesture cancels suppression immediately`() {
+        val coordinator = MiddleClickPopupCoordinator()
+        val gesture = coordinator.begin()
+        val resolution = coordinator.complete(
+            token = gesture.token,
+            directLinkResolved = true
+        )
+        assertTrue(resolution.accepted)
+
+        assertTrue(coordinator.cancel().isEmpty())
+        assertEquals(
+            MiddleClickPopupDisposition.FORWARD,
+            coordinator.onPopup(PopupNavigation("https://example.com/intentional"))
+        )
+    }
+
+    @Test
+    fun `superseded renderer result cannot open an old gesture`() {
+        val coordinator = MiddleClickPopupCoordinator()
+        val firstGesture = coordinator.begin()
+        val secondGesture = coordinator.begin()
+
+        val staleResolution = coordinator.complete(
+            token = firstGesture.token,
+            directLinkResolved = true
+        )
+        assertFalse(staleResolution.accepted)
+
+        val currentResolution = coordinator.complete(
+            token = secondGesture.token,
+            directLinkResolved = true
+        )
+        assertTrue(currentResolution.accepted)
     }
 }
