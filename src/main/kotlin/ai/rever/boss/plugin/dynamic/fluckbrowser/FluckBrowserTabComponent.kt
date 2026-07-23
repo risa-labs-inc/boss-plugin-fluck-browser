@@ -26,6 +26,7 @@ import ai.rever.boss.plugin.browser.BrowserConfig
 import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
 import ai.rever.boss.plugin.browser.BrowserHandle
 import ai.rever.boss.plugin.browser.BrowserService
+import ai.rever.boss.plugin.browser.PopupNavigation
 import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
@@ -57,6 +58,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.*
+import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.text.AnnotatedString
@@ -89,6 +91,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.Lifecycle.Callbacks
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -105,6 +108,7 @@ import java.awt.KeyboardFocusManager
 import java.awt.Toolkit
 import java.awt.Window
 import java.awt.datatransfer.StringSelection
+import java.net.URI
 import java.net.URLEncoder
 import javax.swing.BorderFactory
 import javax.swing.JMenuItem
@@ -261,6 +265,241 @@ private val isMacOS: Boolean by lazy {
  */
 private fun KeyEvent.isPrimaryModifierPressed(): Boolean {
     return if (isMacOS) isMetaPressed else isCtrlPressed
+}
+
+internal enum class BrowserMouseNavigation {
+    BACK,
+    FORWARD
+}
+
+/**
+ * Maps only the auxiliary buttons owned by the browser chrome overlay.
+ *
+ * Button 2 (middle-click) deliberately maps to null because its dedicated
+ * pointer handler resolves the target before page scripts can rewrite it.
+ */
+internal fun browserMouseNavigationForButton(awtButton: Int?): BrowserMouseNavigation? =
+    when (awtButton) {
+        4, 6, 8 -> BrowserMouseNavigation.BACK
+        5, 7, 9 -> BrowserMouseNavigation.FORWARD
+        else -> null
+    }
+
+/**
+ * Resolves a middle-click target from the pressed viewport point.
+ *
+ * Compose reports backing-pixel coordinates for the off-screen browser view.
+ * Chromium's own devicePixelRatio is the authoritative conversion to CSS
+ * pixels and also accounts for fractional display scaling and page zoom.
+ *
+ * Links return a `link:` result for direct BOSS-tab creation; submit controls
+ * submit through a temporary `_blank` target so the popup bridge can preserve
+ * POST data.
+ */
+internal fun middleClickTargetAtPointScript(x: Float, y: Float): String = """
+    (() => {
+        const deviceScale = window.devicePixelRatio || 1;
+        let element = document.elementFromPoint(
+            $x / deviceScale,
+            $y / deviceScale
+        );
+        if (!element) return null;
+
+        const link = element.closest('a[href], area[href]');
+        if (link && link.href) {
+            const rawHref = typeof link.href === 'string'
+                ? link.href
+                : link.href.baseVal;
+            if (!rawHref) return null;
+
+            const resolvedUrl = new URL(rawHref, document.baseURI);
+            if (resolvedUrl.protocol !== 'http:' && resolvedUrl.protocol !== 'https:') {
+                return null;
+            }
+            return 'link:' + resolvedUrl.href;
+        }
+
+        const submitter = element.closest(
+            'button[type="submit"], input[type="submit"], input[type="image"]'
+        );
+        if (!submitter || !submitter.form) return null;
+
+        const previousTarget = submitter.getAttribute('formtarget');
+        submitter.setAttribute('formtarget', '_blank');
+        try {
+            // Deliberate side effect: this is the only path that preserves POST
+            // data through the browser popup callback. The coordinate lookup is
+            // exact (no rounding), and the attribute restore below is best-effort
+            // if the page or renderer disappears during submission.
+            if (typeof submitter.form.requestSubmit === 'function') {
+                submitter.form.requestSubmit(submitter);
+            } else {
+                submitter.click();
+            }
+        } finally {
+            window.setTimeout(() => {
+                if (previousTarget === null) {
+                    submitter.removeAttribute('formtarget');
+                } else {
+                    submitter.setAttribute('formtarget', previousTarget);
+                }
+            }, 0);
+        }
+        return 'submitted';
+    })();
+""".trimIndent()
+
+internal fun middleClickUrlFromScriptResult(result: Any?): String? {
+    val url = (result as? String)
+        ?.takeIf { it.startsWith("link:") }
+        ?.removePrefix("link:")
+        ?.takeIf { it.isNotBlank() }
+        ?: return null
+    val scheme = runCatching { URI(url).scheme?.lowercase() }.getOrNull()
+    return url.takeIf { scheme == "http" || scheme == "https" }
+}
+
+/**
+ * How a native popup should be handled while a middle-click target is being
+ * resolved in the renderer.
+ */
+internal enum class MiddleClickPopupDisposition {
+    FORWARD,
+    BUFFERED,
+    SUPPRESS
+}
+
+internal data class MiddleClickGestureStart(
+    val token: Long,
+    val stalePopupsToForward: List<PopupNavigation>
+)
+
+internal data class MiddleClickResolution(
+    val accepted: Boolean,
+    val popupsToForward: List<PopupNavigation> = emptyList(),
+    val finishAfterReleaseToken: Long? = null
+)
+
+/**
+ * Coordinates the Compose press path with Chromium's native popup callback.
+ *
+ * A native popup can race the renderer JavaScript round-trip. While resolution
+ * is pending, popups are buffered instead of opened. A resolved HTTP(S) link
+ * suppresses the buffered/native popup and opens the original URL directly;
+ * a miss or form submission forwards the buffered popup so POST data and
+ * Chromium-only targets are preserved.
+ *
+ * Suppression is scoped to the active physical middle-click gesture. Release
+ * ends it after a short callback-delivery grace period, and any subsequent
+ * pointer press cancels it immediately, so unrelated user popups are not
+ * swallowed by a fixed-duration timer.
+ */
+internal class MiddleClickPopupCoordinator {
+    private enum class Resolution {
+        PENDING,
+        DIRECT_LINK
+    }
+
+    private data class Gesture(
+        val token: Long,
+        var resolution: Resolution = Resolution.PENDING,
+        var released: Boolean = false,
+        val bufferedPopups: MutableList<PopupNavigation> = mutableListOf()
+    )
+
+    private val lock = Any()
+    private var nextToken = 0L
+    private var gesture: Gesture? = null
+
+    fun begin(): MiddleClickGestureStart = synchronized(lock) {
+        val stalePopups = gesture?.bufferedPopups?.toList().orEmpty()
+        nextToken += 1
+        gesture = Gesture(token = nextToken)
+        MiddleClickGestureStart(
+            token = nextToken,
+            stalePopupsToForward = stalePopups
+        )
+    }
+
+    fun onPopup(navigation: PopupNavigation): MiddleClickPopupDisposition =
+        synchronized(lock) {
+            val current = gesture ?: return@synchronized MiddleClickPopupDisposition.FORWARD
+            when (current.resolution) {
+                Resolution.PENDING -> {
+                    current.bufferedPopups += navigation
+                    MiddleClickPopupDisposition.BUFFERED
+                }
+                Resolution.DIRECT_LINK -> MiddleClickPopupDisposition.SUPPRESS
+            }
+        }
+
+    fun complete(token: Long, directLinkResolved: Boolean): MiddleClickResolution =
+        synchronized(lock) {
+            val current = gesture
+            if (current == null || current.token != token) {
+                return@synchronized MiddleClickResolution(accepted = false)
+            }
+
+            if (!directLinkResolved) {
+                gesture = null
+                return@synchronized MiddleClickResolution(
+                    accepted = true,
+                    popupsToForward = current.bufferedPopups.toList()
+                )
+            }
+
+            current.resolution = Resolution.DIRECT_LINK
+            current.bufferedPopups.clear()
+            MiddleClickResolution(
+                accepted = true,
+                finishAfterReleaseToken = current.token.takeIf { current.released }
+            )
+        }
+
+    fun release(): Long? = synchronized(lock) {
+        val current = gesture ?: return@synchronized null
+        current.released = true
+        current.token.takeIf { current.resolution == Resolution.DIRECT_LINK }
+    }
+
+    fun finish(token: Long) {
+        synchronized(lock) {
+            val current = gesture
+            if (
+                current?.token == token &&
+                current.released &&
+                current.resolution == Resolution.DIRECT_LINK
+            ) {
+                gesture = null
+            }
+        }
+    }
+
+    fun cancel(): List<PopupNavigation> = synchronized(lock) {
+        val buffered = gesture?.bufferedPopups?.toList().orEmpty()
+        gesture = null
+        buffered
+    }
+}
+
+private const val MIDDLE_CLICK_RESOLUTION_TIMEOUT_MS = 500L
+private const val MIDDLE_CLICK_POPUP_RELEASE_GRACE_MS = 150L
+
+private suspend fun resolveMiddleClickTarget(
+    handle: BrowserHandle?,
+    x: Float,
+    y: Float
+): Any? {
+    handle ?: return null
+    return try {
+        withTimeoutOrNull(MIDDLE_CLICK_RESOLUTION_TIMEOUT_MS) {
+            handle.executeJavaScript(middleClickTargetAtPointScript(x, y))
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        null
+    }
 }
 
 /**
@@ -531,6 +770,32 @@ internal fun FluckBrowserTabContent(
     // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
+    val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
+    val handlePopupNavigation: (PopupNavigation) -> Unit = { navigation ->
+        val body = navigation.postData
+        val contentType = navigation.contentType
+        if (body != null && contentType != null) {
+            browserService.stashPopupPost(navigation.url, body, contentType)
+        }
+        onOpenInNewTab(navigation.url)
+    }
+    val finishMiddleClickAfterRelease: (Long) -> Unit = { token ->
+        coroutineScope.launch {
+            delay(MIDDLE_CLICK_POPUP_RELEASE_GRACE_MS)
+            middleClickPopupCoordinator.finish(token)
+        }
+    }
+    val completeMiddleClick: (Long, String?) -> Unit = { token, target ->
+        val resolution = middleClickPopupCoordinator.complete(
+            token = token,
+            directLinkResolved = target != null
+        )
+        resolution.popupsToForward.forEach(handlePopupNavigation)
+        if (resolution.accepted && target != null) {
+            onOpenInNewTab(target)
+        }
+        resolution.finishAfterReleaseToken?.let(finishMiddleClickAfterRelease)
+    }
 
     // Co-browse share dialog. The links arrive reactively (the Cloudflare tunnel URL
     // resolves a few seconds after Share), so observe the manager's shareInfo flow.
@@ -809,17 +1074,16 @@ internal fun FluckBrowserTabContent(
                     showContextMenu = true
                 }
 
-                // Set up callback for cmd+click and target="_blank" to open in new tab.
+                // Route modifier-click, middle-click, and target="_blank" popup navigations to a BOSS tab.
                 // Use the data-aware variant so form-submit popups (e.g. OncoEMR print)
                 // preserve their POST body across the handoff — without this, the
                 // destination server sees a GET and can't reconstruct the print job.
                 handle.setOpenInNewTabWithDataCallback { nav ->
-                    val body = nav.postData
-                    val contentType = nav.contentType
-                    if (body != null && contentType != null) {
-                        browserService.stashPopupPost(nav.url, body, contentType)
+                    when (middleClickPopupCoordinator.onPopup(nav)) {
+                        MiddleClickPopupDisposition.FORWARD -> handlePopupNavigation(nav)
+                        MiddleClickPopupDisposition.BUFFERED,
+                        MiddleClickPopupDisposition.SUPPRESS -> Unit
                     }
-                    onOpenInNewTab(nav.url)
                 }
 
                 // Set up fullscreen handler for video fullscreen (e.g., YouTube)
@@ -1264,40 +1528,71 @@ internal fun FluckBrowserTabContent(
                     )
                 }
                 browserHandle != null -> {
-                    // Wrap browser content with mouse button handler (back/forward/middle-click)
+                    // Resolve middle-click targets on press, before page-level auxclick
+                    // handlers can rewrite hrefs to telemetry endpoints.
+                    // Back/forward auxiliary buttons remain owned by the overlay as well.
                     @OptIn(ExperimentalComposeUiApi::class)
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .onPointerEvent(PointerEventType.Press) { event ->
-                                // Access native AWT MouseEvent for extended button detection
+                                // Access native AWT MouseEvent for extended button detection.
                                 val awtEvent = event.nativeEvent as? java.awt.event.MouseEvent
+                                val isMiddleClick =
+                                    event.button == PointerButton.Tertiary ||
+                                        awtEvent?.button == java.awt.event.MouseEvent.BUTTON2
 
-                                // Handle middle-click to close tab (button 2 is middle mouse button in AWT)
-                                if (awtEvent?.button == 2) {
-                                    onCloseTab()
+                                if (isMiddleClick) {
+                                    val gesture = middleClickPopupCoordinator.begin()
+                                    gesture.stalePopupsToForward.forEach(handlePopupNavigation)
+                                    val position = event.changes.firstOrNull()?.position
                                     event.changes.forEach { it.consume() }
+                                    if (position != null) {
+                                        coroutineScope.launch {
+                                            val scriptResult = resolveMiddleClickTarget(
+                                                handle = browserHandle,
+                                                x = position.x,
+                                                y = position.y
+                                            )
+                                            completeMiddleClick(
+                                                gesture.token,
+                                                middleClickUrlFromScriptResult(scriptResult)
+                                            )
+                                        }
+                                    } else {
+                                        completeMiddleClick(gesture.token, null)
+                                    }
                                     return@onPointerEvent
                                 }
 
-                                // Handle mouse back button
-                                // Windows/macOS: awtButton=4, Linux: awtButton=6 or 8 (varies by mouse)
-                                if (awtEvent?.button in listOf(4, 6, 8)) {
-                                    if (browserHandle?.canGoBack() == true) {
-                                        browserHandle?.goBack()
-                                    }
-                                    event.changes.forEach { it.consume() }
-                                    return@onPointerEvent
-                                }
+                                middleClickPopupCoordinator.cancel()
+                                    .forEach(handlePopupNavigation)
 
-                                // Handle mouse forward button
-                                // Windows/macOS: awtButton=5, Linux: awtButton=7 or 9 (varies by mouse)
-                                if (awtEvent?.button in listOf(5, 7, 9)) {
-                                    if (browserHandle?.canGoForward() == true) {
-                                        browserHandle?.goForward()
+                                when (browserMouseNavigationForButton(awtEvent?.button)) {
+                                    BrowserMouseNavigation.BACK -> {
+                                        if (browserHandle?.canGoBack() == true) {
+                                            browserHandle?.goBack()
+                                        }
+                                        event.changes.forEach { it.consume() }
                                     }
+                                    BrowserMouseNavigation.FORWARD -> {
+                                        if (browserHandle?.canGoForward() == true) {
+                                            browserHandle?.goForward()
+                                        }
+                                        event.changes.forEach { it.consume() }
+                                    }
+                                    null -> Unit
+                                }
+                            }
+                            .onPointerEvent(PointerEventType.Release) { event ->
+                                val awtEvent = event.nativeEvent as? java.awt.event.MouseEvent
+                                val isMiddleClick =
+                                    event.button == PointerButton.Tertiary ||
+                                        awtEvent?.button == java.awt.event.MouseEvent.BUTTON2
+                                if (isMiddleClick) {
                                     event.changes.forEach { it.consume() }
-                                    return@onPointerEvent
+                                    middleClickPopupCoordinator.release()
+                                        ?.let(finishMiddleClickAfterRelease)
                                 }
                             }
                     ) {
