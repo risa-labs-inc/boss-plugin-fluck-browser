@@ -57,8 +57,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.*
+import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
@@ -111,6 +113,7 @@ import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
 import javax.swing.JSeparator
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * Fluck Browser tab component (Dynamic Plugin)
@@ -262,6 +265,72 @@ private val isMacOS: Boolean by lazy {
 private fun KeyEvent.isPrimaryModifierPressed(): Boolean {
     return if (isMacOS) isMetaPressed else isCtrlPressed
 }
+
+internal enum class BrowserMouseNavigation {
+    BACK,
+    FORWARD
+}
+
+/**
+ * Maps only the auxiliary buttons owned by the browser chrome overlay.
+ *
+ * Button 2 (middle-click) deliberately maps to null because its dedicated
+ * pointer handler resolves the target before page scripts can rewrite it.
+ */
+internal fun browserMouseNavigationForButton(awtButton: Int?): BrowserMouseNavigation? =
+    when (awtButton) {
+        4, 6, 8 -> BrowserMouseNavigation.BACK
+        5, 7, 9 -> BrowserMouseNavigation.FORWARD
+        else -> null
+    }
+
+/**
+ * Resolves a middle-click target from the pressed viewport point.
+ * Links return a `link:` result for direct BOSS-tab creation; submit controls
+ * submit through a temporary `_blank` target so the popup bridge can preserve
+ * POST data.
+ */
+internal fun middleClickTargetAtPointScript(x: Int, y: Int): String = """
+    (() => {
+        let element = document.elementFromPoint($x, $y);
+        if (!element) return null;
+        const closest = (selector) => {
+            let current = element;
+            while (current) {
+                if (current.matches && current.matches(selector)) return current;
+                current = current.parentElement;
+            }
+            return null;
+        };
+
+        const link = closest('a[href], area[href]');
+        if (link && link.href) return 'link:' + link.href;
+
+        const submitter = closest(
+            'button[type="submit"], input[type="submit"], input[type="image"]'
+        );
+        if (!submitter || !submitter.form) return null;
+
+        const previousTarget = submitter.getAttribute('formtarget');
+        submitter.setAttribute('formtarget', '_blank');
+        try {
+            if (typeof submitter.form.requestSubmit === 'function') {
+                submitter.form.requestSubmit(submitter);
+            } else {
+                submitter.click();
+            }
+        } finally {
+            window.setTimeout(() => {
+                if (previousTarget === null) {
+                    submitter.removeAttribute('formtarget');
+                } else {
+                    submitter.setAttribute('formtarget', previousTarget);
+                }
+            }, 0);
+        }
+        return 'submitted';
+    })();
+""".trimIndent()
 
 /**
  * Process URL input with smart detection for:
@@ -809,7 +878,7 @@ internal fun FluckBrowserTabContent(
                     showContextMenu = true
                 }
 
-                // Set up callback for cmd+click and target="_blank" to open in new tab.
+                // Route modifier-click, middle-click, and target="_blank" popup navigations to a BOSS tab.
                 // Use the data-aware variant so form-submit popups (e.g. OncoEMR print)
                 // preserve their POST body across the handoff — without this, the
                 // destination server sees a GET and can't reconstruct the print job.
@@ -1264,40 +1333,57 @@ internal fun FluckBrowserTabContent(
                     )
                 }
                 browserHandle != null -> {
-                    // Wrap browser content with mouse button handler (back/forward/middle-click)
+                    val displayDensity = LocalDensity.current.density
+
+                    // Resolve middle-click targets on press, before page-level auxclick
+                    // handlers can rewrite hrefs to telemetry endpoints.
+                    // Back/forward auxiliary buttons remain owned by the overlay as well.
                     @OptIn(ExperimentalComposeUiApi::class)
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .onPointerEvent(PointerEventType.Press) { event ->
-                                // Access native AWT MouseEvent for extended button detection
+                                // Access native AWT MouseEvent for extended button detection.
                                 val awtEvent = event.nativeEvent as? java.awt.event.MouseEvent
 
-                                // Handle middle-click to close tab (button 2 is middle mouse button in AWT)
-                                if (awtEvent?.button == 2) {
-                                    onCloseTab()
+                                if (
+                                    event.button == PointerButton.Tertiary ||
+                                    awtEvent?.button == java.awt.event.MouseEvent.BUTTON2
+                                ) {
+                                    val position = event.changes.firstOrNull()?.position
                                     event.changes.forEach { it.consume() }
+                                    if (position != null) {
+                                        coroutineScope.launch {
+                                            val target = browserHandle?.executeJavaScript(
+                                                middleClickTargetAtPointScript(
+                                                    (position.x / displayDensity).roundToInt(),
+                                                    (position.y / displayDensity).roundToInt()
+                                                )
+                                            ) as? String
+                                            if (target?.startsWith("link:") == true) {
+                                                target.removePrefix("link:")
+                                                    .takeIf { it.isNotBlank() }
+                                                    ?.let(onOpenInNewTab)
+                                            }
+                                        }
+                                    }
                                     return@onPointerEvent
                                 }
 
-                                // Handle mouse back button
-                                // Windows/macOS: awtButton=4, Linux: awtButton=6 or 8 (varies by mouse)
-                                if (awtEvent?.button in listOf(4, 6, 8)) {
-                                    if (browserHandle?.canGoBack() == true) {
-                                        browserHandle?.goBack()
+                                when (browserMouseNavigationForButton(awtEvent?.button)) {
+                                    BrowserMouseNavigation.BACK -> {
+                                        if (browserHandle?.canGoBack() == true) {
+                                            browserHandle?.goBack()
+                                        }
+                                        event.changes.forEach { it.consume() }
                                     }
-                                    event.changes.forEach { it.consume() }
-                                    return@onPointerEvent
-                                }
-
-                                // Handle mouse forward button
-                                // Windows/macOS: awtButton=5, Linux: awtButton=7 or 9 (varies by mouse)
-                                if (awtEvent?.button in listOf(5, 7, 9)) {
-                                    if (browserHandle?.canGoForward() == true) {
-                                        browserHandle?.goForward()
+                                    BrowserMouseNavigation.FORWARD -> {
+                                        if (browserHandle?.canGoForward() == true) {
+                                            browserHandle?.goForward()
+                                        }
+                                        event.changes.forEach { it.consume() }
                                     }
-                                    event.changes.forEach { it.consume() }
-                                    return@onPointerEvent
+                                    null -> Unit
                                 }
                             }
                     ) {
