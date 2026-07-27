@@ -1026,8 +1026,19 @@ internal fun FluckBrowserTabContent(
                     // Update the tab's title in the tab bar via the host
                     tabUpdateProvider?.updateTitle(title)
 
-                    // Add URL to history with title (URL history feature)
-                    urlHistoryProvider?.addUrl(urlBarText.text, title)
+                    // Add URL to history with title (URL history feature).
+                    //
+                    // Record the URL the browser actually committed, not the URL bar text:
+                    // the bar holds whatever the user typed until the navigation listener
+                    // catches up (and it deliberately doesn't while they're still editing),
+                    // so using it filed history entries under half-typed text. The host
+                    // decides whether the navigation really loaded a page before keeping
+                    // the entry — a mistyped host still fires this callback for its error
+                    // page.
+                    val committedUrl = handle.getCurrentUrl()
+                    if (!isHomeUrl(committedUrl)) {
+                        urlHistoryProvider?.addUrl(committedUrl, title)
+                    }
                 }
                 handle.addLoadingListener { loading ->
                     isLoading = loading
