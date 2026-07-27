@@ -33,6 +33,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -1287,6 +1290,28 @@ internal fun FluckBrowserTabContent(
     // handle is owned by the parent Component and disposed in its
     // lifecycle.onDestroy callback (i.e. only on tab close).
 
+    // Forget a suggestion instead of navigating to it — for the entries you never want
+    // offered again (a typo that once loaded an error page, a URL you'd rather not have
+    // surface). Reached from the ✕ on a dropdown row and from shift+Delete on the
+    // highlighted one; both land here so they behave the same. Declared outside the
+    // layout because the URL bar and the dropdown that floats over it are siblings.
+    //
+    // The inline ghost text is dropped rather than recomputed: it previews the first
+    // suggestion, and leaving it pointing at an entry that no longer exists would
+    // autocomplete the URL we were just asked to forget. The next keystroke rebuilds it
+    // from what's left.
+    val onDeleteSuggestion: (UrlHistoryEntry) -> Unit = { entry ->
+        urlHistoryProvider?.deleteUrl(entry.url)
+        val remaining = urlSuggestions.filterNot { it.url == entry.url }
+        urlSuggestions = remaining
+        showUrlSuggestions = remaining.isNotEmpty()
+        selectedDropdownIndex = selectedDropdownIndex.coerceAtMost(remaining.lastIndex)
+        autocompleteSuggestion = null
+        coroutineScope.launch {
+            urlHistoryProvider?.saveHistory()
+        }
+    }
+
     BossTheme {
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -1475,6 +1500,7 @@ internal fun FluckBrowserTabContent(
             onSelectedDropdownIndexChange = { newIndex ->
                 selectedDropdownIndex = newIndex
             },
+            onSuggestionDeleted = onDeleteSuggestion,
             onFocusLost = {
                 // Hide dropdown when focus is lost (with delay to allow click events)
                 coroutineScope.launch {
@@ -1767,6 +1793,8 @@ internal fun FluckBrowserTabContent(
                         .heightIn(max = 300.dp)
                 ) {
                     itemsIndexed(urlSuggestions) { index, entry ->
+                        val rowInteractionSource = remember { MutableInteractionSource() }
+                        val isRowHovered by rowInteractionSource.collectIsHoveredAsState()
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1776,6 +1804,7 @@ internal fun FluckBrowserTabContent(
                                     else
                                         MaterialTheme.colors.surface
                                 )
+                                .hoverable(rowInteractionSource)
                                 .clickable {
                                     urlBarText = TextFieldValue(entry.url, TextRange(entry.url.length))
                                     showUrlSuggestions = false
@@ -1813,6 +1842,19 @@ internal fun FluckBrowserTabContent(
                                     style = MaterialTheme.typography.caption,
                                     color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
                                     maxLines = 1
+                                )
+                            }
+                            // Forget this entry. Shown for the row under the pointer and
+                            // for the arrow-key selection (whose shift+Delete does the
+                            // same thing), so the affordance is discoverable either way.
+                            if (isRowHovered || index == selectedDropdownIndex) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Remove from history",
+                                    tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clickable { onDeleteSuggestion(entry) }
                                 )
                             }
                         }
@@ -2652,6 +2694,7 @@ internal fun BrowserToolbar(
     onDismissSuggestions: () -> Unit = {},
     onAcceptAutocomplete: () -> Unit = {},
     onSelectedDropdownIndexChange: (Int) -> Unit = {},
+    onSuggestionDeleted: (UrlHistoryEntry) -> Unit = {},
     onFocusLost: () -> Unit = {},
     onShare: (() -> Unit)? = null,
     isSharing: Boolean = false
@@ -2819,6 +2862,19 @@ internal fun BrowserToolbar(
                                 } else {
                                     false
                                 }
+                            }
+                            keyEvent.type == KeyEventType.KeyDown &&
+                                keyEvent.isShiftPressed &&
+                                (keyEvent.key == Key.Delete || keyEvent.key == Key.Backspace) &&
+                                showUrlSuggestions &&
+                                selectedDropdownIndex in urlSuggestions.indices -> {
+                                // Forget the highlighted suggestion (Chrome's shift+delete).
+                                // Both keys are accepted because the key labelled "delete" on a
+                                // Mac keyboard reports as Backspace. Gated on a row having been
+                                // highlighted with the arrow keys, so shift+backspace still edits
+                                // text the moment no suggestion is selected.
+                                onSuggestionDeleted(urlSuggestions[selectedDropdownIndex])
+                                true
                             }
                             keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape -> {
                                 onDismissSuggestions()
