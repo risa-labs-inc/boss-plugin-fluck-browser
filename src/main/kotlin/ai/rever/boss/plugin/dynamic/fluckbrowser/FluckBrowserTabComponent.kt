@@ -32,8 +32,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.*
@@ -554,6 +554,36 @@ internal const val HOME_TITLE = "Home"
 internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:blank"
 
 /**
+ * The dropdown state after forgetting [deletedUrl]: the remaining suggestions and where
+ * the keyboard highlight belongs.
+ *
+ * The highlight follows the *entry* the user had chosen, not its index. Deleting a row
+ * above the selection shifts everything below it up one, so keeping the old index would
+ * silently move the highlight onto a different suggestion — and the next Enter would
+ * navigate somewhere the user never selected. Easy to hit, because the ✕ appears on the
+ * row under the pointer regardless of which row the arrow keys are on.
+ *
+ * Pure so the index arithmetic is testable; the composable just applies the result.
+ */
+internal fun suggestionsAfterDelete(
+    suggestions: List<UrlHistoryEntry>,
+    deletedUrl: String,
+    selectedIndex: Int,
+): Pair<List<UrlHistoryEntry>, Int> {
+    val deletedIndex = suggestions.indexOfFirst { it.url == deletedUrl }
+    val remaining = suggestions.filterNot { it.url == deletedUrl }
+
+    val newIndex =
+        when {
+            remaining.isEmpty() || selectedIndex < 0 -> -1
+            // Removed above the selection: everything below shifted up by one.
+            deletedIndex in 0 until selectedIndex -> selectedIndex - 1
+            else -> selectedIndex.coerceAtMost(remaining.lastIndex)
+        }
+    return remaining to newIndex
+}
+
+/**
  * Main browser tab content with URL bar, toolbar, and browser view.
  * Shows Dashboard for about:blank pages and browser content otherwise.
  */
@@ -1052,9 +1082,11 @@ internal fun FluckBrowserTabContent(
                         isInitializing = false
                     }
 
-                    // Save history when page finishes loading (home has no history entry)
-                    val currentUrlText = urlBarText.text
-                    if (!loading && !isHomeUrl(currentUrlText)) {
+                    // Save history when page finishes loading (home has no history entry).
+                    // Reads the committed URL for the same reason the title listener does:
+                    // the URL bar holds what the user is typing, so mid-edit it could look
+                    // home-ish and skip the flush for a page that really did load.
+                    if (!loading && !isHomeUrl(handle.getCurrentUrl())) {
                         coroutineScope.launch {
                             urlHistoryProvider?.saveHistory()
                         }
@@ -1302,10 +1334,11 @@ internal fun FluckBrowserTabContent(
     // from what's left.
     val onDeleteSuggestion: (UrlHistoryEntry) -> Unit = { entry ->
         urlHistoryProvider?.deleteUrl(entry.url)
-        val remaining = urlSuggestions.filterNot { it.url == entry.url }
+        val (remaining, newIndex) =
+            suggestionsAfterDelete(urlSuggestions, entry.url, selectedDropdownIndex)
         urlSuggestions = remaining
         showUrlSuggestions = remaining.isNotEmpty()
-        selectedDropdownIndex = selectedDropdownIndex.coerceAtMost(remaining.lastIndex)
+        selectedDropdownIndex = newIndex
         autocompleteSuggestion = null
         coroutineScope.launch {
             urlHistoryProvider?.saveHistory()
@@ -1792,7 +1825,10 @@ internal fun FluckBrowserTabContent(
                         .fillMaxWidth()
                         .heightIn(max = 300.dp)
                 ) {
-                    itemsIndexed(urlSuggestions) { index, entry ->
+                    // Keyed by URL so per-row state (the hover source below) follows the
+                    // entry rather than the slot — without it, deleting a row hands its
+                    // hover state to whichever suggestion shifts up into its place.
+                    itemsIndexed(urlSuggestions, key = { _, entry -> entry.url }) { index, entry ->
                         val rowInteractionSource = remember { MutableInteractionSource() }
                         val isRowHovered by rowInteractionSource.collectIsHoveredAsState()
                         Row(
@@ -1804,8 +1840,12 @@ internal fun FluckBrowserTabContent(
                                     else
                                         MaterialTheme.colors.surface
                                 )
-                                .hoverable(rowInteractionSource)
-                                .clickable {
+                                // clickable's own interaction source reports hover, so no
+                                // separate .hoverable() is needed.
+                                .clickable(
+                                    interactionSource = rowInteractionSource,
+                                    indication = LocalIndication.current
+                                ) {
                                     urlBarText = TextFieldValue(entry.url, TextRange(entry.url.length))
                                     showUrlSuggestions = false
                                     autocompleteSuggestion = null
@@ -1816,7 +1856,7 @@ internal fun FluckBrowserTabContent(
                                         browserHandle?.loadUrl(entry.url)
                                     }
                                 }
-                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                                .padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             // Icon to indicate type
@@ -1847,15 +1887,31 @@ internal fun FluckBrowserTabContent(
                             // Forget this entry. Shown for the row under the pointer and
                             // for the arrow-key selection (whose shift+Delete does the
                             // same thing), so the affordance is discoverable either way.
-                            if (isRowHovered || index == selectedDropdownIndex) {
-                                Icon(
-                                    imageVector = Icons.Filled.Close,
-                                    contentDescription = "Remove from history",
-                                    tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
-                                    modifier = Modifier
-                                        .size(16.dp)
-                                        .clickable { onDeleteSuggestion(entry) }
-                                )
+                            //
+                            // The slot is always laid out, even when the icon is hidden:
+                            // adding it on hover would re-truncate the title and URL under
+                            // the pointer. The whole 28.dp box is the target, not the
+                            // 16.dp glyph — this deletes, and it sits next to a row that
+                            // navigates on click.
+                            Box(
+                                modifier = Modifier.size(28.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (isRowHovered || index == selectedDropdownIndex) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            .clickable { onDeleteSuggestion(entry) },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "Remove from history",
+                                            tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
