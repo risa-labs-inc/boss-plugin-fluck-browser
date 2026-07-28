@@ -32,7 +32,10 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -551,6 +554,36 @@ internal const val HOME_TITLE = "Home"
 internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:blank"
 
 /**
+ * The dropdown state after forgetting [deletedUrl]: the remaining suggestions and where
+ * the keyboard highlight belongs.
+ *
+ * The highlight follows the *entry* the user had chosen, not its index. Deleting a row
+ * above the selection shifts everything below it up one, so keeping the old index would
+ * silently move the highlight onto a different suggestion — and the next Enter would
+ * navigate somewhere the user never selected. Easy to hit, because the ✕ appears on the
+ * row under the pointer regardless of which row the arrow keys are on.
+ *
+ * Pure so the index arithmetic is testable; the composable just applies the result.
+ */
+internal fun suggestionsAfterDelete(
+    suggestions: List<UrlHistoryEntry>,
+    deletedUrl: String,
+    selectedIndex: Int,
+): Pair<List<UrlHistoryEntry>, Int> {
+    val deletedIndex = suggestions.indexOfFirst { it.url == deletedUrl }
+    val remaining = suggestions.filterNot { it.url == deletedUrl }
+
+    val newIndex =
+        when {
+            remaining.isEmpty() || selectedIndex < 0 -> -1
+            // Removed above the selection: everything below shifted up by one.
+            deletedIndex in 0 until selectedIndex -> selectedIndex - 1
+            else -> selectedIndex.coerceAtMost(remaining.lastIndex)
+        }
+    return remaining to newIndex
+}
+
+/**
  * Main browser tab content with URL bar, toolbar, and browser view.
  * Shows Dashboard for about:blank pages and browser content otherwise.
  */
@@ -1026,8 +1059,22 @@ internal fun FluckBrowserTabContent(
                     // Update the tab's title in the tab bar via the host
                     tabUpdateProvider?.updateTitle(title)
 
-                    // Add URL to history with title (URL history feature)
-                    urlHistoryProvider?.addUrl(urlBarText.text, title)
+                    // Add URL to history with title (URL history feature).
+                    //
+                    // Record the URL the browser actually committed, not the URL bar text:
+                    // the bar holds whatever the user typed until the navigation listener
+                    // catches up (and it deliberately doesn't while they're still editing),
+                    // so using it filed history entries under half-typed text. The host
+                    // decides whether the navigation really loaded a page before keeping
+                    // the entry — a mistyped host still fires this callback for its error
+                    // page.
+                    // runCatching like the other call sites: a callback can land during a
+                    // dispose or renderer-crash race, and an exception here would escape
+                    // into the host's event dispatch rather than being contained.
+                    val committedUrl = runCatching { handle.getCurrentUrl() }.getOrDefault("")
+                    if (!isHomeUrl(committedUrl)) {
+                        urlHistoryProvider?.addUrl(committedUrl, title)
+                    }
                 }
                 handle.addLoadingListener { loading ->
                     isLoading = loading
@@ -1036,13 +1083,19 @@ internal fun FluckBrowserTabContent(
                     if (!loading) {
                         error = null
                         isInitializing = false
-                    }
 
-                    // Save history when page finishes loading (home has no history entry)
-                    val currentUrlText = urlBarText.text
-                    if (!loading && !isHomeUrl(currentUrlText)) {
-                        coroutineScope.launch {
-                            urlHistoryProvider?.saveHistory()
+                        // Save history when page finishes loading (home has no history
+                        // entry). Reads the committed URL for the same reason the title
+                        // listener does: the URL bar holds what the user is typing, so
+                        // mid-edit it could look home-ish and skip the flush for a page
+                        // that really did load. Only asked for on the finished transition
+                        // — reading it on the starting one was a wasted call into the
+                        // engine whose value was then discarded.
+                        val committedUrl = runCatching { handle.getCurrentUrl() }.getOrDefault("")
+                        if (!isHomeUrl(committedUrl)) {
+                            coroutineScope.launch {
+                                urlHistoryProvider?.saveHistory()
+                            }
                         }
                     }
                 }
@@ -1276,6 +1329,38 @@ internal fun FluckBrowserTabContent(
     // handle is owned by the parent Component and disposed in its
     // lifecycle.onDestroy callback (i.e. only on tab close).
 
+    // Forget a suggestion instead of navigating to it — for the entries you never want
+    // offered again (a typo that once loaded an error page, a URL you'd rather not have
+    // surface). Reached from the ✕ on a dropdown row and from shift+Delete on the
+    // highlighted one; both land here so they behave the same. Declared outside the
+    // layout because the URL bar and the dropdown that floats over it are siblings.
+    //
+    // The inline ghost text is dropped rather than recomputed: it previews the first
+    // suggestion, and leaving it pointing at an entry that no longer exists would
+    // autocomplete the URL we were just asked to forget. The next keystroke rebuilds it
+    // from what's left.
+    // remember so the handler keeps one identity across recompositions: the ✕'s gesture
+    // detector is started once per row and would otherwise hold whichever instance existed
+    // when it started, including a stale urlHistoryProvider.
+    val onDeleteSuggestion: (UrlHistoryEntry) -> Unit =
+        remember(urlHistoryProvider) {
+            { entry: UrlHistoryEntry ->
+                // runCatching for the same reason getCurrentUrl has it: this runs inside a
+                // pointer callback, and a host whose provider predates deleteUrl would
+                // throw past it into the host's event dispatch.
+                runCatching { urlHistoryProvider?.deleteUrl(entry.url) }
+                val (remaining, newIndex) =
+                    suggestionsAfterDelete(urlSuggestions, entry.url, selectedDropdownIndex)
+                urlSuggestions = remaining
+                showUrlSuggestions = remaining.isNotEmpty()
+                selectedDropdownIndex = newIndex
+                autocompleteSuggestion = null
+                // No saveHistory() here: the host persists a deletion itself, and holding
+                // shift+Backspace on a full dropdown would otherwise launch a save per key
+                // repeat, all writing the same file.
+            }
+        }
+
     BossTheme {
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -1338,7 +1423,14 @@ internal fun FluckBrowserTabContent(
                 // Get autocomplete suggestion and dropdown items
                 // Only compute when text is not empty and cursor is not selecting text
                 if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
-                    val suggestions = urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
+                    // distinctBy: the dropdown keys its rows by URL, and a duplicate key
+                    // is fatal to a LazyColumn. The current host can't produce one, but
+                    // the list is host-supplied data and a provider that later merges
+                    // sources (history + bookmarks + open tabs) is exactly the shape that
+                    // would. Deleting already removes every copy, so this loses nothing.
+                    val suggestions =
+                        urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
+                            .distinctBy { it.url }
 
                     // Set inline autocomplete (first suggestion with protocol stripped)
                     if (suggestions.isNotEmpty()) {
@@ -1464,6 +1556,7 @@ internal fun FluckBrowserTabContent(
             onSelectedDropdownIndexChange = { newIndex ->
                 selectedDropdownIndex = newIndex
             },
+            onSuggestionDeleted = onDeleteSuggestion,
             onFocusLost = {
                 // Hide dropdown when focus is lost (with delay to allow click events)
                 coroutineScope.launch {
@@ -1755,7 +1848,12 @@ internal fun FluckBrowserTabContent(
                         .fillMaxWidth()
                         .heightIn(max = 300.dp)
                 ) {
-                    itemsIndexed(urlSuggestions) { index, entry ->
+                    // Keyed by URL so per-row state (the hover source below) follows the
+                    // entry rather than the slot — without it, deleting a row hands its
+                    // hover state to whichever suggestion shifts up into its place.
+                    itemsIndexed(urlSuggestions, key = { _, entry -> entry.url }) { index, entry ->
+                        val rowInteractionSource = remember { MutableInteractionSource() }
+                        val isRowHovered by rowInteractionSource.collectIsHoveredAsState()
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1765,7 +1863,12 @@ internal fun FluckBrowserTabContent(
                                     else
                                         MaterialTheme.colors.surface
                                 )
-                                .clickable {
+                                // clickable's own interaction source reports hover, so no
+                                // separate .hoverable() is needed.
+                                .clickable(
+                                    interactionSource = rowInteractionSource,
+                                    indication = LocalIndication.current
+                                ) {
                                     urlBarText = TextFieldValue(entry.url, TextRange(entry.url.length))
                                     showUrlSuggestions = false
                                     autocompleteSuggestion = null
@@ -1776,7 +1879,7 @@ internal fun FluckBrowserTabContent(
                                         browserHandle?.loadUrl(entry.url)
                                     }
                                 }
-                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                                .padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             // Icon to indicate type
@@ -1803,6 +1906,49 @@ internal fun FluckBrowserTabContent(
                                     color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
                                     maxLines = 1
                                 )
+                            }
+                            // Forget this entry. Shown for the row under the pointer and
+                            // for the arrow-key selection (whose shift+Delete does the
+                            // same thing), so the affordance is discoverable either way.
+                            //
+                            // The slot is always laid out, even when the icon is hidden:
+                            // adding it on hover would re-truncate the title and URL under
+                            // the pointer. The whole 28.dp box is the target, not the
+                            // 16.dp glyph — this deletes, and it sits next to a row that
+                            // navigates on click.
+                            Box(
+                                modifier = Modifier.size(28.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (isRowHovered || index == selectedDropdownIndex) {
+                                    @OptIn(ExperimentalComposeUiApi::class)
+                                    Box(
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            // A pointer handler rather than .clickable:
+                                            // clickable is focusable, so clicking ✕ pulled
+                                            // focus out of the URL bar and onFocusLost then
+                                            // closed the whole dropdown 200ms later — you
+                                            // could delete one entry, then had to retype to
+                                            // delete a second. Primary button only: this
+                                            // deletes, so a right-click reaching for a
+                                            // context menu must not fire it.
+                                            .onPointerEvent(PointerEventType.Release) { event ->
+                                                if (event.button == PointerButton.Primary) {
+                                                    event.changes.forEach { it.consume() }
+                                                    onDeleteSuggestion(entry)
+                                                }
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "Remove from history",
+                                            tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -2641,6 +2787,7 @@ internal fun BrowserToolbar(
     onDismissSuggestions: () -> Unit = {},
     onAcceptAutocomplete: () -> Unit = {},
     onSelectedDropdownIndexChange: (Int) -> Unit = {},
+    onSuggestionDeleted: (UrlHistoryEntry) -> Unit = {},
     onFocusLost: () -> Unit = {},
     onShare: (() -> Unit)? = null,
     isSharing: Boolean = false
@@ -2808,6 +2955,19 @@ internal fun BrowserToolbar(
                                 } else {
                                     false
                                 }
+                            }
+                            keyEvent.type == KeyEventType.KeyDown &&
+                                keyEvent.isShiftPressed &&
+                                (keyEvent.key == Key.Delete || keyEvent.key == Key.Backspace) &&
+                                showUrlSuggestions &&
+                                selectedDropdownIndex in urlSuggestions.indices -> {
+                                // Forget the highlighted suggestion (Chrome's shift+delete).
+                                // Both keys are accepted because the key labelled "delete" on a
+                                // Mac keyboard reports as Backspace. Gated on a row having been
+                                // highlighted with the arrow keys, so shift+backspace still edits
+                                // text the moment no suggestion is selected.
+                                onSuggestionDeleted(urlSuggestions[selectedDropdownIndex])
+                                true
                             }
                             keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape -> {
                                 onDismissSuggestions()
