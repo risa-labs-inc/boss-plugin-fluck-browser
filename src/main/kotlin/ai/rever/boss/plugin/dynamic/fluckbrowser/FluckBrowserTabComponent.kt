@@ -34,6 +34,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.*
@@ -64,6 +65,7 @@ import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextRange
@@ -1068,7 +1070,10 @@ internal fun FluckBrowserTabContent(
                     // decides whether the navigation really loaded a page before keeping
                     // the entry — a mistyped host still fires this callback for its error
                     // page.
-                    val committedUrl = handle.getCurrentUrl()
+                    // runCatching like the other call sites: a callback can land during a
+                    // dispose or renderer-crash race, and an exception here would escape
+                    // into the host's event dispatch rather than being contained.
+                    val committedUrl = runCatching { handle.getCurrentUrl() }.getOrDefault("")
                     if (!isHomeUrl(committedUrl)) {
                         urlHistoryProvider?.addUrl(committedUrl, title)
                     }
@@ -1086,7 +1091,8 @@ internal fun FluckBrowserTabContent(
                     // Reads the committed URL for the same reason the title listener does:
                     // the URL bar holds what the user is typing, so mid-edit it could look
                     // home-ish and skip the flush for a page that really did load.
-                    if (!loading && !isHomeUrl(handle.getCurrentUrl())) {
+                    val committedUrl = runCatching { handle.getCurrentUrl() }.getOrDefault("")
+                    if (!loading && !isHomeUrl(committedUrl)) {
                         coroutineScope.launch {
                             urlHistoryProvider?.saveHistory()
                         }
@@ -1407,7 +1413,14 @@ internal fun FluckBrowserTabContent(
                 // Get autocomplete suggestion and dropdown items
                 // Only compute when text is not empty and cursor is not selecting text
                 if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
-                    val suggestions = urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
+                    // distinctBy: the dropdown keys its rows by URL, and a duplicate key
+                    // is fatal to a LazyColumn. The current host can't produce one, but
+                    // the list is host-supplied data and a provider that later merges
+                    // sources (history + bookmarks + open tabs) is exactly the shape that
+                    // would. Deleting already removes every copy, so this loses nothing.
+                    val suggestions =
+                        urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
+                            .distinctBy { it.url }
 
                     // Set inline autocomplete (first suggestion with protocol stripped)
                     if (suggestions.isNotEmpty()) {
@@ -1901,7 +1914,16 @@ internal fun FluckBrowserTabContent(
                                     Box(
                                         modifier = Modifier
                                             .size(28.dp)
-                                            .clickable { onDeleteSuggestion(entry) },
+                                            // A tap gesture rather than .clickable: clickable
+                                            // is focusable, so clicking ✕ pulled focus out of
+                                            // the URL bar, and onFocusLost then closed the
+                                            // whole dropdown 200ms later — you could delete
+                                            // one entry and then had to retype to delete a
+                                            // second. Keyed by URL so the handler follows the
+                                            // entry when the list shifts under it.
+                                            .pointerInput(entry.url) {
+                                                detectTapGestures { onDeleteSuggestion(entry) }
+                                            },
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Icon(
