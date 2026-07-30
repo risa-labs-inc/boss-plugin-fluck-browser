@@ -756,6 +756,10 @@ internal class FluckBrowserTabState {
     // a row are two distinct values: keying the show-effect on a boolean silently drops
     // the second request whenever the first menu's dismissal hasn't reset it yet.
     var contextMenuRequest: Int by mutableStateOf(0)
+    // The request a menu has already been opened for. LaunchedEffect restarts when the
+    // tab re-enters composition, which would otherwise re-open the last menu — visible
+    // if the tab is switched away from with a menu still up.
+    var shownContextMenuRequest: Int = 0
     var isInFullscreen: Boolean by mutableStateOf(false)
 }
 
@@ -1723,7 +1727,8 @@ internal fun FluckBrowserTabContent(
                 // the menu we are building.
                 val requestId = contextMenuRequest
                 val menuInfo = contextMenuInfo
-                if (requestId > 0 && menuInfo != null) {
+                if (requestId > 0 && requestId != hoistedState.shownContextMenuRequest && menuInfo != null) {
+                    hoistedState.shownContextMenuRequest = requestId
                     val mouseLocation = java.awt.MouseInfo.getPointerInfo()?.location
                     if (mouseLocation != null) {
                         // Load secrets if we have formFieldInfo and a provider
