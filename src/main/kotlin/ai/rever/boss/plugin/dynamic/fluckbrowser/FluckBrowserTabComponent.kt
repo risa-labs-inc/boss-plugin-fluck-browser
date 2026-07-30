@@ -1791,6 +1791,15 @@ internal fun FluckBrowserTabContent(
                 }
             }
 
+            // A heavyweight popup is a window: it outlives this Composable unless something
+            // takes it down. AWT's grab means a *mouse* click elsewhere dismisses it on the
+            // way, but a keyboard tab switch, a tab close, or crash-recovery swapping the
+            // content underneath leaves it on screen — with items closing over the previous
+            // tab's browserHandle, so Reload would fire into a disposed browser.
+            DisposableEffect(Unit) {
+                onDispose { SwingContextMenu.hide() }
+            }
+
             // Context menu (Swing-based for hardware accelerated browser compatibility).
             // Keyed on the request counter, not on a visibility flag, so every right-click
             // re-opens the menu — including one fired while the previous menu is still up.
@@ -1800,14 +1809,18 @@ internal fun FluckBrowserTabContent(
                 // the menu we are building.
                 val requestId = contextMenuRequest
                 val menuInfo = contextMenuInfo
-                if (menuInfo != null) {
+                // Read the pointer before the request is eligible to be consumed. Inside the
+                // run, a null here (headless, or the pointer on no screen device) would burn
+                // the request without ever showing anything — and unlike a cancelled run,
+                // this one never got as far as wanting to draw, so there is nothing to
+                // protect the user from replaying.
+                val mouseLocation = java.awt.MouseInfo.getPointerInfo()?.location
+                if (menuInfo != null && mouseLocation != null) {
                     runContextMenuRequest(
                         request = requestId,
                         shownRequest = hoistedState.shownContextMenuRequest,
                         markShown = { hoistedState.shownContextMenuRequest = it }
                     ) {
-                    val mouseLocation = java.awt.MouseInfo.getPointerInfo()?.location
-                    if (mouseLocation != null) {
                         // Load secrets if we have formFieldInfo and a provider
                         val secretsForMenu: List<SecretEntryData> = if (menuInfo.formFieldInfo != null && secretDataProvider != null) {
                             try {
@@ -1889,7 +1902,6 @@ internal fun FluckBrowserTabContent(
                                 }
                             }
                         )
-                    }
                     }
                 }
             }
@@ -2378,15 +2390,18 @@ internal fun buildContextMenuItems(
                 text = "Copy Link URL",
                 onClick = { copyToClipboard(linkUrl) }
             ))
-        } else {
-            // Not on a link - copy current page URL
-            add(ContextMenuItem(
-                text = "Copy Page URL",
-                onClick = {
-                    info?.pageUrl?.let { copyToClipboard(it) }
-                }
-            ))
         }
+
+        // Always offered, including on a link. Copying the page you are on is the one
+        // entry whose availability shouldn't depend on what the pointer happened to be
+        // over — and for a mailto:/javascript: href, where the open entries are gated
+        // away, it is otherwise the only thing the menu could do and doesn't.
+        add(ContextMenuItem(
+            text = "Copy Page URL",
+            onClick = {
+                info?.pageUrl?.let { copyToClipboard(it) }
+            }
+        ))
 
         // Image actions, when the click landed on one. Independent of the link
         // branch above: images are routinely wrapped in an anchor, and both sets

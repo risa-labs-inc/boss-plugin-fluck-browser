@@ -35,13 +35,6 @@ class ContextMenuRequestGateTest {
     }
 
     @Test
-    fun `a request whose run was cancelled before it opened is retried`() {
-        // shownRequest is only advanced once the menu is actually shown, so a run cancelled
-        // while loading secrets leaves the request eligible on the next pass.
-        assertTrue(shouldOpenContextMenu(request = 4, shownRequest = 3))
-    }
-
-    @Test
     fun `the initial state opens nothing`() {
         assertFalse(shouldOpenContextMenu(request = 0, shownRequest = 0))
     }

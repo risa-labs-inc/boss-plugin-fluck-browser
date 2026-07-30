@@ -52,7 +52,7 @@ class ContextMenuItemsTest {
     }
 
     @Test
-    fun `right-clicking a link offers the link actions instead of the page URL`() {
+    fun `right-clicking a link offers the link actions alongside the page URL`() {
         val items = labels(
             BrowserContextMenuInfo(
                 linkUrl = "https://example.com/target",
@@ -63,7 +63,7 @@ class ContextMenuItemsTest {
         assertTrue(items.contains("Open Link"))
         assertTrue(items.contains("Open Link in New Tab"))
         assertTrue(items.contains("Copy Link URL"))
-        assertFalse(items.contains("Copy Page URL"))
+        assertTrue(items.contains("Copy Page URL"))
     }
 
     @Test
@@ -134,7 +134,18 @@ class ContextMenuItemsTest {
             assertFalse(items.contains("Open Link"), "should not offer to navigate to $href")
             assertFalse(items.contains("Open Link in New Tab"), "should not open $href in a tab")
             assertTrue(items.contains("Copy Link URL"), "copying $href is inert and stays")
+            assertTrue(items.contains("Copy Page URL"), "the page is still copyable on $href")
         }
+    }
+
+    @Test
+    fun `a non-web image can be copied but not opened`() {
+        val items = labels(
+            BrowserContextMenuInfo(hasImage = true, imageUrl = "data:image/png;base64,AAAA")
+        )
+
+        assertFalse(items.contains("Open Image in New Tab"))
+        assertTrue(items.contains("Copy Image URL"))
     }
 
     @Test
