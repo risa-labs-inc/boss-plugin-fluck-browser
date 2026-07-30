@@ -744,6 +744,19 @@ internal class FluckBrowserTabState {
     var isBookmarked: Boolean by mutableStateOf(false)
     var navigationHistory: MutableList<Pair<String, String>> by mutableStateOf(mutableListOf())
     var historyIndex: Int by mutableStateOf(-1)
+
+    // Written by callbacks registered once on the BrowserHandle (setContextMenuCallback,
+    // setFullscreenHandler), so they MUST live here rather than in a remember slot.
+    // A remember-scoped MutableState is discarded when the host drops the inactive tab's
+    // Composable from composition; the callback lambda captured the *old* instance and
+    // would keep writing to it, leaving the UI observing a state nobody updates. That is
+    // exactly how right-click went dead after the first tab switch.
+    var contextMenuInfo: BrowserContextMenuInfo? by mutableStateOf(null)
+    // Bumped once per right-click. A counter rather than a boolean so two right-clicks in
+    // a row are two distinct values: keying the show-effect on a boolean silently drops
+    // the second request whenever the first menu's dismissal hasn't reset it yet.
+    var contextMenuRequest: Int by mutableStateOf(0)
+    var isInFullscreen: Boolean by mutableStateOf(false)
 }
 
 @Composable
@@ -798,6 +811,9 @@ internal fun FluckBrowserTabContent(
     var isBookmarked by hoistedState::isBookmarked
     var navigationHistory by hoistedState::navigationHistory
     var historyIndex by hoistedState::historyIndex
+    var contextMenuInfo by hoistedState::contextMenuInfo
+    var contextMenuRequest by hoistedState::contextMenuRequest
+    var isInFullscreen by hoistedState::isInFullscreen
 
     // Local-only state (not shared across composition) — derived/transient,
     // doesn't need to survive tab switches.
@@ -870,9 +886,8 @@ internal fun FluckBrowserTabContent(
     var selectedDropdownIndex by remember { mutableStateOf(-1) }
     val dropdownListState = rememberLazyListState()
 
-    // Context menu state
-    var showContextMenu by remember { mutableStateOf(false) }
-    var contextMenuInfo by remember { mutableStateOf<BrowserContextMenuInfo?>(null) }
+    // Context-menu state lives on hoistedState (see FluckBrowserTabState) — it is written
+    // by the once-registered setContextMenuCallback.
 
     // Cached secrets for context menu (loaded when context menu is shown)
     var cachedSecrets by remember { mutableStateOf<List<SecretEntryData>>(emptyList()) }
@@ -883,8 +898,8 @@ internal fun FluckBrowserTabContent(
     var quickCreateWebsitePrefill by remember { mutableStateOf("") }
     var allSecrets by remember { mutableStateOf<List<SecretEntryData>>(emptyList()) }
 
-    // Fullscreen state - tracks when browser content is displayed in a fullscreen window
-    var isInFullscreen by remember { mutableStateOf(false) }
+    // Fullscreen state (hoisted — written by the once-registered setFullscreenHandler)
+    // tracks when browser content is displayed in a fullscreen window.
 
     // Retry state for browser creation. retryCount drives the auto-retry backoff;
     // initNonce (hoisted, see FluckBrowserTabState) guarantees the init effect
@@ -1121,10 +1136,15 @@ internal fun FluckBrowserTabContent(
                     }
                 }
 
-                // Set up context menu callback
+                // Set up context menu callback. Registered once per BrowserHandle, so it
+                // writes to the hoisted state — see the note on FluckBrowserTabState.
+                // JxBrowser invokes this on its own thread; hop to Main so the two writes
+                // land in one frame and the effect below observes them together.
                 handle.setContextMenuCallback { info ->
-                    contextMenuInfo = info
-                    showContextMenu = true
+                    coroutineScope.launch(Dispatchers.Main) {
+                        hoistedState.contextMenuInfo = info
+                        hoistedState.contextMenuRequest++
+                    }
                 }
 
                 // Route modifier-click, middle-click, and target="_blank" popup navigations to a BOSS tab.
@@ -1694,13 +1714,20 @@ internal fun FluckBrowserTabContent(
                 }
             }
 
-            // Context menu (Swing-based for hardware accelerated browser compatibility)
-            LaunchedEffect(showContextMenu) {
-                if (showContextMenu && contextMenuInfo != null) {
+            // Context menu (Swing-based for hardware accelerated browser compatibility).
+            // Keyed on the request counter, not on a visibility flag, so every right-click
+            // re-opens the menu — including one fired while the previous menu is still up.
+            LaunchedEffect(contextMenuRequest) {
+                // Snapshot both up front: loading secrets below suspends, and a second
+                // right-click landing meanwhile must not swap the target out from under
+                // the menu we are building.
+                val requestId = contextMenuRequest
+                val menuInfo = contextMenuInfo
+                if (requestId > 0 && menuInfo != null) {
                     val mouseLocation = java.awt.MouseInfo.getPointerInfo()?.location
                     if (mouseLocation != null) {
                         // Load secrets if we have formFieldInfo and a provider
-                        val secretsForMenu: List<SecretEntryData> = if (contextMenuInfo?.formFieldInfo != null && secretDataProvider != null) {
+                        val secretsForMenu: List<SecretEntryData> = if (menuInfo.formFieldInfo != null && secretDataProvider != null) {
                             try {
                                 val result = secretDataProvider.getUserSecrets(limit = 100)
                                 result.getOrNull()?.data ?: emptyList()
@@ -1712,7 +1739,7 @@ internal fun FluckBrowserTabContent(
                         }
 
                         val menuItems = buildContextMenuItems(
-                            info = contextMenuInfo,
+                            info = menuInfo,
                             browserHandle = browserHandle,
                             canGoBack = canGoBack,
                             canGoForward = canGoForward,
@@ -1771,8 +1798,13 @@ internal fun FluckBrowserTabContent(
                             screenY = mouseLocation.y,
                             items = menuItems,
                             onDismiss = {
-                                showContextMenu = false
-                                contextMenuInfo = null
+                                // Only clear the info this menu was built from. A newer
+                                // right-click may already have replaced it while this
+                                // popup was closing; nulling that out would drop the
+                                // menu that is on its way in.
+                                if (hoistedState.contextMenuRequest == requestId) {
+                                    hoistedState.contextMenuInfo = null
+                                }
                             }
                         )
                     }
@@ -2059,7 +2091,7 @@ private fun getDisplayName(website: String): String {
 /**
  * Build context menu items based on browser state.
  */
-private fun buildContextMenuItems(
+internal fun buildContextMenuItems(
     info: BrowserContextMenuInfo?,
     browserHandle: BrowserHandle?,
     canGoBack: Boolean,
@@ -2079,6 +2111,11 @@ private fun buildContextMenuItems(
 
         // Edit operations for text fields (first, like main branch)
         add(ContextMenuItem(
+            text = "Cut",
+            onClick = { browserHandle?.cut() }
+        ))
+
+        add(ContextMenuItem(
             text = "Copy",
             onClick = { browserHandle?.copySelection() }
         ))
@@ -2086,6 +2123,11 @@ private fun buildContextMenuItems(
         add(ContextMenuItem(
             text = "Paste",
             onClick = { browserHandle?.paste() }
+        ))
+
+        add(ContextMenuItem(
+            text = "Select All",
+            onClick = { browserHandle?.selectAll() }
         ))
 
         add(ContextMenuItem(isDivider = true))
@@ -2236,13 +2278,18 @@ private fun buildContextMenuItems(
         if (!linkUrl.isNullOrEmpty()) {
             // Right-clicked on a link
             add(ContextMenuItem(
-                text = "Copy Link URL",
-                onClick = { copyToClipboard(linkUrl) }
+                text = "Open Link",
+                onClick = { onNavigate(linkUrl) }
             ))
 
             add(ContextMenuItem(
                 text = "Open Link in New Tab",
                 onClick = { onOpenInNewTab(linkUrl) }
+            ))
+
+            add(ContextMenuItem(
+                text = "Copy Link URL",
+                onClick = { copyToClipboard(linkUrl) }
             ))
         } else {
             // Not on a link - copy current page URL
@@ -2251,6 +2298,24 @@ private fun buildContextMenuItems(
                 onClick = {
                     info?.pageUrl?.let { copyToClipboard(it) }
                 }
+            ))
+        }
+
+        // Image actions, when the click landed on one. Independent of the link
+        // branch above: images are routinely wrapped in an anchor, and both sets
+        // of actions are meaningful there.
+        val imageUrl = info?.imageUrl
+        if (info?.hasImage == true && !imageUrl.isNullOrEmpty()) {
+            add(ContextMenuItem(isDivider = true))
+
+            add(ContextMenuItem(
+                text = "Open Image in New Tab",
+                onClick = { onOpenInNewTab(imageUrl) }
+            ))
+
+            add(ContextMenuItem(
+                text = "Copy Image URL",
+                onClick = { copyToClipboard(imageUrl) }
             ))
         }
 
@@ -2293,6 +2358,11 @@ object SwingContextMenu {
             // Dark theme colors matching BOSS style
             background = AwtColor(0x2B, 0x2B, 0x2B)
             border = BorderFactory.createLineBorder(AwtColor(0x3C, 0x3F, 0x41), 1)
+            // A lightweight popup paints into the Swing layer, which sits *behind* the
+            // hardware-accelerated browser surface — the menu would be invisible over
+            // page content. The host sets this globally, but the plugin cannot assume
+            // the host it is loaded into did.
+            isLightWeightPopupEnabled = false
         }
 
         // Add items to popup
@@ -2331,19 +2401,21 @@ object SwingContextMenu {
 
         currentPopup = popup
 
-        // Find the window to use as invoker
-        var targetWindow: Window? = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusedWindow
-
-        // If no focused window, find window at mouse position
-        if (targetWindow == null) {
-            val mousePoint = java.awt.Point(screenX, screenY)
-            targetWindow = Window.getWindows()
-                .filter { it.isVisible && it.bounds.contains(mousePoint) }
-                .maxByOrNull { it.bounds.width * it.bounds.height }
-
-            targetWindow?.toFront()
-            targetWindow?.requestFocus()
-        }
+        // Find the window to use as invoker. It must be the window that was actually
+        // right-clicked: with several BOSS windows open (or focus sitting on a detached
+        // browser window), the focused one need not contain the click, and the popup
+        // would then be positioned against the wrong origin. Only frames and dialogs
+        // are candidates — Window.getWindows() also returns the heavyweight windows
+        // Swing creates for popups, including the menu we may be replacing.
+        val clickPoint = java.awt.Point(screenX, screenY)
+        val focusedWindow = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusedWindow
+        val targetWindow: Window? =
+            focusedWindow?.takeIf { it.isShowing && it.bounds.contains(clickPoint) }
+                ?: Window.getWindows()
+                    .filter { it is java.awt.Frame || it is java.awt.Dialog }
+                    .filter { it.isShowing && it.bounds.contains(clickPoint) }
+                    .minByOrNull { it.bounds.width.toLong() * it.bounds.height }
+                ?: focusedWindow
 
         if (targetWindow != null) {
             // Convert screen coordinates to window-relative
