@@ -362,21 +362,14 @@ internal fun middleClickUrlFromScriptResult(result: Any?): String? {
 }
 
 /**
- * Whether a page-supplied URL is safe for the menu to act on.
- *
- * An href reaches us straight from the document, so `javascript:` and `data:` are both
- * possible. Navigating one is not a new privilege — clicking the link would do the same —
- * but a menu entry runs it without the page's own affordance, and `data:` in particular
- * makes an attacker-chosen document look like it came from the menu. Web schemes only.
- */
-/**
  * Whether a context-menu request should open a menu.
  *
  * The show-effect restarts whenever the tab re-enters composition, which would otherwise
- * re-open the menu for a request already honoured — visible if the tab is switched away
- * from with a menu still up. [shownRequest] is the last request a menu actually opened
- * for; a request only counts as consumed once `show` has been reached, so a run cancelled
- * mid-flight is retried rather than swallowed.
+ * re-open the menu for a request already honoured. [shownRequest] is the last request the
+ * effect ran for — a request is consumed whether its run reached `show` or was cancelled
+ * on the way there, because replaying a cancelled one opens a menu the user never asked
+ * for, at a cursor they have since moved. Losing that menu costs another right-click;
+ * replaying it puts UI on screen unbidden.
  *
  * Pure so the gate is testable; the composable applies the result.
  */
@@ -384,6 +377,27 @@ internal fun shouldOpenContextMenu(
     request: Int,
     shownRequest: Int
 ): Boolean = request > 0 && request != shownRequest
+
+/**
+ * Run [open] for [request] if the gate allows it, marking the request consumed either way.
+ *
+ * The consume-on-cancellation half is the point: it is what stops a run that was cut short
+ * from being replayed when the tab re-enters composition. Structured so the invariant is
+ * testable — it has already been got wrong in both directions.
+ */
+internal suspend fun runContextMenuRequest(
+    request: Int,
+    shownRequest: Int,
+    markShown: (Int) -> Unit,
+    open: suspend () -> Unit
+) {
+    if (!shouldOpenContextMenu(request, shownRequest)) return
+    try {
+        open()
+    } finally {
+        markShown(request)
+    }
+}
 
 /**
  * Whether a dismissed menu should clear the pending target.
@@ -397,6 +411,14 @@ internal fun shouldClearContextMenuTarget(
     currentRequest: Int
 ): Boolean = dismissedRequest == currentRequest
 
+/**
+ * Whether a page-supplied URL is safe for the menu to act on.
+ *
+ * An href reaches us straight from the document, so `javascript:` and `data:` are both
+ * possible. Navigating one is not a new privilege — clicking the link would do the same —
+ * but a menu entry runs it without the page's own affordance, and `data:` in particular
+ * makes an attacker-chosen document look like it came from the menu. Web schemes only.
+ */
 internal fun isWebUrl(url: String): Boolean {
     val scheme = runCatching { URI(url).scheme?.lowercase() }.getOrNull()
     return scheme == "http" || scheme == "https"
@@ -1778,7 +1800,12 @@ internal fun FluckBrowserTabContent(
                 // the menu we are building.
                 val requestId = contextMenuRequest
                 val menuInfo = contextMenuInfo
-                if (menuInfo != null && shouldOpenContextMenu(requestId, hoistedState.shownContextMenuRequest)) {
+                if (menuInfo != null) {
+                    runContextMenuRequest(
+                        request = requestId,
+                        shownRequest = hoistedState.shownContextMenuRequest,
+                        markShown = { hoistedState.shownContextMenuRequest = it }
+                    ) {
                     val mouseLocation = java.awt.MouseInfo.getPointerInfo()?.location
                     if (mouseLocation != null) {
                         // Load secrets if we have formFieldInfo and a provider
@@ -1848,12 +1875,6 @@ internal fun FluckBrowserTabContent(
                                 }
                             }
                         )
-                        // Mark the request consumed only now that it is actually being
-                        // honoured. Marking it earlier loses a menu outright when the
-                        // effect is cancelled mid-flight (a tab switch while the secrets
-                        // load suspends) — the replay guard would then suppress the very
-                        // request that never got shown.
-                        hoistedState.shownContextMenuRequest = requestId
                         SwingContextMenu.show(
                             screenX = mouseLocation.x,
                             screenY = mouseLocation.y,
@@ -1868,6 +1889,7 @@ internal fun FluckBrowserTabContent(
                                 }
                             }
                         )
+                    }
                     }
                 }
             }
@@ -2373,10 +2395,14 @@ internal fun buildContextMenuItems(
         if (info?.hasImage == true && !imageUrl.isNullOrEmpty()) {
             add(ContextMenuItem(isDivider = true))
 
-            add(ContextMenuItem(
-                text = "Open Image in New Tab",
-                onClick = { onOpenInNewTab(imageUrl) }
-            ))
+            // Same rule as the link entries: an image src is page-supplied, so only the
+            // entry that opens it is gated. Copying is inert.
+            if (isWebUrl(imageUrl)) {
+                add(ContextMenuItem(
+                    text = "Open Image in New Tab",
+                    onClick = { onOpenInNewTab(imageUrl) }
+                ))
+            }
 
             add(ContextMenuItem(
                 text = "Copy Image URL",
@@ -2478,15 +2504,21 @@ object SwingContextMenu {
             Window.getWindows()
                 .filter { it is java.awt.Frame || it is java.awt.Dialog }
                 .filter { it.isShowing && it.bounds.contains(clickPoint) }
+        val smallestFirst =
+            compareBy<Window> { it.bounds.width.toLong() * it.bounds.height }
         val targetWindow: Window? =
-            focusedWindow?.takeIf { it.isShowing && it.bounds.contains(clickPoint) }
+            focusedWindow
+                ?.takeIf { it is java.awt.Frame || it is java.awt.Dialog }
+                ?.takeIf { it.isShowing && it.bounds.contains(clickPoint) }
                 // getWindows() is not in z-order, and smallest-area is only a proxy for
                 // topmost — it inverts when a fullscreen browser window covers a smaller
                 // main frame. A heavyweight popup is owned by its invoker, so choosing the
-                // window underneath would paint the menu behind the one on top. Prefer the
-                // active window, which is authoritative.
-                ?: candidates.firstOrNull { it.isActive }
-                ?: candidates.minByOrNull { it.bounds.width.toLong() * it.bounds.height }
+                // window underneath would paint the menu behind the one on top. Active
+                // first, then smallest: isActive is also true for every window the active
+                // one owns, so a dialog over its owner leaves both active and the array
+                // order would otherwise decide.
+                ?: candidates.filter { it.isActive }.minWithOrNull(smallestFirst)
+                ?: candidates.minWithOrNull(smallestFirst)
                 // Deliberately not falling back to focusedWindow here: it is only reached
                 // when focus sits outside the click, and it bypasses the frame/dialog
                 // filter above — handing the invoker role to a heavyweight popup window is

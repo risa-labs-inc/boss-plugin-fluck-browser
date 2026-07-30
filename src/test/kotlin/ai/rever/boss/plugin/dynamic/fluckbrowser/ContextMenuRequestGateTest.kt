@@ -1,6 +1,10 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -52,5 +56,52 @@ class ContextMenuRequestGateTest {
         // Showing a new menu hides the old one, whose dismiss handler runs after the new
         // target is already in place — clearing it there would drop the incoming menu.
         assertFalse(shouldClearContextMenuTarget(dismissedRequest = 3, currentRequest = 4))
+    }
+
+    @Test
+    fun `a run that completes consumes its request`() = runTest {
+        var shown = 0
+        var opened = false
+
+        runContextMenuRequest(request = 1, shownRequest = 0, markShown = { shown = it }) {
+            opened = true
+        }
+
+        assertTrue(opened)
+        assertEquals(1, shown)
+    }
+
+    @Test
+    fun `a run cancelled before it opens still consumes its request`() = runTest {
+        // The tab switching away mid-flight: the composition this belonged to is gone, and
+        // replaying on re-entry would open a menu nobody asked for at a stale cursor.
+        var shown = 0
+        val started = CompletableDeferred<Unit>()
+        val job = launch {
+            runContextMenuRequest(request = 5, shownRequest = 4, markShown = { shown = it }) {
+                started.complete(Unit)
+                CompletableDeferred<Unit>().await() // never returns; only cancellation ends it
+            }
+        }
+
+        started.await()
+        job.cancel()
+        job.join()
+
+        assertEquals(5, shown)
+        assertFalse(shouldOpenContextMenu(request = 5, shownRequest = shown))
+    }
+
+    @Test
+    fun `a request the gate rejects is not run and does not re-consume`() = runTest {
+        var shown = -1
+        var opened = false
+
+        runContextMenuRequest(request = 7, shownRequest = 7, markShown = { shown = it }) {
+            opened = true
+        }
+
+        assertFalse(opened)
+        assertEquals(-1, shown)
     }
 }
