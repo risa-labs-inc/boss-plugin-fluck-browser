@@ -111,12 +111,30 @@ class ContextMenuItemsTest {
 
     @Test
     fun `an editable field offers the full set of edit operations`() {
-        val items = labels(BrowserContextMenuInfo(isEditable = true))
+        // canGoBack/Forward are true so the absent-Back assertion discriminates: it proves
+        // the field branch was taken, not merely that there was no history to offer.
+        val items = labels(
+            BrowserContextMenuInfo(isEditable = true),
+            canGoBack = true,
+            canGoForward = true
+        )
 
         assertEquals(listOf("Cut", "Copy", "Paste", "Select All"), items.take(4))
         // The page-level actions belong to the page menu, not the field menu.
         assertFalse(items.contains("Back"))
+        assertFalse(items.contains("Forward"))
         assertFalse(items.contains("Add Bookmark"))
+    }
+
+    @Test
+    fun `a non-web link can be copied but not opened`() {
+        listOf("javascript:alert(1)", "data:text/html,hi", "file:///etc/passwd").forEach { href ->
+            val items = labels(BrowserContextMenuInfo(linkUrl = href))
+
+            assertFalse(items.contains("Open Link"), "should not offer to navigate to $href")
+            assertFalse(items.contains("Open Link in New Tab"), "should not open $href in a tab")
+            assertTrue(items.contains("Copy Link URL"), "copying $href is inert and stays")
+        }
     }
 
     @Test

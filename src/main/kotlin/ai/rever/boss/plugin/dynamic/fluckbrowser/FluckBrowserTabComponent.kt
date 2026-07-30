@@ -358,8 +358,48 @@ internal fun middleClickUrlFromScriptResult(result: Any?): String? {
         ?.removePrefix("link:")
         ?.takeIf { it.isNotBlank() }
         ?: return null
+    return url.takeIf { isWebUrl(it) }
+}
+
+/**
+ * Whether a page-supplied URL is safe for the menu to act on.
+ *
+ * An href reaches us straight from the document, so `javascript:` and `data:` are both
+ * possible. Navigating one is not a new privilege — clicking the link would do the same —
+ * but a menu entry runs it without the page's own affordance, and `data:` in particular
+ * makes an attacker-chosen document look like it came from the menu. Web schemes only.
+ */
+/**
+ * Whether a context-menu request should open a menu.
+ *
+ * The show-effect restarts whenever the tab re-enters composition, which would otherwise
+ * re-open the menu for a request already honoured — visible if the tab is switched away
+ * from with a menu still up. [shownRequest] is the last request a menu actually opened
+ * for; a request only counts as consumed once `show` has been reached, so a run cancelled
+ * mid-flight is retried rather than swallowed.
+ *
+ * Pure so the gate is testable; the composable applies the result.
+ */
+internal fun shouldOpenContextMenu(
+    request: Int,
+    shownRequest: Int
+): Boolean = request > 0 && request != shownRequest
+
+/**
+ * Whether a dismissed menu should clear the pending target.
+ *
+ * Dismissal is asynchronous: showing a new menu hides the old one, which fires the old
+ * menu's dismiss handler *after* the new target is in place. Only the request the closing
+ * menu was built from may clear it.
+ */
+internal fun shouldClearContextMenuTarget(
+    dismissedRequest: Int,
+    currentRequest: Int
+): Boolean = dismissedRequest == currentRequest
+
+internal fun isWebUrl(url: String): Boolean {
     val scheme = runCatching { URI(url).scheme?.lowercase() }.getOrNull()
-    return url.takeIf { scheme == "http" || scheme == "https" }
+    return scheme == "http" || scheme == "https"
 }
 
 /**
@@ -1145,7 +1185,11 @@ internal fun FluckBrowserTabContent(
                 // JxBrowser invokes this on its own thread; hop to Main so the two writes
                 // land in one frame and the effect below observes them together.
                 handle.setContextMenuCallback { info ->
-                    coroutineScope.launch(Dispatchers.Main) {
+                    // coroutineScope is already Main-dispatched; `immediate` keeps a
+                    // callback that already arrives on the EDT from taking a dispatch it
+                    // doesn't need — the menu still reads the pointer position, so every
+                    // hop between the click and the read is drift.
+                    coroutineScope.launch(Dispatchers.Main.immediate) {
                         hoistedState.contextMenuInfo = info
                         hoistedState.contextMenuRequest++
                     }
@@ -1258,6 +1302,11 @@ internal fun FluckBrowserTabContent(
                         browserHandle = null
                         disposeBrowserHandleOffThread(handle)
                         isInitializing = true
+                        // Fullscreen belongs to the handle, not the tab: the replacement
+                        // never reports onExitFullscreen for a session it wasn't part of,
+                        // so a stale `true` would strand the tab on FullscreenPlaceholder
+                        // with an exit button that can't do anything.
+                        isInFullscreen = false
                         error = "Browser crashed. Recovering..."
 
                         // Restore URL after small delay (home needs no restore)
@@ -1274,6 +1323,7 @@ internal fun FluckBrowserTabContent(
                         browserHandle = null
                         disposeBrowserHandleOffThread(handle)
                         isInitializing = false
+                        isInFullscreen = false
                     }
                     break
                 }
@@ -1325,6 +1375,7 @@ internal fun FluckBrowserTabContent(
                     val handle = browserHandle
                     browserHandle = null
                     isInitializing = true
+                    isInFullscreen = false
                     // Off the UI thread so hibernating a background tab can't hitch
                     // the foreground UI.
                     if (handle != null) disposeBrowserHandleOffThread(handle)
@@ -1727,8 +1778,7 @@ internal fun FluckBrowserTabContent(
                 // the menu we are building.
                 val requestId = contextMenuRequest
                 val menuInfo = contextMenuInfo
-                if (requestId > 0 && requestId != hoistedState.shownContextMenuRequest && menuInfo != null) {
-                    hoistedState.shownContextMenuRequest = requestId
+                if (menuInfo != null && shouldOpenContextMenu(requestId, hoistedState.shownContextMenuRequest)) {
                     val mouseLocation = java.awt.MouseInfo.getPointerInfo()?.location
                     if (mouseLocation != null) {
                         // Load secrets if we have formFieldInfo and a provider
@@ -1798,16 +1848,22 @@ internal fun FluckBrowserTabContent(
                                 }
                             }
                         )
+                        // Mark the request consumed only now that it is actually being
+                        // honoured. Marking it earlier loses a menu outright when the
+                        // effect is cancelled mid-flight (a tab switch while the secrets
+                        // load suspends) — the replay guard would then suppress the very
+                        // request that never got shown.
+                        hoistedState.shownContextMenuRequest = requestId
                         SwingContextMenu.show(
                             screenX = mouseLocation.x,
                             screenY = mouseLocation.y,
                             items = menuItems,
                             onDismiss = {
-                                // Only clear the info this menu was built from. A newer
-                                // right-click may already have replaced it while this
-                                // popup was closing; nulling that out would drop the
-                                // menu that is on its way in.
-                                if (hoistedState.contextMenuRequest == requestId) {
+                                if (shouldClearContextMenuTarget(
+                                        dismissedRequest = requestId,
+                                        currentRequest = hoistedState.contextMenuRequest
+                                    )
+                                ) {
                                     hoistedState.contextMenuInfo = null
                                 }
                             }
@@ -2281,16 +2337,20 @@ internal fun buildContextMenuItems(
         // Copy URL - copies link URL if on a link, otherwise copies page URL
         val linkUrl = info?.linkUrl
         if (!linkUrl.isNullOrEmpty()) {
-            // Right-clicked on a link
-            add(ContextMenuItem(
-                text = "Open Link",
-                onClick = { onNavigate(linkUrl) }
-            ))
+            // Right-clicked on a link. Only the two entries that *act* on the href are
+            // scheme-gated (same rule as a middle click); copying it is inert, and
+            // refusing to copy a javascript: href would just be unhelpful.
+            if (isWebUrl(linkUrl)) {
+                add(ContextMenuItem(
+                    text = "Open Link",
+                    onClick = { onNavigate(linkUrl) }
+                ))
 
-            add(ContextMenuItem(
-                text = "Open Link in New Tab",
-                onClick = { onOpenInNewTab(linkUrl) }
-            ))
+                add(ContextMenuItem(
+                    text = "Open Link in New Tab",
+                    onClick = { onOpenInNewTab(linkUrl) }
+                ))
+            }
 
             add(ContextMenuItem(
                 text = "Copy Link URL",
@@ -2414,13 +2474,24 @@ object SwingContextMenu {
         // Swing creates for popups, including the menu we may be replacing.
         val clickPoint = java.awt.Point(screenX, screenY)
         val focusedWindow = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusedWindow
+        val candidates =
+            Window.getWindows()
+                .filter { it is java.awt.Frame || it is java.awt.Dialog }
+                .filter { it.isShowing && it.bounds.contains(clickPoint) }
         val targetWindow: Window? =
             focusedWindow?.takeIf { it.isShowing && it.bounds.contains(clickPoint) }
-                ?: Window.getWindows()
-                    .filter { it is java.awt.Frame || it is java.awt.Dialog }
-                    .filter { it.isShowing && it.bounds.contains(clickPoint) }
-                    .minByOrNull { it.bounds.width.toLong() * it.bounds.height }
-                ?: focusedWindow
+                // getWindows() is not in z-order, and smallest-area is only a proxy for
+                // topmost — it inverts when a fullscreen browser window covers a smaller
+                // main frame. A heavyweight popup is owned by its invoker, so choosing the
+                // window underneath would paint the menu behind the one on top. Prefer the
+                // active window, which is authoritative.
+                ?: candidates.firstOrNull { it.isActive }
+                ?: candidates.minByOrNull { it.bounds.width.toLong() * it.bounds.height }
+                // Deliberately not falling back to focusedWindow here: it is only reached
+                // when focus sits outside the click, and it bypasses the frame/dialog
+                // filter above — handing the invoker role to a heavyweight popup window is
+                // exactly what that filter exists to prevent. The screen-location branch
+                // below is the safer last resort.
 
         if (targetWindow != null) {
             // Convert screen coordinates to window-relative
