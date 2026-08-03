@@ -38,4 +38,6 @@ Or use the Plugin Manager within BOSS to install from the plugin repository.
 
 ## License
 
-Proprietary - Risa Labs Inc. All rights reserved.
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright 2025-2026 Risa Labs Inc.
