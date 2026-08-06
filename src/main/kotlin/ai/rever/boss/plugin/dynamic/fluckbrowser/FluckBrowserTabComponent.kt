@@ -1,5 +1,9 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.foundation.LocalContextMenuRepresentation
+import ai.rever.boss.plugin.ui.BossPopupAnchoring
+import ai.rever.boss.plugin.ui.BossPopup
 import ai.rever.boss.plugin.api.ActiveTabsProvider
 import ai.rever.boss.plugin.api.BookmarkDataProvider
 import ai.rever.boss.plugin.api.CreateSecretRequestData
@@ -1459,6 +1463,11 @@ internal fun FluckBrowserTabContent(
         }
 
     BossTheme {
+    // Route Compose's built-in text context menus (the URL bar's right-click Cut/Copy/Paste)
+    // through a JPopupMenu instead of a lightweight Compose popup, which was cropped at the
+    // browser's rendering area. Same mechanism the page's own context menu already uses, so the
+    // two now match - see SwingContextMenuRepresentation.
+    CompositionLocalProvider(LocalContextMenuRepresentation provides SwingContextMenuRepresentation) {
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
@@ -1958,14 +1967,33 @@ internal fun FluckBrowserTabContent(
         }
         } // End Column
 
-        // Floating URL autocomplete dropdown overlay (positioned below toolbar)
+        // Floating URL autocomplete dropdown overlay (positioned below toolbar).
+        //
+        // The outer Box is the ANCHOR and keeps the placement this always had; BossPopup measures it
+        // and, under HARDWARE_ACCELERATED, draws the list in an always-on-top window at that spot.
+        // Drawn in place the list was invisible the moment it extended over the page, because
+        // Chromium composites its own native window over the Compose scene - so the suggestions were
+        // painted behind the content they overlap.
+        //
+        // AnchorBounds, not Cursor: the user is typing, so the pointer may be anywhere on screen and
+        // the list must follow the URL bar instead. focusable = false for the same reason - the field
+        // has to keep focus for typing to keep filtering, and it owns the arrow keys and Escape.
         if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(0.5f)
+                    .align(Alignment.TopCenter)
+                    .offset(y = 38.dp),
+            ) {
+                BossPopup(
+                    onDismissRequest = { showUrlSuggestions = false },
+                    focusable = false,
+                    anchoring = BossPopupAnchoring.AnchorBounds,
+                ) {
             Card(
                 modifier = Modifier
-                    .fillMaxWidth(0.5f) // Half the width of the screen
-                    .wrapContentHeight()
-                    .align(Alignment.TopCenter)
-                    .offset(y = 38.dp), // Position below the navigation bar
+                    .fillMaxWidth()
+                    .wrapContentHeight(),
                 elevation = 8.dp,
                 backgroundColor = MaterialTheme.colors.surface
             ) {
@@ -2081,6 +2109,8 @@ internal fun FluckBrowserTabContent(
                     }
                 }
             }
+                }
+            }
         }
 
         // Co-browse approval banners (BossTerm-style): non-modal cards in the
@@ -2104,6 +2134,7 @@ internal fun FluckBrowserTabContent(
         }
     } // End Box
     } // End BossTheme
+    } // End context-menu representation
 }
 
 /**
