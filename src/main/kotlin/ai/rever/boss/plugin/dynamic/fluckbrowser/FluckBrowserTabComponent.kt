@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.foundation.LocalContextMenuRepresentation
 import ai.rever.boss.plugin.ui.BossPopupAnchoring
+import ai.rever.boss.plugin.ui.BossDialog
 import ai.rever.boss.plugin.ui.BossPopup
 import ai.rever.boss.plugin.api.ActiveTabsProvider
 import ai.rever.boss.plugin.api.BookmarkDataProvider
@@ -86,7 +87,6 @@ import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.rememberWindowState
 import androidx.compose.foundation.rememberScrollState
@@ -3497,7 +3497,7 @@ private fun SecretSelectionDialog(
     // Extract domain for highlighting matched secrets
     val currentDomain = remember(currentUrl) { extractMainDomain(currentUrl) }
 
-    Dialog(onDismissRequest = onDismiss) {
+    BossDialog(onDismissRequest = onDismiss) {
         Card(
             modifier = Modifier
                 .width(700.dp)
@@ -3867,7 +3867,7 @@ private fun QuickCreateSecretDialog(
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    Dialog(onDismissRequest = onDismiss) {
+    BossDialog(onDismissRequest = onDismiss) {
         Surface(
             modifier = Modifier.width(380.dp),
             color = BossThemeColors.SurfaceColor,
