@@ -1441,23 +1441,31 @@ internal class FluckBrowserTabState {
     }
 
     /**
-     * Idempotent, with one exception: a duplicate host enter must not drop a fallback armed for
-     * the live session, but it must not leave a genuinely re-entered session wearing
-     * [FullscreenExitPhase.FAILED] either.
+     * A host enter always means "there is a live fullscreen session now", including when one was
+     * already believed to be running.
      *
-     * That case is reachable through the failure this whole design calls the likelier one. The
-     * host exits cleanly, the callback is dropped, two windows elapse and the phase lands on
-     * FAILED with `isInFullscreen` still set. The user then re-enters fullscreen from the page.
-     * Without the reset the placeholder keeps saying "Couldn't exit fullscreen" over a live
-     * session, and worse, [fullscreenBlocksHibernation] stays false - so backgrounding that tab
-     * hibernates it mid-video, which is the exact thing [TabHibernation.BusyState.FULLSCREEN]
-     * was added to prevent, reached through the FAILED escape hatch.
+     * When `isInFullscreen` is already set, the callback is either a duplicate the host emitted
+     * or a genuine re-entry inside a pending exit's window, and nothing here can tell them apart.
+     * The costs are not symmetric, which is what decides it:
      *
-     * A fresh enter is positive evidence that the host is talking to us, unlike the *absence* of
-     * an exit callback that produced FAILED in the first place, so treating it as "this session
-     * is live again" is the sound reading. It does mean a host that spuriously re-emits enters
-     * keeps the tab exempt from hibernation - but losing the exemption on a healthy session is
-     * the worse side of that trade.
+     *  - Treating a genuine re-entry as a duplicate leaves the old exit's fallback armed against
+     *    a session that is no longer the one it was armed for. It fires, posts an exit, and
+     *    ejects the user from fullscreen they just started - then either restores the tab under
+     *    them or spends another window landing on [FullscreenExitPhase.FAILED]. Reachable through
+     *    exactly the failure this design calls the likelier one: the host exits, the callback is
+     *    dropped, and the user re-enters inside the two-second window.
+     *  - Treating a duplicate as a re-entry cancels a legitimate pending exit. The phase returns
+     *    to IDLE, so the placeholder stops swallowing clicks, and the user clicks once more.
+     *
+     * So a repeat resets rather than early-returning. The epoch bump matters as much as the
+     * cancel: it is what stops a fallback already past its delay from acting on the old session.
+     *
+     * The same reasoning covers [FullscreenExitPhase.FAILED], where leaving the phase set would
+     * also keep [fullscreenBlocksHibernation] false and let a backgrounded tab hibernate
+     * mid-video - the exact thing [TabHibernation.BusyState.FULLSCREEN] was added to prevent,
+     * reached through the FAILED escape hatch. A fresh enter is positive evidence the host is
+     * talking to us, unlike the *absence* of an exit callback that produced FAILED in the first
+     * place.
      */
     fun markFullscreenEntered(seq: Long = nextFullscreenCallbackSeq()) {
         if (!acceptFullscreenCallback(seq)) return
@@ -1467,14 +1475,8 @@ internal class FluckBrowserTabState {
         // with no handle is unexitable: the placeholder's click finds nothing to ask, clears
         // itself, and the content `when` falls through every branch to render nothing at all.
         if (browserHandle == null) return
-        if (isInFullscreen) {
-            // EXITING is left alone: its fallback is armed for a request still in flight, and
-            // clearing the phase here would strand it.
-            if (fullscreenExitPhase == FullscreenExitPhase.FAILED) {
-                println("[FluckBrowser] Fullscreen re-entered after a failed exit; treating the session as live")
-                fullscreenExitPhase = FullscreenExitPhase.IDLE
-            }
-            return
+        if (isInFullscreen && fullscreenExitPhase != FullscreenExitPhase.IDLE) {
+            println("[FluckBrowser] Fullscreen re-entered during a pending exit; treating the session as live")
         }
         cancelFullscreenExitFallback()
         fullscreenEpoch++

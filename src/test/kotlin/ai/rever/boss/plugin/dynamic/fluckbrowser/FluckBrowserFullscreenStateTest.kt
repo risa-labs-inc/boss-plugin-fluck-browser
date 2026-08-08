@@ -272,19 +272,6 @@ class FluckBrowserFullscreenStateTest {
     }
 
     @Test
-    fun `a duplicate enter mid-exit still does not clear the pending phase`() = runTest {
-        val state = FluckBrowserTabState()
-        state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
-        assertTrue(state.requestExitFullscreen(this))
-
-        state.markFullscreenEntered()
-
-        // EXITING has a fallback armed for a request in flight; only FAILED is reset.
-        assertEquals(FullscreenExitPhase.EXITING, state.fullscreenExitPhase)
-    }
-
-    @Test
     fun `a failed exit stops blocking hibernation`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
@@ -584,19 +571,42 @@ class FluckBrowserFullscreenStateTest {
     }
 
     @Test
-    fun `a duplicate host enter does not strand a pending exit`() = runTest {
+    fun `a re-enter during a pending exit is not ejected by the stale fallback`() = runTest {
+        val state = FluckBrowserTabState()
+        var exitRequests = 0
+        state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
+        state.markFullscreenEntered()
+        assertTrue(state.requestExitFullscreen(this))
+        assertEquals(1, exitRequests)
+
+        // The host did exit, the callback was dropped, and the user re-entered fullscreen from
+        // the page inside the window - the likelier failure, met by a live new session.
+        state.markFullscreenEntered()
+        advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
+        runCurrent()
+
+        // The old session's fallback must not post an exit against the new one and throw the
+        // user out of fullscreen they just started.
+        assertEquals(1, exitRequests)
+        assertTrue(state.isInFullscreen)
+        assertEquals(FullscreenExitPhase.IDLE, state.fullscreenExitPhase)
+    }
+
+    @Test
+    fun `a duplicate enter leaves the placeholder clickable rather than stranded`() = runTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
         state.markFullscreenEntered()
         assertTrue(state.requestExitFullscreen(this))
 
-        // Spurious repeat of a callback the host already delivered.
+        // The other reading of the same callback: a spurious repeat. It cancels a legitimate
+        // pending exit, which is the cheap side of the trade - the phase returns to IDLE, so the
+        // debounce stops swallowing clicks and one more click re-requests.
         state.markFullscreenEntered()
-        advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS + 1)
-        runCurrent()
 
-        // The fallback armed for the live session is still the one running.
+        assertEquals(FullscreenExitPhase.IDLE, state.fullscreenExitPhase)
+        assertTrue(state.requestExitFullscreen(this))
         assertEquals(2, exitRequests)
     }
 }
