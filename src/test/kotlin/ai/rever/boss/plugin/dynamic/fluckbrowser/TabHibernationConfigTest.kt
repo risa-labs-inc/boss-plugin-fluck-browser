@@ -174,7 +174,6 @@ class TabHibernationConfigTest {
 
     private val IDLE = TabHibernation.BusyState.IDLE
     private val MEDIA = TabHibernation.BusyState.PLAYING_MEDIA
-    private val INPUT = TabHibernation.BusyState.UNSAVED_INPUT
 
     @Test
     fun `an idle tab hibernates immediately`() = runBlocking {
@@ -194,48 +193,6 @@ class TabHibernationConfigTest {
             )
         assertTrue(hibernate, "a tab that went quiet should hibernate")
         assertEquals(3, waits.size)
-    }
-
-    /**
-     * The regression this split exists for. Unsaved typing may never resolve - an SPA search box
-     * or a half-written comment stays dirty for the life of the page - so polling it is not
-     * deferral, it is a permanent wake-up loop attached to a tab that will never hibernate. At 40
-     * tabs that was a JS eval into a background renderer roughly every second, forever: worse than
-     * not deferring at all, for both memory and battery.
-     */
-    @Test
-    fun `unsaved input never hibernates the tab`() = runBlocking {
-        val hibernate =
-            TabHibernation.awaitQuiet(probe = { INPUT }, onWait = { }, maxRechecks = 3)
-        assertFalse(hibernate, "a tab with unsaved input must not hibernate")
-    }
-
-    /**
-     * Re-checked on a long cadence rather than the media one. "Never re-check" was the first
-     * correction and it overshot: a submitted form or a navigation resolves, and none of it would
-     * ever have been noticed, leaving the tab live for the whole session.
-     */
-    @Test
-    fun `unsaved input is re-checked slowly, not polled and not abandoned`() = runBlocking {
-        val waits = mutableListOf<Long>()
-        TabHibernation.awaitQuiet(probe = { INPUT }, onWait = { waits.add(it) }, maxRechecks = 3)
-        assertTrue(waits.isNotEmpty(), "the condition must be revisited at least once")
-        assertTrue(
-            waits.all { it == TabHibernation.UNSAVED_RECHECK_MS },
-            "expected the slow cadence, got $waits",
-        )
-        assertTrue(
-            TabHibernation.UNSAVED_RECHECK_MS > TabHibernation.MAX_RECHECK_MS,
-            "unsaved input must be checked less often than media",
-        )
-    }
-
-    @Test
-    fun `input that gets saved lets the tab hibernate`() = runBlocking {
-        var probes = 0
-        val hibernate =
-            TabHibernation.awaitQuiet(probe = { if (probes++ < 2) INPUT else IDLE }, onWait = { })
-        assertTrue(hibernate, "a resolved form should stop exempting the tab")
     }
 
     /** Rechecks must back off, or a three-hour video costs an eval every 30s for three hours. */
@@ -281,14 +238,34 @@ class TabHibernationConfigTest {
             var slept = 0L
             var asked = 0
             TabHibernation.awaitIdleWindow(
-                // 10 minutes at first; after two chunks, pressure arrives and it drops to one.
+                // 10 minutes, until pressure arrives partway through and drops it to one.
                 idleMsNow = { asked++; if (slept >= 60_000L) 60_000L else 600_000L },
                 sleep = { slept += it },
                 chunkMs = 30_000L,
             )
-            assertEquals(60_000L, slept, "should have stopped at the shortened target")
-            assertTrue(asked > 1, "target was only sampled once")
+            assertTrue(asked > 1, "target was only sampled once - pressure could never be seen")
+            assertTrue(slept < 600_000L, "waited out the original target despite the shortening")
         }
+
+    /**
+     * Coarse while the deadline is far off, fine as it approaches. A flat chunk woke every
+     * backgrounded tab every 30s for its whole window - at 40 tabs on the Full tier, over one
+     * wakeup a second sustained for half an hour, which is the same cost this PR rejected
+     * elsewhere. Resolution only buys anything near the deadline.
+     */
+    @Test
+    fun `sleeps are coarse early and fine near the deadline`() = runBlocking {
+        val chunks = mutableListOf<Long>()
+        TabHibernation.awaitIdleWindow(
+            idleMsNow = { 30 * 60_000L },
+            sleep = { chunks.add(it) },
+            chunkMs = 30_000L,
+        )
+        assertEquals(30 * 60_000L, chunks.sum(), "must still wait the full target")
+        assertTrue(chunks.first() > 30_000L, "first sleep was not coarse: ${chunks.first()}")
+        assertTrue(chunks.last() <= 30_000L, "last sleep was not fine: ${chunks.last()}")
+        assertTrue(chunks.size < 60, "still one wake per floor interval: ${chunks.size}")
+    }
 
     @Test
     fun `a steady target is slept out in chunks`() = runBlocking {
@@ -454,10 +431,11 @@ class TabHibernationConfigTest {
     @Test
     fun `the script result maps to a state, tolerating how it is marshalled`() {
         assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("media"))
-        assertEquals(INPUT, TabHibernation.busyStateFromScriptResult("input"))
         // Quoted, padded and differently-cased forms all still resolve.
         assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("\"media\""))
-        assertEquals(INPUT, TabHibernation.busyStateFromScriptResult("  input  "))
+        assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("  media  "))
+        // "input" was a state until the predicate behind it was cut; it must not linger.
+        assertEquals(IDLE, TabHibernation.busyStateFromScriptResult("input"))
         assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("MEDIA"))
     }
 

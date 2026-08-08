@@ -93,10 +93,13 @@ internal object HibernationMemory {
     private fun measureFraction(): Double? =
         when {
             osName.startsWith("linux") -> {
+                // Both fields or neither. Falling back to the JDK total when MemTotal is absent
+                // would divide a /proc numerator by a cgroup-constrained denominator - exactly the
+                // source-mixing this branch exists to avoid.
                 val meminfo = readMeminfo()
                 fraction(
                     available = meminfo?.let { parseMemAvailableKb(it) }?.times(1024L),
-                    total = meminfo?.let { parseMemTotalKb(it) }?.times(1024L) ?: totalBytes(),
+                    total = meminfo?.let { parseMemTotalKb(it) }?.times(1024L) ?: return null,
                 )
             }
 

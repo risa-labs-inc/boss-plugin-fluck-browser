@@ -691,7 +691,20 @@ internal object TabHibernation {
      * cost of being wrong is a reload on return, not lost work - the tab, its URL, its title and
      * its history all survive.
      */
-    val enabled: Boolean = resolveEnabled(System.getenv("BOSS_TAB_HIBERNATION"))
+    /** The host system property by which a tier or preference can switch hibernation off. */
+    internal const val HOST_ENABLED_PROPERTY = "boss.browser.hibernationEnabled"
+
+    /**
+     * Whether hibernation runs at all, read per call like [currentIdleMs].
+     *
+     * Environment first, then the host. The PR argues that an environment variable nobody knows
+     * about is not a real control surface; with the default flipped, that argument applies to the
+     * *off* switch, and the host had no way to say "not on this machine" without an api release.
+     */
+    fun currentlyEnabled(
+        fromEnvironment: String? = System.getenv("BOSS_TAB_HIBERNATION"),
+        fromHost: String? = System.getProperty(HOST_ENABLED_PROPERTY),
+    ): Boolean = resolveEnabled(fromEnvironment ?: fromHost)
 
     /**
      * How long a backgrounded tab waits before hibernating.
@@ -781,7 +794,6 @@ internal object TabHibernation {
             onBattery = System.getProperty("boss.power.onBattery") == "true",
         )
 
-
     /**
      * Why a tab should not hibernate right now, if it should not.
      *
@@ -794,40 +806,35 @@ internal object TabHibernation {
 
         /** Audible playback. Transient by nature: wait, and it will stop. */
         PLAYING_MEDIA,
-
-        /** Unsaved typing. May never resolve on its own, so waiting for it is not a strategy. */
-        UNSAVED_INPUT,
     }
 
     /**
-     * What, if anything, hibernating this tab right now would destroy.
+     * Whether hibernating this tab right now would cut audible playback.
      *
-     * Both cases are things a reload does **not** restore: audible media (cut mid-play) and typed
-     * input (discarded). The probe runs in JavaScript because `BrowserHandle` exposes neither
-     * audio nor form state; JxBrowser's `browser.audio()` is not surfaced through plugin-api, and
-     * adding it means an api release, then a host release, then this.
+     * **Media only, deliberately.** This also tried to detect unsaved typing, and three successive
+     * attempts were each wrong in a new way: matching any changed input exempted every SPA with a
+     * populated search box; adding a visibility check left autofilled credentials exempting a tab
+     * for ~20 hours, because `defaultValue` reflects the `value=""` attribute that login forms do
+     * not set, so an autofilled password is indistinguishable from a typed one. Meanwhile the case
+     * that actually loses work - `contenteditable` drafts in Gmail, Slack, Notion - was never
+     * covered by any of them, because the DOM does not answer "has a human typed here" by
+     * enumeration.
      *
-     * **The input predicate is deliberately narrow**, and an earlier, wider version is why this
-     * returns a state instead of a boolean. It matched any `input` whose value differed from its
-     * default, plus any page with `window.onbeforeunload` set. Both are permanent for the life of
-     * the page rather than transient - every SPA with a populated search box, every page with an
-     * analytics unload handler - so a large share of tabs would never have hibernated *and* would
-     * have woken their renderer every 30 seconds forever to be told so again. Worse than the
-     * opt-in status quo for both memory and battery.
+     * A page-load `input` listener setting a dirty flag would answer it properly, and is the right
+     * follow-up; it needs an injection point at navigation, and getting that wrong fails toward
+     * losing the work it is meant to protect. Not something to land at the end of a review series.
      *
-     * So: `textarea` content only, plus password fields, plus single-line inputs carrying a
-     * non-trivial amount of text and living inside a real `<form>`. Search boxes, empty fields and
-     * `onbeforeunload` no longer count.
+     * So the shipped guarantee is narrow and true: **hibernation never cuts audio**, and a
+     * backgrounded tab may be reloaded, which discards unsaved input the same way Chrome's own
+     * memory saver does. That is documented in the README next to the opt-out.
      *
-     * Every field must also be **rendered** and differ from its default. Without those two the
-     * password clause walked straight back into the same failure: a manager-autofilled password is
-     * non-empty without anyone typing, and a `display:none` login form left in the DOM of an
-     * authenticated SPA qualifies just as well - which under a permanent exemption meant the tab
-     * kept its whole Chromium process tree for the session.
+     * Done in JavaScript because `BrowserHandle` exposes no audio state; JxBrowser's
+     * `browser.audio()` is not surfaced through plugin-api, and adding it means an api release,
+     * then a host release, then this.
      *
      * **Known gaps**, all toward hibernating when perhaps it should not: only the top document is
-     * visible, so cross-origin iframes are missed; pure Web Audio playback has no media element to
-     * find; `contenteditable` regions and framework state held outside form elements are unseen.
+     * visible, so cross-origin iframes are missed, and pure Web Audio playback has no media
+     * element to find.
      *
      * Failure reads as [BusyState.IDLE], so a page that cannot run this still hibernates. The
      * opposite would let one broken evaluation exempt a tab for the rest of the session.
@@ -845,7 +852,11 @@ internal object TabHibernation {
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
+            // Throwable, not Exception: a plugin-classloader NoClassDefFoundError out of
+            // executeJavaScript would otherwise escape and kill the job silently, which is the
+            // failure mode this file is written against. effectiveIdleMs uses runCatching, which
+            // is already Throwable-wide.
             BusyState.IDLE
         }
 
@@ -859,13 +870,6 @@ internal object TabHibernation {
      *    JS eval every 30 seconds for three hours, and gives up after [MAX_RECHECKS] - at which
      *    point the tab is **left alone**, not hibernated. Cutting audio is the thing being
      *    avoided; a bound on polling must not become a licence to do it anyway.
-     *  - [BusyState.UNSAVED_INPUT] may never resolve, so it is re-checked on a much longer
-     *    [UNSAVED_RECHECK_MS] cadence rather than the media one. "Never wait" was the first
-     *    correction and it overshot: a form gets submitted, a page navigates away, an SPA clears
-     *    its draft - all resolve, and none would ever have been noticed, leaving the tab live for
-     *    the session. One eval per tab per half hour is nothing like the 30-second loop that made
-     *    the original version worse than no deferral at all.
-     *
      * Pure but for the two callbacks, so the policy is testable without a browser.
      */
     suspend fun awaitQuiet(
@@ -873,26 +877,16 @@ internal object TabHibernation {
         onWait: suspend (Long) -> Unit,
         maxRechecks: Int = MAX_RECHECKS,
     ): Boolean {
-        var mediaInterval = MEDIA_RECHECK_MS
+        var interval = MEDIA_RECHECK_MS
         repeat(maxRechecks + 1) { attempt ->
-            val interval =
-                when (probe()) {
-                    BusyState.IDLE -> return true
-
-                    BusyState.UNSAVED_INPUT -> UNSAVED_RECHECK_MS
-
-                    BusyState.PLAYING_MEDIA -> {
-                        mediaInterval.also {
-                            mediaInterval = (mediaInterval * 2).coerceAtMost(MAX_RECHECK_MS)
-                        }
-                    }
-                }
+            if (probe() == BusyState.IDLE) return true
             // Checked before sleeping, not after. Sleeping on the final attempt parked a live
             // coroutine for up to MAX_RECHECK_MS on a result already decided.
             if (attempt == maxRechecks) return false
             onWait(interval)
+            interval = (interval * 2).coerceAtMost(MAX_RECHECK_MS)
         }
-        // Still busy after the last recheck. Leave it be rather than cut audio or drop typing.
+        // Still playing after the last recheck. Leave it be rather than cut the audio.
         return false
     }
 
@@ -910,7 +904,6 @@ internal object TabHibernation {
     internal fun busyStateFromScriptResult(result: Any?): BusyState =
         when (result?.toString()?.trim()?.trim('"')?.lowercase()) {
             "media" -> BusyState.PLAYING_MEDIA
-            "input" -> BusyState.UNSAVED_INPUT
             else -> BusyState.IDLE
         }
 
@@ -921,44 +914,21 @@ internal object TabHibernation {
 
     internal const val MAX_RECHECK_MS = 5 * 60_000L
 
-    /** After this many rechecks a still-busy tab is left alone rather than polled forever. */
-    internal const val MAX_RECHECKS = 40
-
     /**
-     * Gap between re-checks of a tab holding unsaved typing.
+     * After this many rechecks a still-audible tab is left alone rather than polled forever.
      *
-     * Deliberately far longer than the media cadence: this condition may never resolve, so the
-     * cost of checking has to be negligible per tab. Half an hour is one eval per tab per half
-     * hour even across a large session.
+     * With the backoff below that is roughly 3 hours of wall clock. A tab still playing then keeps
+     * its process tree until the user visits it again, which is the deliberate trade: a bound on
+     * polling must not become a licence to cut the audio.
      */
-    internal const val UNSAVED_RECHECK_MS = 30 * 60_000L
-
-    /** Minimum typed characters before a single-line field counts as unsaved work. */
-    private const val MIN_MEANINGFUL_INPUT = 12
+    internal const val MAX_RECHECKS = 40
 
     private const val BUSY_SCRIPT =
         "(function(){try{" +
-            "var q=function(s){return Array.prototype.slice.call(document.querySelectorAll(s));};" +
-            "if(q('video,audio').some(function(m){" +
+            "return Array.prototype.slice.call(document.querySelectorAll('video,audio'))" +
+            ".some(function(m){" +
             "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
-            "})) return 'media';" +
-            "var shown=function(f){" +
-            "return !(f.offsetParent === null && f.getClientRects().length === 0);};" +
-            "var dirty=q('textarea').some(function(f){" +
-            "return !f.disabled && !f.readOnly && shown(f) && (f.value||'').trim().length > 0 " +
-            "&& (f.value||'') !== (f.defaultValue||'');" +
-            "});" +
-            "if(!dirty) dirty=q('input').some(function(f){" +
-            "if(f.disabled || f.readOnly || !shown(f)) return false;" +
-            "var t=(f.type||'text').toLowerCase();" +
-            "if(t==='password') return (f.value||'') !== (f.defaultValue||'') " +
-            "&& (f.value||'').length > 0;" +
-            "if(t!=='text' && t!=='email' && t!=='tel' && t!=='url' && t!=='number') return false;" +
-            "if(!f.form) return false;" +
-            "return (f.value||'') !== (f.defaultValue||'') " +
-            "&& (f.value||'').trim().length >= " + MIN_MEANINGFUL_INPUT + ";" +
-            "});" +
-            "return dirty ? 'input' : '';" +
+            "}) ? 'media' : '';" +
             "}catch(e){return '';}})()"
 
     /**
@@ -986,17 +956,25 @@ internal object TabHibernation {
         while (true) {
             val target = idleMsNow()
             if (waited >= target) return
-            val chunk = minOf(chunkMs, target - waited)
+            val remaining = target - waited
+            // Coarse early, fine near the deadline. A flat chunk woke every backgrounded tab every
+            // 30s for its whole window - at 40 tabs on the Full tier, ~1.3 wakeups a second
+            // sustained for half an hour, which is the same argument used against the 30s busy
+            // loop and works against the battery accelerant a few lines above. Resolution only
+            // matters as the deadline approaches.
+            val chunk = minOf(remaining, maxOf(chunkMs, remaining / 4))
             sleep(chunk)
             waited += chunk
         }
     }
 
     /**
-     * How often the idle target is re-evaluated while a tab waits.
+     * Floor on how often the idle target is re-evaluated while a tab waits.
      *
-     * Matched to `HibernationMemory`'s cache TTL: re-asking more often than the reading can change
-     * would just be arithmetic.
+     * A floor, not a fixed cadence - [awaitIdleWindow] sleeps in coarser steps while the deadline
+     * is far off. Deliberately shorter than `HibernationMemory.CACHE_TTL_MS` rather than equal to
+     * it: equal meant the cached reading was always just-expired on the next wake, so the cache
+     * could never hit.
      */
     internal const val PRESSURE_RECHECK_CHUNK_MS = 30_000L
 
@@ -1702,24 +1680,18 @@ internal fun FluckBrowserTabContent(
         hoistedState.hibernationJob?.cancel()
         hoistedState.hibernationJob = null
         onDispose {
-            if (TabHibernation.enabled && browserHandle != null) {
+            if (TabHibernation.currentlyEnabled() && browserHandle != null) {
                 hoistedState.hibernationJob = coroutineScope.launch {
-                    // effectiveIdleMs() off the UI thread. coroutineScope is Dispatchers.Main, so
-                    // this argument is evaluated on the EDT before delay ever suspends - and on
-                    // macOS it forks /usr/bin/vm_stat and waits up to 5s for it. That was a
-                    // fork/exec, and a worst-case five-second frozen UI, at the exact moment the
-                    // user is switching tabs. It used to be an MXBean field read, which is why the
-                    // call site did not look dangerous.
                     // Re-evaluated in chunks rather than slept once: pressure usually develops
                     // after a tab backgrounds, and a single up-front sample cannot see it. Each
                     // read is off the UI thread - coroutineScope is Dispatchers.Main, and on macOS
-                    // this forks vm_stat and waits up to 5s for it.
+                    // this forks vm_stat and waits up to 5s for it, which on the EDT is a
+                    // five-second frozen UI at the moment the user is switching tabs.
                     TabHibernation.awaitIdleWindow(
                         idleMsNow = { withContext(Dispatchers.IO) { TabHibernation.effectiveIdleMs() } },
                         sleep = { delay(it) },
                     )
-                    // Audible tabs are waited out; tabs with unsaved typing are left alone
-                    // entirely, since that condition may never resolve.
+                    // Audible tabs are waited out rather than cut off mid-play.
                     val mayHibernate =
                         TabHibernation.awaitQuiet(
                             probe = {
@@ -1732,7 +1704,7 @@ internal fun FluckBrowserTabContent(
                         // Logged because this whole feature is an argument against silent
                         // outcomes, and "my 40 tabs never released memory" is otherwise
                         // indistinguishable in the field from "hibernation is broken".
-                        println("[FluckBrowser] Hibernation skipped: tab still busy")
+                        println("[FluckBrowser] Hibernation skipped: tab still playing audio")
                         return@launch
                     }
                     println("[FluckBrowser] Hibernating idle tab to release its renderer")
