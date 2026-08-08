@@ -243,11 +243,27 @@ class TabHibernationConfigTest {
                 maxRechecks = 4,
             )
         assertEquals(IDLE, hibernate, "the budget should have restarted at the switch")
-        assertEquals(
-            TabHibernation.MEDIA_RECHECK_MS,
-            waits[4],
-            "the first wait after the reason changed should be back at the floor: $waits",
+    }
+
+    /**
+     * The budget resets on a changed reason; the interval must not. Resetting both pins an
+     * alternating tab at the floor for the whole total ceiling - more probing than no reset at
+     * all, and the opposite of what the backoff is for.
+     */
+    @Test
+    fun `a changed reason does not restart the backoff`() = runBlocking {
+        var probes = 0
+        val waits = mutableListOf<Long>()
+        TabHibernation.awaitQuiet(
+            probe = { if (probes++ % 2 == 0) FULLSCREEN else MEDIA },
+            onWait = { waits.add(it) },
+            maxRechecks = 4,
         )
+        assertTrue(waits.size >= 4, "expected several waits, got $waits")
+        for (i in 1 until waits.size) {
+            assertTrue(waits[i] >= waits[i - 1], "interval reset at $i despite alternating: $waits")
+        }
+        assertTrue(waits.last() > TabHibernation.MEDIA_RECHECK_MS, "never climbed off the floor: $waits")
     }
 
     /** Rechecks must back off, or a three-hour video costs an eval every 30s for three hours. */
@@ -280,13 +296,13 @@ class TabHibernationConfigTest {
                 arrayOf(BrowserHandle::class.java),
             ) { _, method, _ -> error("busyStateFor probed the page: ${method.name}") }
                 as BrowserHandle
-        assertEquals(FULLSCREEN, TabHibernation.busyStateFor(isInFullscreen = true, handle = exploding))
+        assertEquals(FULLSCREEN, TabHibernation.busyStateFor(fullscreenBlocks = true, handle = exploding))
         assertEquals(
             FULLSCREEN,
-            TabHibernation.busyStateFor(isInFullscreen = true, handle = null),
+            TabHibernation.busyStateFor(fullscreenBlocks = true, handle = null),
             "a null handle must not stop fullscreen being reported",
         )
-        assertEquals(IDLE, TabHibernation.busyStateFor(isInFullscreen = false, handle = null))
+        assertEquals(IDLE, TabHibernation.busyStateFor(fullscreenBlocks = false, handle = null))
     }
 
     /**

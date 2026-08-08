@@ -225,6 +225,62 @@ class FluckBrowserFullscreenStateTest {
     }
 
     @Test
+    fun `a failed exit stops blocking hibernation`() = runTest {
+        val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
+        state.markFullscreenEntered()
+        assertTrue(state.fullscreenBlocksHibernation, "live fullscreen must defer hibernation")
+
+        assertTrue(state.requestExitFullscreen(this))
+        advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
+        runCurrent()
+        assertEquals(FullscreenExitPhase.FAILED, state.fullscreenExitPhase)
+
+        // Still isInFullscreen, so the placeholder stays - but the "user is watching"
+        // presumption is exactly what just failed twice, and leaving it set would exempt this
+        // tab from hibernation for the rest of its life.
+        assertTrue(state.isInFullscreen)
+        assertFalse(state.fullscreenBlocksHibernation)
+    }
+
+    @Test
+    fun `re-adopting the installed handle is a no-op, not a disposal`() = runTest {
+        val state = FluckBrowserTabState()
+        val disposed = CountDownLatch(1)
+        val handle = fakeHandle(disposals = { disposed.countDown() })
+        state.adoptBrowserHandle(handle)
+
+        state.adoptBrowserHandle(handle)
+
+        assertSame(handle, state.browserHandle)
+        // A bounded negative wait, not an immediate read: disposal is posted to
+        // browserDisposeExecutor, so reading a counter here would race the executor and pass
+        // whether or not the guard exists.
+        assertFalse(
+            disposed.await(1, TimeUnit.SECONDS),
+            "re-adopting disposed the handle it then stored",
+        )
+    }
+
+    @Test
+    fun `restoring anyway makes one last exit request`() = runTest {
+        val state = FluckBrowserTabState()
+        var exitRequests = 0
+        state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
+        state.markFullscreenEntered()
+        assertTrue(state.requestExitFullscreen(this))
+        advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
+        runCurrent()
+        assertEquals(2, exitRequests)
+
+        state.restoreTabFromFailedExit()
+
+        // A merely slow host can still detach on this one before the tab recomposes.
+        assertEquals(3, exitRequests)
+        assertFalse(state.isInFullscreen)
+    }
+
+    @Test
     fun `a handle swap clears a failed exit phase`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
