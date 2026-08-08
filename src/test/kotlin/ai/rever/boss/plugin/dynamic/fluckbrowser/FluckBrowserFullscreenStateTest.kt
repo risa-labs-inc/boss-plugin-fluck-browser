@@ -225,6 +225,38 @@ class FluckBrowserFullscreenStateTest {
     }
 
     @Test
+    fun `a host enter after a failed exit is a live session again`() = runTest {
+        val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
+        state.markFullscreenEntered()
+        assertTrue(state.requestExitFullscreen(this))
+        advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
+        runCurrent()
+        assertEquals(FullscreenExitPhase.FAILED, state.fullscreenExitPhase)
+
+        // The host exited cleanly and lost the callback - the likelier of the two FAILED
+        // causes - so isInFullscreen is still set when the user re-enters from the page.
+        state.markFullscreenEntered()
+
+        assertEquals(FullscreenExitPhase.IDLE, state.fullscreenExitPhase)
+        // The part that actually bites: without this the tab hibernates mid-video.
+        assertTrue(state.fullscreenBlocksHibernation)
+    }
+
+    @Test
+    fun `a duplicate enter mid-exit still does not clear the pending phase`() = runTest {
+        val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
+        state.markFullscreenEntered()
+        assertTrue(state.requestExitFullscreen(this))
+
+        state.markFullscreenEntered()
+
+        // EXITING has a fallback armed for a request in flight; only FAILED is reset.
+        assertEquals(FullscreenExitPhase.EXITING, state.fullscreenExitPhase)
+    }
+
+    @Test
     fun `a failed exit stops blocking hibernation`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())

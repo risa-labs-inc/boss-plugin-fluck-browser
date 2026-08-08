@@ -928,12 +928,6 @@ internal object TabHibernation {
             // interval climb past its first doubling: polling pinned at the 30s floor forever.
             if (total >= maxRechecks * 2) return busy
             total++
-            // A changed reason starts a fresh wait rather than inheriting the old one's
-            // position. The backoff and the budget both exist to bound the cost of probing an
-            // audible page; carrying a five-minute interval and a spent budget over from a
-            // finished fullscreen session would charge audio for a wait it never asked for -
-            // and worse, could hand a newly audible tab an already-exhausted budget, which
-            // reads as "left alone" and exempts it from hibernation for no reason.
             // The budget resets, the interval does not. Handing a newly audible tab a spent
             // budget would exempt it for no reason, so the count has to restart - but restarting
             // the interval as well pins an alternating tab at the 30s floor for the entire total
@@ -1412,7 +1406,25 @@ internal class FluckBrowserTabState {
             }
     }
 
-    /** Idempotent: a duplicate host enter must not drop a fallback armed for the live session. */
+    /**
+     * Idempotent, with one exception: a duplicate host enter must not drop a fallback armed for
+     * the live session, but it must not leave a genuinely re-entered session wearing
+     * [FullscreenExitPhase.FAILED] either.
+     *
+     * That case is reachable through the failure this whole design calls the likelier one. The
+     * host exits cleanly, the callback is dropped, two windows elapse and the phase lands on
+     * FAILED with `isInFullscreen` still set. The user then re-enters fullscreen from the page.
+     * Without the reset the placeholder keeps saying "Couldn't exit fullscreen" over a live
+     * session, and worse, [fullscreenBlocksHibernation] stays false - so backgrounding that tab
+     * hibernates it mid-video, which is the exact thing [TabHibernation.BusyState.FULLSCREEN]
+     * was added to prevent, reached through the FAILED escape hatch.
+     *
+     * A fresh enter is positive evidence that the host is talking to us, unlike the *absence* of
+     * an exit callback that produced FAILED in the first place, so treating it as "this session
+     * is live again" is the sound reading. It does mean a host that spuriously re-emits enters
+     * keeps the tab exempt from hibernation - but losing the exemption on a healthy session is
+     * the worse side of that trade.
+     */
     fun markFullscreenEntered() {
         // The invariant has to hold in both directions, not just on release. These callbacks are
         // marshalled asynchronously onto the Component scope, so a late or duplicate host enter
@@ -1420,7 +1432,15 @@ internal class FluckBrowserTabState {
         // with no handle is unexitable: the placeholder's click finds nothing to ask, clears
         // itself, and the content `when` falls through every branch to render nothing at all.
         if (browserHandle == null) return
-        if (isInFullscreen) return
+        if (isInFullscreen) {
+            // EXITING is left alone: its fallback is armed for a request still in flight, and
+            // clearing the phase here would strand it.
+            if (fullscreenExitPhase == FullscreenExitPhase.FAILED) {
+                println("[FluckBrowser] Fullscreen re-entered after a failed exit; treating the session as live")
+                fullscreenExitPhase = FullscreenExitPhase.IDLE
+            }
+            return
+        }
         cancelFullscreenExitFallback()
         fullscreenEpoch++
         fullscreenExitPhase = FullscreenExitPhase.IDLE

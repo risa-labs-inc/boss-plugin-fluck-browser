@@ -226,12 +226,12 @@ class TabHibernationConfigTest {
     }
 
     /**
-     * The backoff and the budget are both there to bound the cost of probing an *audible* page.
-     * Carrying either across a change of reason charges the new reason for the old one's waits -
-     * and can hand a newly audible tab an already-spent budget, exempting it for no reason.
+     * The *budget* is what must restart across a change of reason: carrying a spent one over
+     * hands a newly audible tab an already-exhausted allowance and exempts it for no reason.
+     * The interval deliberately does not - see the test below.
      */
     @Test
-    fun `a changed reason restarts the backoff and the budget`() = runBlocking {
+    fun `a changed reason restarts the budget`() = runBlocking {
         var probes = 0
         val waits = mutableListOf<Long>()
         val hibernate =
