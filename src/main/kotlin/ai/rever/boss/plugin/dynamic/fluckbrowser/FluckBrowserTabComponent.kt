@@ -975,9 +975,12 @@ internal object TabHibernation {
     /**
      * After this many rechecks a still-audible tab is left alone rather than polled forever.
      *
-     * With the backoff below that is roughly 3 hours of wall clock. A tab still playing then keeps
-     * its process tree until the user visits it again, which is the deliberate trade: a bound on
-     * polling must not become a licence to cut the audio.
+     * With the backoff below that is roughly 3 hours of wall clock for a tab whose reason stays
+     * the same. A tab that alternates between reasons restarts this budget each time it changes,
+     * and is bounded instead by the total ceiling in [awaitQuiet] at `maxRechecks * 2` probes -
+     * with a monotonic interval saturating at [MAX_RECHECK_MS], up to roughly twice as long. A
+     * tab still busy at either bound keeps its process tree until the user visits it again, which
+     * is the deliberate trade: a bound on polling must not become a licence to cut the audio.
      */
     internal const val MAX_RECHECKS = 40
 
@@ -1297,6 +1300,10 @@ internal class FluckBrowserTabState {
             // Chromium process tree alive. This is now the single chokepoint for handle
             // transitions, so it is the place to actually free it rather than log about it.
             println("[FluckBrowser] Adopting a handle over a live one; disposing the previous")
+            // Symmetric with releaseBrowserHandle. Disposal alone would rely entirely on
+            // BossConsole#36 detaching the view, which is a host version this plugin can load
+            // without.
+            if (isInFullscreen) requestHostExitFullscreen(previous)
             disposeBrowserHandleOffThread(previous)
         }
         clearFullscreenState()
@@ -1467,7 +1474,7 @@ internal class FluckBrowserTabState {
      * talking to us, unlike the *absence* of an exit callback that produced FAILED in the first
      * place.
      */
-    fun markFullscreenEntered(seq: Long = nextFullscreenCallbackSeq()) {
+    fun markFullscreenEntered(seq: Long) {
         if (!acceptFullscreenCallback(seq)) return
         // The invariant has to hold in both directions, not just on release. These callbacks are
         // marshalled asynchronously onto the Component scope, so a late or duplicate host enter
@@ -1484,7 +1491,7 @@ internal class FluckBrowserTabState {
         isInFullscreen = true
     }
 
-    fun markFullscreenExited(seq: Long = nextFullscreenCallbackSeq()) {
+    fun markFullscreenExited(seq: Long) {
         if (!acceptFullscreenCallback(seq)) return
         clearFullscreenState()
     }
@@ -1502,11 +1509,23 @@ internal class FluckBrowserTabState {
     }
 
     private fun requestHostExitFullscreen(handle: BrowserHandle?): HostExitOutcome {
-        // Checked before the call, so a handle that is both invalid and throwing reads as DEAD.
-        if (handle == null || !handle.isValid) return HostExitOutcome.DEAD
+        if (handle == null) return HostExitOutcome.DEAD
+        // isValid is inside the guard, not before it. It is still checked first, so a handle that
+        // is both invalid and throwing reads as DEAD - but it is a call across the plugin
+        // classloader like every other, and this file already catches Throwable around
+        // executeJavaScript for exactly that reason. Left outside, a throwing isValid propagates
+        // out of releaseBrowserHandle and takes onDestroy with it, so neither the dispose on the
+        // next line nor the scope cancellation below it runs: a leaked Chromium process tree, the
+        // very thing adoptBrowserHandle was hardened against. From the fallback coroutine it
+        // would instead kill the job and strand the phase at EXITING, where the debounce swallows
+        // every click.
         return runCatching {
-            handle.requestExitFullscreen()
-            HostExitOutcome.ACCEPTED
+            if (!handle.isValid) {
+                HostExitOutcome.DEAD
+            } else {
+                handle.requestExitFullscreen()
+                HostExitOutcome.ACCEPTED
+            }
         }.onFailure { error ->
             println("[FluckBrowser] Failed to request fullscreen exit: ${error.message}")
         }.getOrDefault(HostExitOutcome.THREW)

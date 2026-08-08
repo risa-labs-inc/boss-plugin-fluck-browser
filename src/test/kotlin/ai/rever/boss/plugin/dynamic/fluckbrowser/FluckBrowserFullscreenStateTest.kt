@@ -56,6 +56,17 @@ class FluckBrowserFullscreenStateTest {
             }
         } as BrowserHandle
 
+    /**
+     * Stamp-then-apply, the way the host callbacks do it. The production signature has no default
+     * for `seq` on purpose: allocating it at apply time instead of at arrival is precisely what
+     * would make the ordering guarantee vacuous.
+     */
+    private fun FluckBrowserTabState.enterFullscreen() =
+        markFullscreenEntered(nextFullscreenCallbackSeq())
+
+    private fun FluckBrowserTabState.exitFullscreen() =
+        markFullscreenExited(nextFullscreenCallbackSeq())
+
     // ---- handle lifetime ----
 
     @Test
@@ -64,7 +75,7 @@ class FluckBrowserFullscreenStateTest {
         var exitRequests = 0
         val handle = fakeHandle(onExitFullscreen = { exitRequests++ })
         state.adoptBrowserHandle(handle)
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         assertSame(handle, state.releaseBrowserHandle())
         assertNull(state.browserHandle)
@@ -93,7 +104,7 @@ class FluckBrowserFullscreenStateTest {
                 onExitFullscreen = { exitRequests++ },
             ),
         )
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         state.releaseBrowserHandle()
 
@@ -105,7 +116,7 @@ class FluckBrowserFullscreenStateTest {
     fun `releasing fullscreen state without a handle clears it safely`() {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertNotNull(state.releaseBrowserHandle())
 
         // Second release: fullscreen already cleared, handle already gone.
@@ -117,7 +128,7 @@ class FluckBrowserFullscreenStateTest {
     fun `adopting a replacement handle clears stale fullscreen state`() {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         val replacement = fakeHandle()
 
         state.adoptBrowserHandle(replacement)
@@ -146,7 +157,7 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         val requested = state.requestExitFullscreen(this)
 
@@ -160,13 +171,13 @@ class FluckBrowserFullscreenStateTest {
     fun `a late host enter cannot resurrect fullscreen after release`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.isInFullscreen)
 
         // Hibernation or crash recovery takes the handle, and the enter callback the host
         // queued before that lands afterwards on the Component scope.
         state.releaseBrowserHandle()
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         assertFalse(state.isInFullscreen)
         assertNull(state.browserHandle)
@@ -176,7 +187,7 @@ class FluckBrowserFullscreenStateTest {
     fun `exit request clears placeholder when handle is invalid`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle(isValid = { false }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         val requested = state.requestExitFullscreen(this)
 
@@ -185,10 +196,62 @@ class FluckBrowserFullscreenStateTest {
     }
 
     @Test
+    fun `a throwing isValid is contained, not propagated`() = runTest {
+        val state = FluckBrowserTabState()
+        val handle =
+            Proxy.newProxyInstance(
+                BrowserHandle::class.java.classLoader,
+                arrayOf(BrowserHandle::class.java),
+            ) { proxy, method, arguments ->
+                when (method.name) {
+                    "isValid" -> throw IllegalStateException("classloader gone")
+                    "toString" -> "ThrowingValidityHandle"
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === arguments?.firstOrNull()
+                    else -> error("Unstubbed BrowserHandle method: ${method.name}")
+                }
+            } as BrowserHandle
+        state.adoptBrowserHandle(handle)
+        state.enterFullscreen()
+
+        // Escaping here would take onDestroy with it, so neither the dispose nor the scope
+        // cancellation would run - the leaked process tree adoptBrowserHandle was hardened
+        // against. Must be contained, and on the conservative side.
+        assertFalse(state.requestExitFullscreen(this))
+
+        assertEquals(FullscreenExitPhase.FAILED, state.fullscreenExitPhase)
+        assertTrue(state.isInFullscreen)
+    }
+
+    @Test
+    fun `releasing a handle whose isValid throws still yields it for disposal`() = runTest {
+        val state = FluckBrowserTabState()
+        val handle =
+            Proxy.newProxyInstance(
+                BrowserHandle::class.java.classLoader,
+                arrayOf(BrowserHandle::class.java),
+            ) { proxy, method, arguments ->
+                when (method.name) {
+                    "isValid" -> throw IllegalStateException("classloader gone")
+                    "toString" -> "ThrowingValidityHandle"
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === arguments?.firstOrNull()
+                    else -> error("Unstubbed BrowserHandle method: ${method.name}")
+                }
+            } as BrowserHandle
+        state.adoptBrowserHandle(handle)
+        state.enterFullscreen()
+
+        assertSame(handle, state.releaseBrowserHandle(), "the caller must still get it to dispose")
+        assertNull(state.browserHandle)
+        assertFalse(state.isInFullscreen)
+    }
+
+    @Test
     fun `a throwing but live handle goes to FAILED, not a local restore`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle(exitFailure = IllegalStateException("wedged")))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         val requested = state.requestExitFullscreen(this)
 
@@ -205,7 +268,7 @@ class FluckBrowserFullscreenStateTest {
         state.adoptBrowserHandle(
             fakeHandle(isValid = { false }, exitFailure = IllegalStateException("gone")),
         )
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         assertFalse(state.requestExitFullscreen(this))
 
@@ -219,7 +282,7 @@ class FluckBrowserFullscreenStateTest {
         // A late host callback marshalled onto the Component scope, landing after hibernation
         // or crash recovery already released the handle. Fullscreen here would be unexitable,
         // and the content `when` has no else branch to fall back to.
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         assertFalse(state.isInFullscreen)
     }
@@ -256,7 +319,7 @@ class FluckBrowserFullscreenStateTest {
     fun `a host enter after a failed exit is a live session again`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
@@ -264,7 +327,7 @@ class FluckBrowserFullscreenStateTest {
 
         // The host exited cleanly and lost the callback - the likelier of the two FAILED
         // causes - so isInFullscreen is still set when the user re-enters from the page.
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         assertEquals(FullscreenExitPhase.IDLE, state.fullscreenExitPhase)
         // The part that actually bites: without this the tab hibernates mid-video.
@@ -275,7 +338,7 @@ class FluckBrowserFullscreenStateTest {
     fun `a failed exit stops blocking hibernation`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.fullscreenBlocksHibernation, "live fullscreen must defer hibernation")
 
         assertTrue(state.requestExitFullscreen(this))
@@ -314,7 +377,7 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
@@ -331,7 +394,7 @@ class FluckBrowserFullscreenStateTest {
     fun `a handle swap clears a failed exit phase`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
@@ -348,7 +411,7 @@ class FluckBrowserFullscreenStateTest {
     fun `releasing the handle clears a failed exit phase`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
@@ -364,7 +427,7 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         assertTrue(state.requestExitFullscreen(this))
         assertFalse(state.requestExitFullscreen(this))
@@ -380,7 +443,7 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         assertTrue(state.requestExitFullscreen(this))
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS + 1)
@@ -404,7 +467,7 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
@@ -415,7 +478,7 @@ class FluckBrowserFullscreenStateTest {
         assertEquals(FullscreenExitPhase.EXITING, state.fullscreenExitPhase)
         assertEquals(3, exitRequests)
 
-        state.markFullscreenExited()
+        state.exitFullscreen()
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
 
@@ -428,7 +491,7 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var valid = true
         state.adoptBrowserHandle(fakeHandle(isValid = { valid }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
 
         // The renderer crashes while the exit is in flight - the one way the retry can find a
@@ -446,7 +509,7 @@ class FluckBrowserFullscreenStateTest {
     fun `the user can restore a tab whose exit never completed`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
@@ -464,7 +527,7 @@ class FluckBrowserFullscreenStateTest {
     fun `restoring anyway does nothing before the exit has actually failed`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
 
         // Still EXITING: the host may yet call back, and dropping the placeholder here would
@@ -480,10 +543,10 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
 
-        state.markFullscreenExited()
+        state.exitFullscreen()
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
 
@@ -496,12 +559,12 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
 
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS + 1)
         runCurrent()
-        state.markFullscreenExited()
+        state.exitFullscreen()
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS + 1)
         runCurrent()
 
@@ -515,7 +578,7 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
 
         // Tab closed while the exit was still in flight.
@@ -533,7 +596,7 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
 
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS / 2)
@@ -556,12 +619,12 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
 
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS / 2)
-        state.markFullscreenExited()
-        state.markFullscreenEntered()
+        state.exitFullscreen()
+        state.enterFullscreen()
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
 
@@ -575,13 +638,13 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
         assertEquals(1, exitRequests)
 
         // The host did exit, the callback was dropped, and the user re-entered fullscreen from
         // the page inside the window - the likelier failure, met by a live new session.
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
 
@@ -597,13 +660,13 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
-        state.markFullscreenEntered()
+        state.enterFullscreen()
         assertTrue(state.requestExitFullscreen(this))
 
         // The other reading of the same callback: a spurious repeat. It cancels a legitimate
         // pending exit, which is the cheap side of the trade - the phase returns to IDLE, so the
         // debounce stops swallowing clicks and one more click re-requests.
-        state.markFullscreenEntered()
+        state.enterFullscreen()
 
         assertEquals(FullscreenExitPhase.IDLE, state.fullscreenExitPhase)
         assertTrue(state.requestExitFullscreen(this))
