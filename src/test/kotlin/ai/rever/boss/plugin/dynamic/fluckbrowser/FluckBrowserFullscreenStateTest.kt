@@ -225,6 +225,34 @@ class FluckBrowserFullscreenStateTest {
     }
 
     @Test
+    fun `an overtaken host callback is dropped`() = runTest {
+        val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
+
+        // Both callbacks are stamped at arrival, then delivered out of order - what
+        // Dispatchers.Main.immediate permits when one arrives on a CEF thread and the other
+        // inline on the EDT. Applying the exit last would leave fullscreen set with no window.
+        val enterSeq = state.nextFullscreenCallbackSeq()
+        val exitSeq = state.nextFullscreenCallbackSeq()
+        state.markFullscreenExited(exitSeq)
+        state.markFullscreenEntered(enterSeq)
+
+        assertFalse(state.isInFullscreen, "the stale enter was applied over a newer exit")
+    }
+
+    @Test
+    fun `callbacks still apply in the order they were stamped`() = runTest {
+        val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
+
+        state.markFullscreenEntered(state.nextFullscreenCallbackSeq())
+        assertTrue(state.isInFullscreen)
+        state.markFullscreenExited(state.nextFullscreenCallbackSeq())
+
+        assertFalse(state.isInFullscreen)
+    }
+
+    @Test
     fun `a host enter after a failed exit is a live session again`() = runTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())

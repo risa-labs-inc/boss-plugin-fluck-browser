@@ -1257,6 +1257,30 @@ internal class FluckBrowserTabState {
     // that it woke into a different one and do nothing.
     private var fullscreenEpoch = 0
 
+    // Stamped at host-callback time, before any dispatch, and checked once the callback lands.
+    //
+    // Needed because the callbacks marshal with Dispatchers.Main.immediate, which buys the tight
+    // enter tracking documented at the call site but gives up FIFO *between* the two: an enter
+    // arriving on a CEF thread is queued while an exit arriving on the EDT a moment later runs
+    // inline, so the exit would apply first and leave isInFullscreen set with no window behind
+    // it. Atomic because the stamp is taken on whichever thread the host used; the compare below
+    // runs main-confined like the rest of this state.
+    private val fullscreenCallbackSeq = java.util.concurrent.atomic.AtomicLong(0L)
+    private var lastAppliedFullscreenSeq = 0L
+
+    /** Stamp a host callback at arrival, before it is marshalled. See [fullscreenCallbackSeq]. */
+    fun nextFullscreenCallbackSeq(): Long = fullscreenCallbackSeq.incrementAndGet()
+
+    /** False when this callback was overtaken by a later one that already applied. */
+    private fun acceptFullscreenCallback(seq: Long): Boolean {
+        if (seq <= lastAppliedFullscreenSeq) {
+            println("[FluckBrowser] Dropping out-of-order fullscreen callback $seq")
+            return false
+        }
+        lastAppliedFullscreenSeq = seq
+        return true
+    }
+
     /**
      * Takes ownership of a freshly created handle.
      *
@@ -1283,10 +1307,20 @@ internal class FluckBrowserTabState {
      * Releases the current handle and returns it for disposal.
      *
      * Asking the host to leave fullscreen first is what keeps a detached fullscreen window from
-     * outliving the tab that owned it. `requestExitFullscreen` is a non-blocking post, so this is
-     * safe on the lifecycle thread and callers may dispose immediately afterwards; BossConsole#36
-     * (merged) also detaches a matching fullscreen view from `BrowserHandle` disposal, which is
-     * what covers the invalid-handle case this cannot reach.
+     * outliving the tab that owned it.
+     *
+     * This one host call is made synchronously, one line above a `disposeBrowserHandleOffThread`
+     * whose comment exists because dispose ends in a blocking Chromium IPC round-trip. The
+     * asymmetry is deliberate and rests on a specific host implementation rather than on the
+     * general claim that exit is cheap: `BrowserHandleImpl.requestExitFullscreen` delegates to
+     * `FullscreenBrowserWindow.requestExit`, whose entire body is a `SwingUtilities.invokeLater`.
+     * It posts and returns. If that ever becomes an `invokeAndWait`, closing a fullscreen tab
+     * starts hitching the UI and this call has to move off-thread with it - note that
+     * `browserDisposeExecutor` is a *cached* pool, so simply routing it there would not preserve
+     * exit-before-dispose ordering.
+     *
+     * BossConsole#36 (merged) additionally detaches a matching fullscreen view from `BrowserHandle`
+     * disposal, which is what covers the invalid-handle case this cannot reach.
      */
     fun releaseBrowserHandle(): BrowserHandle? {
         val handle = browserHandle
@@ -1425,7 +1459,8 @@ internal class FluckBrowserTabState {
      * keeps the tab exempt from hibernation - but losing the exemption on a healthy session is
      * the worse side of that trade.
      */
-    fun markFullscreenEntered() {
+    fun markFullscreenEntered(seq: Long = nextFullscreenCallbackSeq()) {
+        if (!acceptFullscreenCallback(seq)) return
         // The invariant has to hold in both directions, not just on release. These callbacks are
         // marshalled asynchronously onto the Component scope, so a late or duplicate host enter
         // can land after hibernation or crash recovery already dropped the handle. Fullscreen
@@ -1447,7 +1482,8 @@ internal class FluckBrowserTabState {
         isInFullscreen = true
     }
 
-    fun markFullscreenExited() {
+    fun markFullscreenExited(seq: Long = nextFullscreenCallbackSeq()) {
+        if (!acceptFullscreenCallback(seq)) return
         clearFullscreenState()
     }
 
@@ -1893,14 +1929,20 @@ internal fun FluckBrowserTabContent(
                         // window but isInFullscreen is still false - so the tab composes
                         // Content() for a view that has moved. That is the two-parents condition
                         // the FAILED state exists to avoid, arrived at from the other end.
+                        // The sequence stamp is taken here, on the host's thread, because
+                        // `immediate` only orders callbacks that arrive the same way: one queued
+                        // from a CEF thread would otherwise be overtaken by one running inline on
+                        // the EDT. Stamping before the dispatch makes that detectable.
                         onEnterFullscreen = {
+                            val seq = hoistedState.nextFullscreenCallbackSeq()
                             coroutineScope.launch(Dispatchers.Main.immediate) {
-                                hoistedState.markFullscreenEntered()
+                                hoistedState.markFullscreenEntered(seq)
                             }
                         },
                         onExitFullscreen = {
+                            val seq = hoistedState.nextFullscreenCallbackSeq()
                             coroutineScope.launch(Dispatchers.Main.immediate) {
-                                hoistedState.markFullscreenExited()
+                                hoistedState.markFullscreenExited(seq)
                             }
                         }
                     )
