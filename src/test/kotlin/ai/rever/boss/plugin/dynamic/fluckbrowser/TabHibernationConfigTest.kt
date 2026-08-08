@@ -1,10 +1,12 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.fail
 
 /**
  * Guards how hibernation decides whether to run, and how long to wait.
@@ -152,39 +154,49 @@ class TabHibernationConfigTest {
 
     // endregion
 
-    // region audible-tab guard
+    // region busy-tab guard
 
     /**
-     * Hibernation tears down the Chromium process tree, so hibernating an audible tab cuts the
-     * user's music mid-play. That is the one consequence of hibernating that a reload does not
-     * undo, and it is why turning hibernation on by default without this guard would be a
-     * regression rather than a saving.
+     * The behaviour that makes default-on safe, exercised rather than grepped.
+     *
+     * An earlier version of these tests asserted `script.contains("m.paused")`, which stays green
+     * if the predicate is inverted or a `!` is dropped - it pinned the formatting of a JavaScript
+     * string, not the logic, and locked the string in place while proving nothing. What actually
+     * protects the user is the defer loop, so that is what is tested.
      */
     @Test
-    fun `the media probe only counts genuinely audible playback`() {
-        val script = TabHibernation.mediaPlayingScriptForTest()
-        // Each of these is a way a media element can exist while making no sound.
-        for (condition in listOf("m.paused", "m.ended", "m.muted", "m.volume > 0", "m.currentTime > 0")) {
-            assertTrue(script.contains(condition), "probe ignores $condition: $script")
-        }
-        assertTrue(script.contains("video,audio"), script)
-    }
-
-    /**
-     * The probe runs on arbitrary pages. A throw inside it must read as "not playing", so a page
-     * that cannot evaluate it still hibernates rather than being exempted for the session.
-     */
-    @Test
-    fun `the media probe swallows its own errors`() {
-        val script = TabHibernation.mediaPlayingScriptForTest()
-        assertTrue(script.contains("try{"), script)
-        assertTrue(script.contains("catch"), script)
-        assertTrue(script.contains("return false"), script)
+    fun `an idle tab hibernates immediately`() = runBlocking {
+        var waits = 0
+        TabHibernation.waitUntilIdle(isBusyNow = { false }, onWait = { waits++ })
+        assertEquals(0, waits, "an idle tab should not have waited")
     }
 
     @Test
-    fun `an audible tab is rechecked rather than exempted forever`() {
+    fun `a busy tab is deferred until it goes quiet, then hibernates`() = runBlocking {
+        var probes = 0
+        var waits = 0
+        // Audible for the first three checks, quiet on the fourth.
+        TabHibernation.waitUntilIdle(
+            isBusyNow = { probes++ < 3 },
+            onWait = { waits++ },
+        )
+        assertEquals(3, waits, "expected one wait per busy probe")
+        assertEquals(4, probes, "expected a final probe that found the tab quiet")
+    }
+
+    /** Deferred, never exempted: the tab must be re-checked rather than given up on. */
+    @Test
+    fun `the recheck interval is positive so a deferred tab is revisited`() = runBlocking {
         assertTrue(TabHibernation.MEDIA_RECHECK_MS > 0)
+        TabHibernation.waitUntilIdle(isBusyNow = { false }, onWait = { fail("must not wait") })
+    }
+
+    @Test
+    fun `the wait interval passed to the caller is the recheck interval`() = runBlocking {
+        var probes = 0
+        val intervals = mutableListOf<Long>()
+        TabHibernation.waitUntilIdle(isBusyNow = { probes++ < 2 }, onWait = { intervals.add(it) })
+        assertEquals(listOf(TabHibernation.MEDIA_RECHECK_MS, TabHibernation.MEDIA_RECHECK_MS), intervals)
     }
 
     // endregion
@@ -224,6 +236,19 @@ class TabHibernationConfigTest {
             """.trimIndent()
         // free + inactive + speculative + purgeable = 375 pages
         assertEquals(375L * 16384L, HibernationMemory.parseVmStatAvailableBytes(output))
+    }
+
+    /**
+     * A genuine zero and an unreadable value must not collapse together. They used to, which meant
+     * a machine that really had run out of available memory - the single case the accelerant exists
+     * for - was indistinguishable from an unmeasurable one, and so was ignored.
+     */
+    @Test
+    fun `a real zero reading is pressure, not unknown`() {
+        assertEquals(0L, TabHibernation.accelerate(0L, availableFraction = 0.0, onBattery = false))
+        // 0.0 is below any sane threshold, so it must accelerate rather than be ignored.
+        val accelerated = TabHibernation.accelerate(600_000L, availableFraction = 0.0, onBattery = false)
+        assertTrue(accelerated < 600_000L, "a zero available fraction did not accelerate: $accelerated")
     }
 
     @Test

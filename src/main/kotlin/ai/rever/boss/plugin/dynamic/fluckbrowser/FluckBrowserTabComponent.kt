@@ -108,6 +108,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.awt.Color as AwtColor
 import java.awt.Font
@@ -666,16 +667,17 @@ internal fun suggestionsAfterDelete(
  * without re-creating the browser.
  */
 /**
- * Tab hibernation (memory saver) configuration. When [enabled], a browser tab that's been in the
- * background past [idleMs] disposes its live browser (freeing the Chromium process tree) and is
- * recreated from its current URL when shown again. Gated off by default; opt in with
- * BOSS_TAB_HIBERNATION=true so it can be dogfooded before it becomes the default.
+ * Tab hibernation (memory saver) configuration. A browser tab that has been in the background
+ * past [currentIdleMs] disposes its live browser (freeing the Chromium process tree) and is
+ * recreated from its current URL when shown again.
+ *
+ * **On by default**, opt out with `BOSS_TAB_HIBERNATION=false`. It shipped opt-in, which meant it
+ * effectively never ran - see [enabled].
  */
 internal object TabHibernation {
     /** The host system property carrying the resource tier's idle timeout. */
     internal const val HOST_IDLE_PROPERTY = "boss.browser.hibernationIdleMs"
 
-    private val TRUTHY = listOf("1", "true", "yes", "on")
     private val FALSY = listOf("0", "false", "no", "off")
 
     internal const val DEFAULT_IDLE_MS = 10 * 60 * 1000L
@@ -701,8 +703,13 @@ internal object TabHibernation {
      * The tier arrives as a system property rather than through plugin-api because plugins cannot
      * see host classes; this mirrors how `boss.power.onBattery` reaches the battery accelerant
      * below. Absent (older host, or a host that never published it) simply means the default.
+     *
+     * Read **per call**, not captured at class-load, exactly as the battery property is. As a
+     * `val` this silently kept the default for the whole session if anything touched
+     * [TabHibernation] before the host published - a load-order dependency with no error and no
+     * log line, which is the failure mode this file is otherwise written against.
      */
-    val idleMs: Long =
+    fun currentIdleMs(): Long =
         resolveIdleMs(
             fromEnvironment = System.getenv("BOSS_TAB_HIBERNATION_IDLE_MS"),
             fromHost = System.getProperty(HOST_IDLE_PROPERTY),
@@ -710,16 +717,10 @@ internal object TabHibernation {
 
     /** Pure, so `TabHibernationConfigTest` can pin the opt-out without an environment. */
     internal fun resolveEnabled(raw: String?): Boolean {
-        val value = raw?.trim()?.lowercase()
-        return when {
-            value.isNullOrEmpty() -> true
-            value in FALSY -> false
-            value in TRUTHY -> true
-            // An unrecognized value must not read as "off". Silently disabling the memory
-            // reclamation because someone wrote BOSS_TAB_HIBERNATION=enabled would be the worst
-            // possible reading of that intent.
-            else -> true
-        }
+        // Only an explicit falsy value turns it off. An unrecognized value must not read as
+        // "off": someone writing BOSS_TAB_HIBERNATION=enabled plainly wants it enabled, and
+        // silently disabling memory reclamation is the worst available reading of that.
+        return raw?.trim()?.lowercase() !in FALSY
     }
 
     /** Pure, so the precedence is testable. Non-positive values are ignored, not obeyed. */
@@ -737,7 +738,9 @@ internal object TabHibernation {
     // (see the DisposableEffect), so responsiveness is unaffected. Tunable, fails safe to idleMs.
     private val pressureIdleMs: Long =
         System.getenv("BOSS_TAB_HIBERNATION_PRESSURE_IDLE_MS")?.trim()?.toLongOrNull() ?: 60_000L
-    private val pressureFreeFraction: Double =
+    // Named for what it now compares. The env var keeps its old spelling for compatibility, but
+    // the field used to hold a *free*-pages fraction, which is the metric this change proved wrong.
+    private val pressureAvailableFraction: Double =
         System.getenv("BOSS_TAB_HIBERNATION_PRESSURE_FRACTION")?.trim()?.toDoubleOrNull() ?: 0.15
 
     // Battery-aware (roadmap Phase 2). On battery, hibernate idle background tabs sooner to save
@@ -752,12 +755,12 @@ internal object TabHibernation {
     /**
      * The idle delay to use right now. Starts at the normal [idleMs] and takes the shortest of any
      * applicable accelerant: the memory-pressure delay when available system memory is below
-     * [pressureFreeFraction] of total, and the battery delay when running on battery (opt-in). Only
+     * [pressureAvailableFraction] of total, and the battery delay when running on battery. Only
      * ever shortens — never exceeds [idleMs] — and fails safe to [idleMs] on any read error.
      */
     fun effectiveIdleMs(): Long =
         accelerate(
-            baseline = idleMs,
+            baseline = currentIdleMs(),
             availableFraction = runCatching { HibernationMemory.availableFraction() }.getOrNull(),
             onBattery = System.getProperty("boss.power.onBattery") == "true",
         )
@@ -768,41 +771,79 @@ internal object TabHibernation {
     private const val MEDIA_CHECK_TIMEOUT_MS = 2_000L
 
     /**
-     * True when the page is playing audible media, in which case the tab must not hibernate.
+     * True when hibernating this tab right now would destroy something the user cares about.
      *
-     * Hibernation tears down the Chromium process tree, so hibernating an audible tab cuts the
-     * user's music or video mid-play. That is the one failure here a reload does not undo - every
-     * other consequence of hibernating is a page that comes back when you return to it.
+     * Two cases, and both are things a reload does **not** restore:
      *
-     * Done in JavaScript because `BrowserHandle` exposes no audio state; JxBrowser's own
-     * `browser.audio()` is not surfaced through plugin-api, and adding it means an api release,
-     * then a host release, then this. **Known gap:** this sees only the top document, so media
-     * inside a cross-origin iframe and pure Web Audio playback are both missed. It covers the
-     * common cases (a video or audio element on the page itself) and is strictly better than the
-     * nothing that shipping default-on without it would mean.
+     *  - **Audible media.** Tearing down the process tree cuts music or video mid-play.
+     *  - **Unsaved input.** The justification for turning this on by default is "a reload on
+     *    return, not lost work", and that is only true for URL, title and history. A reload also
+     *    discards a half-filled form, which ten minutes of idle is very easy to reach with. A user
+     *    who loses a form to a memory optimisation they never opted into will read it as data
+     *    loss, and they will be right.
      *
-     * Failure reads as "not playing", so a page that cannot run this script still hibernates. The
-     * opposite would let one broken evaluation quietly disable the feature for that tab forever.
+     * Done in JavaScript because `BrowserHandle` exposes neither audio nor form state; JxBrowser's
+     * own `browser.audio()` is not surfaced through plugin-api, and adding it means an api
+     * release, then a host release, then this.
+     *
+     * **Known gaps**, all in the direction of hibernating when perhaps it should not: only the top
+     * document is visible, so cross-origin iframes are missed; pure Web Audio playback has no
+     * media element to find; `contenteditable` regions and JS-framework state held outside form
+     * elements are not seen; and `window.onbeforeunload` catches only the property form, not
+     * handlers registered with `addEventListener`.
+     *
+     * Failure reads as "not busy", so a page that cannot run this still hibernates. The opposite
+     * would let one broken evaluation quietly exempt a tab for the rest of the session.
      */
-    suspend fun isPlayingMedia(handle: BrowserHandle): Boolean =
+    suspend fun isBusy(handle: BrowserHandle): Boolean =
         try {
-            withTimeoutOrNull(MEDIA_CHECK_TIMEOUT_MS) {
-                handle.executeJavaScript(MEDIA_PLAYING_SCRIPT)
-            } == true
+            withContext(Dispatchers.IO) {
+                withTimeoutOrNull(BUSY_CHECK_TIMEOUT_MS) {
+                    handle.executeJavaScript(BUSY_SCRIPT)
+                } == true
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
             false
         }
 
-    private const val MEDIA_PLAYING_SCRIPT =
-        "(function(){try{return Array.prototype.slice.call(" +
-            "document.querySelectorAll('video,audio')).some(function(m){" +
-            "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
-            "});}catch(e){return false;}})()"
+    /**
+     * Waits until [isBusy] reports the tab idle, re-checking every [MEDIA_RECHECK_MS].
+     *
+     * Extracted from the composable so the deferral behaviour - the part that actually protects
+     * the user's audio and form input - is testable against a fake probe rather than only
+     * inspectable by reading the JavaScript.
+     *
+     * Deferring rather than cancelling on purpose: a paused video or an abandoned form should
+     * still release its processes once it stops being busy.
+     */
+    suspend fun waitUntilIdle(
+        isBusyNow: suspend () -> Boolean,
+        onWait: suspend (Long) -> Unit,
+    ) {
+        while (isBusyNow()) {
+            onWait(MEDIA_RECHECK_MS)
+        }
+    }
 
-    /** The probe source, so its conditions can be pinned without a live browser. */
-    internal fun mediaPlayingScriptForTest(): String = MEDIA_PLAYING_SCRIPT
+    private const val BUSY_CHECK_TIMEOUT_MS = 2_000L
+
+    private const val BUSY_SCRIPT =
+        "(function(){try{" +
+            "var q=function(s){return Array.prototype.slice.call(document.querySelectorAll(s));};" +
+            "if(q('video,audio').some(function(m){" +
+            "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
+            "})) return true;" +
+            "if(window.onbeforeunload) return true;" +
+            "return q('input,textarea').some(function(f){" +
+            "if(f.disabled || f.readOnly) return false;" +
+            "var t=(f.type||'').toLowerCase();" +
+            "if(t==='hidden'||t==='submit'||t==='button'||t==='reset') return false;" +
+            "if(t==='checkbox'||t==='radio') return f.checked !== f.defaultChecked;" +
+            "return (f.value||'') !== (f.defaultValue||'');" +
+            "});" +
+            "}catch(e){return false;}})()"
 
     /**
      * Pure accelerant arithmetic, so the "only ever shortens" contract is testable.
@@ -817,7 +858,7 @@ internal object TabHibernation {
         onBattery: Boolean,
     ): Long {
         var delay = baseline
-        if (availableFraction != null && availableFraction < pressureFreeFraction) {
+        if (availableFraction != null && availableFraction < pressureAvailableFraction) {
             delay = minOf(delay, pressureIdleMs)
         }
         if (batteryAwareEnabled && onBattery) {
@@ -1500,12 +1541,19 @@ internal fun FluckBrowserTabContent(
         onDispose {
             if (TabHibernation.enabled && browserHandle != null) {
                 hoistedState.hibernationJob = coroutineScope.launch {
-                    delay(TabHibernation.effectiveIdleMs())
-                    // Defer while the tab is audible rather than skipping hibernation outright:
-                    // a paused video should still release its processes eventually.
-                    while (browserHandle?.let { TabHibernation.isPlayingMedia(it) } == true) {
-                        delay(TabHibernation.MEDIA_RECHECK_MS)
-                    }
+                    // effectiveIdleMs() off the UI thread. coroutineScope is Dispatchers.Main, so
+                    // this argument is evaluated on the EDT before delay ever suspends - and on
+                    // macOS it forks /usr/bin/vm_stat and waits up to 5s for it. That was a
+                    // fork/exec, and a worst-case five-second frozen UI, at the exact moment the
+                    // user is switching tabs. It used to be an MXBean field read, which is why the
+                    // call site did not look dangerous.
+                    delay(withContext(Dispatchers.IO) { TabHibernation.effectiveIdleMs() })
+                    // Defer while the tab is busy rather than skipping hibernation outright: a
+                    // paused video or an abandoned form should still release its processes.
+                    TabHibernation.waitUntilIdle(
+                        isBusyNow = { browserHandle?.let { TabHibernation.isBusy(it) } == true },
+                        onWait = { delay(it) },
+                    )
                     val handle = browserHandle
                     browserHandle = null
                     isInitializing = true

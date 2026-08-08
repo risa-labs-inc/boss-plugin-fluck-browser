@@ -33,7 +33,8 @@ internal object HibernationMemory {
 
     private val osName: String = System.getProperty("os.name").orEmpty().lowercase()
 
-    private data class Reading(val bytes: Long, val takenAtNanos: Long)
+    /** [bytes] is null for a reading that failed, which is cached like any other. */
+    private data class Reading(val bytes: Long?, val takenAtNanos: Long)
 
     @Volatile
     private var macCache: Reading? = null
@@ -42,18 +43,21 @@ internal object HibernationMemory {
     fun totalBytes(): Long = osBean?.totalMemorySize?.takeIf { it > 0L } ?: 0L
 
     /**
-     * Memory available without evicting the user's working set, or 0 when it cannot be read.
+     * Memory available without evicting the user's working set, or **null** when it cannot be read.
      *
-     * The platform branch is **total**: on a known platform an unreadable value is 0, meaning
-     * "unknown", never a different and known-wrong metric. Falling back to `freeMemorySize` here
-     * would reintroduce exactly the bug above whenever `vm_stat` was slow or unavailable.
+     * The platform branch is **total**: on a known platform an unreadable value stays null rather
+     * than falling back to `freeMemorySize`, which would reintroduce exactly the bug above
+     * whenever `vm_stat` was slow or unavailable.
+     *
+     * Null and not 0, so a machine that genuinely has no memory available - the one case the
+     * accelerant exists for - stays distinguishable from one whose memory we could not read.
      */
-    fun availableBytes(): Long =
+    fun availableBytes(): Long? =
         when {
-            osName.startsWith("linux") -> linuxAvailableBytes() ?: 0L
-            osName.startsWith("mac") -> macAvailableBytes() ?: 0L
+            osName.startsWith("linux") -> linuxAvailableBytes()
+            osName.startsWith("mac") -> macAvailableBytes()
             // Windows: ullAvailPhys already means "available" rather than "untouched".
-            else -> osBean?.freeMemorySize ?: 0L
+            else -> osBean?.freeMemorySize?.takeIf { it >= 0L }
         }
 
     /**
@@ -64,8 +68,12 @@ internal object HibernationMemory {
      */
     fun availableFraction(): Double? {
         val total = totalBytes()
-        val available = availableBytes()
-        if (total <= 0L || available <= 0L) return null
+        // Nullable, so that a genuine zero is distinguishable from a failed read. Collapsing both
+        // into 0L meant a machine that really had run out of available memory - the single case
+        // this accelerant exists for - was indistinguishable from an unreadable one, and so was
+        // ignored.
+        val available = availableBytes() ?: return null
+        if (total <= 0L || available < 0L) return null
         return (available.toDouble() / total.toDouble()).coerceIn(0.0, 1.0)
     }
 
@@ -87,8 +95,13 @@ internal object HibernationMemory {
 
     private fun macAvailableBytes(): Long? {
         val now = System.nanoTime()
-        val cached = macCache?.takeIf { now - it.takenAtNanos < CACHE_TTL_NANOS }
-        return cached?.bytes ?: vmStatBytes()?.also { macCache = Reading(it, now) }
+        macCache?.takeIf { now - it.takenAtNanos < CACHE_TTL_NANOS }?.let { return it.bytes }
+        // Failures are cached too. On a host where vm_stat consistently fails - sandboxing, a
+        // stripped image - caching only successes means forking a process on every evaluation
+        // forever, which is the cost this cache exists to avoid.
+        val reading = vmStatBytes()
+        macCache = Reading(reading, now)
+        return reading
     }
 
     private fun vmStatBytes(): Long? =
@@ -107,7 +120,9 @@ internal object HibernationMemory {
                 }
                 parseVmStatAvailableBytes(process.inputStream.bufferedReader().use { it.readText() })
             } finally {
-                // destroyForcibly does not close these, and the timeout branch never reads them.
+                // Only load-bearing for the timeout branch, which returns without reading either
+                // stream; destroyForcibly does not close them. Closing an already-closed stream
+                // is a no-op, so the success path double-closing inputStream is harmless.
                 process.inputStream.close()
                 process.errorStream.close()
                 process.outputStream.close()
