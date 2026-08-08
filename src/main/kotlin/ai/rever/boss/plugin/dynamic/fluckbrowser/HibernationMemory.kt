@@ -56,8 +56,12 @@ internal object HibernationMemory {
         when {
             osName.startsWith("linux") -> linuxAvailableBytes()
             osName.startsWith("mac") -> macAvailableBytes()
-            // Windows: ullAvailPhys already means "available" rather than "untouched".
-            else -> osBean?.freeMemorySize?.takeIf { it >= 0L }
+            // Windows only: ullAvailPhys already means "available" rather than "untouched".
+            osName.startsWith("windows") -> osBean?.freeMemorySize?.takeIf { it >= 0L }
+            // Anything else - FreeBSD, Solaris, an unrecognized name - is unknown rather than
+            // freeMemorySize. Using the JDK reading there would reintroduce the free-vs-available
+            // bug this class exists to fix, on exactly the platforms nobody is testing.
+            else -> null
         }
 
     /**
@@ -146,15 +150,20 @@ internal object HibernationMemory {
                 ?.toLongOrNull()
                 ?: return null
 
-        fun pages(label: String): Long =
+        fun pages(label: String): Long? =
             Regex("""^Pages $label:\s+(\d+)\.""", RegexOption.MULTILINE)
                 .find(output)
                 ?.groupValues
                 ?.getOrNull(1)
                 ?.toLongOrNull()
-                ?: 0L
 
-        val total = pages("free") + pages("inactive") + pages("speculative") + pages("purgeable")
-        return if (total > 0L) total * pageSize else null
+        val counts = listOf("free", "inactive", "speculative", "purgeable").map(::pages)
+        // Null only when no page-count line matched at all, which means output we do not
+        // understand. A set of lines that genuinely sums to zero is the deepest-pressure reading
+        // there is, and returning null for it would have the caller ignore the one case the
+        // accelerant exists for - the same zero-versus-unknown conflation this file argues against
+        // everywhere else.
+        if (counts.all { it == null }) return null
+        return counts.filterNotNull().sum() * pageSize
     }
 }

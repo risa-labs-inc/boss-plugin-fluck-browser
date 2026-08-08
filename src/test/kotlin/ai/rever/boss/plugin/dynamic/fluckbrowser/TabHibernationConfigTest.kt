@@ -110,14 +110,30 @@ class TabHibernationConfigTest {
 
     // region accelerants
 
+    // Explicit thresholds so these do not change behaviour on a machine that happens to have
+    // BOSS_TAB_HIBERNATION_* set - which is the developer most likely to run them.
+    private fun accelerate(
+        baseline: Long,
+        available: Double?,
+        onBattery: Boolean = false,
+    ) = TabHibernation.accelerate(
+        baseline = baseline,
+        availableFraction = available,
+        onBattery = onBattery,
+        pressureThreshold = 0.15,
+        pressureDelayMs = 60_000L,
+        batteryDelayMs = 120_000L,
+        batteryAware = true,
+    )
+
     @Test
     fun `plenty of memory leaves the baseline alone`() {
-        assertEquals(600_000L, TabHibernation.accelerate(600_000L, availableFraction = 0.85, onBattery = false))
+        assertEquals(600_000L, accelerate(600_000L, available = 0.85))
     }
 
     @Test
     fun `real pressure shortens the wait`() {
-        val accelerated = TabHibernation.accelerate(600_000L, availableFraction = 0.02, onBattery = false)
+        val accelerated = accelerate(600_000L, available = 0.02)
         assertTrue(accelerated < 600_000L, "expected acceleration, got $accelerated")
     }
 
@@ -129,7 +145,7 @@ class TabHibernationConfigTest {
      */
     @Test
     fun `a healthy mac reading does not trigger the accelerant`() {
-        assertEquals(600_000L, TabHibernation.accelerate(600_000L, availableFraction = 0.92, onBattery = false))
+        assertEquals(600_000L, accelerate(600_000L, available = 0.92))
     }
 
     /**
@@ -138,7 +154,7 @@ class TabHibernationConfigTest {
      */
     @Test
     fun `an unreadable memory reading is not treated as pressure`() {
-        assertEquals(600_000L, TabHibernation.accelerate(600_000L, availableFraction = null, onBattery = false))
+        assertEquals(600_000L, accelerate(600_000L, available = null))
     }
 
     @Test
@@ -146,7 +162,7 @@ class TabHibernationConfigTest {
         val shortBaseline = 1_000L
         for (fraction in listOf(null, 0.0, 0.01, 0.5, 1.0)) {
             for (battery in listOf(true, false)) {
-                val result = TabHibernation.accelerate(shortBaseline, fraction, battery)
+                val result = accelerate(shortBaseline, fraction, battery)
                 assertTrue(result <= shortBaseline, "fraction=$fraction battery=$battery gave $result")
             }
         }
@@ -154,49 +170,122 @@ class TabHibernationConfigTest {
 
     // endregion
 
-    // region busy-tab guard
+    // region busy-tab policy
 
-    /**
-     * The behaviour that makes default-on safe, exercised rather than grepped.
-     *
-     * An earlier version of these tests asserted `script.contains("m.paused")`, which stays green
-     * if the predicate is inverted or a `!` is dropped - it pinned the formatting of a JavaScript
-     * string, not the logic, and locked the string in place while proving nothing. What actually
-     * protects the user is the defer loop, so that is what is tested.
-     */
+    private val IDLE = TabHibernation.BusyState.IDLE
+    private val MEDIA = TabHibernation.BusyState.PLAYING_MEDIA
+    private val INPUT = TabHibernation.BusyState.UNSAVED_INPUT
+
     @Test
     fun `an idle tab hibernates immediately`() = runBlocking {
         var waits = 0
-        TabHibernation.waitUntilIdle(isBusyNow = { false }, onWait = { waits++ })
+        assertTrue(TabHibernation.awaitQuiet(probe = { IDLE }, onWait = { waits++ }))
         assertEquals(0, waits, "an idle tab should not have waited")
     }
 
     @Test
-    fun `a busy tab is deferred until it goes quiet, then hibernates`() = runBlocking {
+    fun `an audible tab is waited out, then hibernates once quiet`() = runBlocking {
+        var probes = 0
+        val waits = mutableListOf<Long>()
+        val hibernate =
+            TabHibernation.awaitQuiet(
+                probe = { if (probes++ < 3) MEDIA else IDLE },
+                onWait = { waits.add(it) },
+            )
+        assertTrue(hibernate, "a tab that went quiet should hibernate")
+        assertEquals(3, waits.size)
+    }
+
+    /**
+     * The regression this split exists for. Unsaved typing may never resolve - an SPA search box
+     * or a half-written comment stays dirty for the life of the page - so polling it is not
+     * deferral, it is a permanent wake-up loop attached to a tab that will never hibernate. At 40
+     * tabs that was a JS eval into a background renderer roughly every second, forever: worse than
+     * not deferring at all, for both memory and battery.
+     */
+    @Test
+    fun `unsaved input exempts the tab without polling it`() = runBlocking {
         var probes = 0
         var waits = 0
-        // Audible for the first three checks, quiet on the fourth.
-        TabHibernation.waitUntilIdle(
-            isBusyNow = { probes++ < 3 },
-            onWait = { waits++ },
+        val hibernate =
+            TabHibernation.awaitQuiet(
+                probe = { probes++; INPUT },
+                onWait = { waits++ },
+            )
+        assertFalse(hibernate, "a tab with unsaved input must not hibernate")
+        assertEquals(0, waits, "an unresolvable condition must not be polled")
+        assertEquals(1, probes, "should decide on the first probe")
+    }
+
+    /** Rechecks must back off, or a three-hour video costs an eval every 30s for three hours. */
+    @Test
+    fun `rechecks back off toward the ceiling`() = runBlocking {
+        val waits = mutableListOf<Long>()
+        TabHibernation.awaitQuiet(probe = { MEDIA }, onWait = { waits.add(it) }, maxRechecks = 12)
+        assertEquals(TabHibernation.MEDIA_RECHECK_MS, waits.first())
+        for (i in 1 until waits.size) {
+            assertTrue(waits[i] >= waits[i - 1], "interval shrank at $i: $waits")
+        }
+        assertTrue(waits.all { it <= TabHibernation.MAX_RECHECK_MS }, waits.toString())
+        assertEquals(TabHibernation.MAX_RECHECK_MS, waits.last(), "should reach the ceiling")
+    }
+
+    /**
+     * A bound on polling must not become a licence to cut the audio. When a tab is *still* playing
+     * after the last recheck, the answer is to leave it alone - not to hibernate it anyway.
+     */
+    @Test
+    fun `a tab still playing at the recheck limit is left alone, not hibernated`() = runBlocking {
+        var waits = 0
+        val hibernate =
+            TabHibernation.awaitQuiet(probe = { MEDIA }, onWait = { waits++ }, maxRechecks = 5)
+        assertFalse(hibernate, "hibernating here would cut audio mid-play")
+        assertTrue(waits <= 6, "polling was not bounded: $waits")
+    }
+
+    // endregion
+
+    // region pressure re-evaluation
+
+    /**
+     * The accelerant used to sample memory once, when the tab backgrounded, then sleep on that
+     * answer for up to thirty minutes - so it could only ever see pressure that already existed,
+     * never the normal case of pressure caused afterwards by the other tabs.
+     */
+    @Test
+    fun `the idle target is re-evaluated while waiting, so later pressure still shortens it`() =
+        runBlocking {
+            var slept = 0L
+            var asked = 0
+            TabHibernation.awaitIdleWindow(
+                // 10 minutes at first; after two chunks, pressure arrives and it drops to one.
+                idleMsNow = { asked++; if (slept >= 60_000L) 60_000L else 600_000L },
+                sleep = { slept += it },
+                chunkMs = 30_000L,
+            )
+            assertEquals(60_000L, slept, "should have stopped at the shortened target")
+            assertTrue(asked > 1, "target was only sampled once")
+        }
+
+    @Test
+    fun `a steady target is slept out in chunks`() = runBlocking {
+        val chunks = mutableListOf<Long>()
+        TabHibernation.awaitIdleWindow(
+            idleMsNow = { 100_000L },
+            sleep = { chunks.add(it) },
+            chunkMs = 30_000L,
         )
-        assertEquals(3, waits, "expected one wait per busy probe")
-        assertEquals(4, probes, "expected a final probe that found the tab quiet")
-    }
-
-    /** Deferred, never exempted: the tab must be re-checked rather than given up on. */
-    @Test
-    fun `the recheck interval is positive so a deferred tab is revisited`() = runBlocking {
-        assertTrue(TabHibernation.MEDIA_RECHECK_MS > 0)
-        TabHibernation.waitUntilIdle(isBusyNow = { false }, onWait = { fail("must not wait") })
+        assertEquals(100_000L, chunks.sum())
+        assertTrue(chunks.all { it <= 30_000L }, chunks.toString())
+        // The final chunk is the remainder, never an overshoot past the target.
+        assertEquals(10_000L, chunks.last())
     }
 
     @Test
-    fun `the wait interval passed to the caller is the recheck interval`() = runBlocking {
-        var probes = 0
-        val intervals = mutableListOf<Long>()
-        TabHibernation.waitUntilIdle(isBusyNow = { probes++ < 2 }, onWait = { intervals.add(it) })
-        assertEquals(listOf(TabHibernation.MEDIA_RECHECK_MS, TabHibernation.MEDIA_RECHECK_MS), intervals)
+    fun `an already-elapsed target returns without sleeping`() = runBlocking {
+        var slept = 0
+        TabHibernation.awaitIdleWindow(idleMsNow = { 0L }, sleep = { slept++ }, chunkMs = 30_000L)
+        assertEquals(0, slept)
     }
 
     // endregion
@@ -245,9 +334,9 @@ class TabHibernationConfigTest {
      */
     @Test
     fun `a real zero reading is pressure, not unknown`() {
-        assertEquals(0L, TabHibernation.accelerate(0L, availableFraction = 0.0, onBattery = false))
+        assertEquals(0L, accelerate(0L, available = 0.0))
         // 0.0 is below any sane threshold, so it must accelerate rather than be ignored.
-        val accelerated = TabHibernation.accelerate(600_000L, availableFraction = 0.0, onBattery = false)
+        val accelerated = accelerate(600_000L, available = 0.0)
         assertTrue(accelerated < 600_000L, "a zero available fraction did not accelerate: $accelerated")
     }
 
@@ -257,6 +346,44 @@ class TabHibernationConfigTest {
         assertNull(HibernationMemory.parseVmStatAvailableBytes("command not found"))
         // Page size present but no page counts: nothing to sum, so still unknown.
         assertNull(HibernationMemory.parseVmStatAvailableBytes("(page size of 4096 bytes)"))
+    }
+
+    /**
+     * A vm_stat table that genuinely sums to zero reclaimable pages is the deepest-pressure
+     * reading there is. Returning null for it would have the caller ignore the single case the
+     * accelerant exists for - and the accelerate() test above passes either way, which is exactly
+     * the false confidence worth closing here.
+     */
+    @Test
+    fun `a vm_stat table summing to zero is zero, not unknown`() {
+        val output =
+            """
+            Mach Virtual Memory Statistics: (page size of 4096 bytes)
+            Pages free:                                 0.
+            Pages active:                          500000.
+            Pages inactive:                             0.
+            Pages speculative:                          0.
+            Pages purgeable:                            0.
+            """.trimIndent()
+        assertEquals(0L, HibernationMemory.parseVmStatAvailableBytes(output))
+    }
+
+    /** The per-call property read is the point of the change, so it needs its own pin. */
+    @Test
+    fun `currentIdleMs reflects the host property at the time it is called`() {
+        val previous = System.getProperty(TabHibernation.HOST_IDLE_PROPERTY)
+        try {
+            System.setProperty(TabHibernation.HOST_IDLE_PROPERTY, "123456")
+            assertEquals(123_456L, TabHibernation.currentIdleMs())
+            System.setProperty(TabHibernation.HOST_IDLE_PROPERTY, "654321")
+            assertEquals(654_321L, TabHibernation.currentIdleMs(), "value was captured, not re-read")
+        } finally {
+            if (previous == null) {
+                System.clearProperty(TabHibernation.HOST_IDLE_PROPERTY)
+            } else {
+                System.setProperty(TabHibernation.HOST_IDLE_PROPERTY, previous)
+            }
+        }
     }
 
     // endregion
