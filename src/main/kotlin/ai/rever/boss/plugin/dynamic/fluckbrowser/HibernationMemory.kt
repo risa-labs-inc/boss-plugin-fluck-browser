@@ -70,16 +70,43 @@ internal object HibernationMemory {
      * Null rather than 0.0 on purpose. The caller must not read "could not measure" as "out of
      * memory" and start hibernating the user's tabs after a minute.
      */
-    fun availableFraction(): Double? {
-        val total = totalBytes()
-        // Nullable, so that a genuine zero is distinguishable from a failed read. Collapsing both
-        // into 0L meant a machine that really had run out of available memory - the single case
-        // this accelerant exists for - was indistinguishable from an unreadable one, and so was
-        // ignored.
-        val available = availableBytes() ?: return null
-        if (total <= 0L || available < 0L) return null
+    fun availableFraction(): Double? = fraction(availableBytes(), totalForCurrentPlatform())
+
+    /**
+     * Pure ratio, split out so the null propagation and guards are testable.
+     *
+     * [available] is nullable so that a genuine zero stays distinguishable from a failed read.
+     * Collapsing both into 0 meant a machine that really had run out - the single case the
+     * accelerant exists for - looked exactly like one we could not measure, and was ignored.
+     */
+    internal fun fraction(
+        available: Long?,
+        total: Long,
+    ): Double? {
+        if (available == null || available < 0L || total <= 0L) return null
         return (available.toDouble() / total.toDouble()).coerceIn(0.0, 1.0)
     }
+
+    /**
+     * Total to divide by, taken from the **same source** as the numerator.
+     *
+     * On Linux the JDK reports a cgroup-constrained total while `/proc/meminfo` reports the host's,
+     * so mixing them describes two different machines. Under a container limit that pins the ratio
+     * at 1.0 through the clamp, and an accelerant that silently never fires is the exact class of
+     * silent wrongness this file exists to remove.
+     */
+    private fun totalForCurrentPlatform(): Long =
+        if (osName.startsWith("linux")) linuxMemTotalBytes() ?: totalBytes() else totalBytes()
+
+    private fun linuxMemTotalBytes(): Long? =
+        runCatching {
+            val meminfo = File("/proc/meminfo")
+            if (!meminfo.exists()) return@runCatching null
+            parseMemTotalKb(meminfo.readText())?.times(1024L)
+        }.getOrNull()
+
+    /** `MemTotal` in kB from `/proc/meminfo` text, or null when absent. */
+    internal fun parseMemTotalKb(meminfo: String): Long? = parseKb(meminfo, "MemTotal:")
 
     private fun linuxAvailableBytes(): Long? =
         runCatching {
@@ -89,16 +116,30 @@ internal object HibernationMemory {
         }.getOrNull()
 
     /** `MemAvailable` in kB from `/proc/meminfo` text, or null when absent. */
-    internal fun parseMemAvailableKb(meminfo: String): Long? =
+    internal fun parseMemAvailableKb(meminfo: String): Long? = parseKb(meminfo, "MemAvailable:")
+
+    private fun parseKb(
+        meminfo: String,
+        field: String,
+    ): Long? =
         meminfo
             .lineSequence()
-            .firstOrNull { it.startsWith("MemAvailable:") }
+            .firstOrNull { it.startsWith(field) }
             ?.split(Regex("\\s+"))
             ?.getOrNull(1)
             ?.toLongOrNull()
 
     private fun macAvailableBytes(): Long? {
         val now = System.nanoTime()
+        macCache?.takeIf { now - it.takenAtNanos < CACHE_TTL_NANOS }?.let { return it.bytes }
+        // Synchronized on the miss. The TTL is close to the tab wake cadence, so a session's tabs
+        // tend to cross the expiry boundary together - each seeing a stale cache and each forking
+        // vm_stat. A 40-tab session forking 40 processes in one instant is the cost this cache
+        // exists to prevent. Re-checked inside the lock so only the first arrival pays.
+        return synchronized(this) { refreshMacReading(now) }
+    }
+
+    private fun refreshMacReading(now: Long): Long? {
         macCache?.takeIf { now - it.takenAtNanos < CACHE_TTL_NANOS }?.let { return it.bytes }
         // Failures are cached too. On a host where vm_stat consistently fails - sandboxing, a
         // stripped image - caching only successes means forking a process on every evaluation

@@ -204,17 +204,38 @@ class TabHibernationConfigTest {
      * not deferring at all, for both memory and battery.
      */
     @Test
-    fun `unsaved input exempts the tab without polling it`() = runBlocking {
-        var probes = 0
-        var waits = 0
+    fun `unsaved input never hibernates the tab`() = runBlocking {
         val hibernate =
-            TabHibernation.awaitQuiet(
-                probe = { probes++; INPUT },
-                onWait = { waits++ },
-            )
+            TabHibernation.awaitQuiet(probe = { INPUT }, onWait = { }, maxRechecks = 3)
         assertFalse(hibernate, "a tab with unsaved input must not hibernate")
-        assertEquals(0, waits, "an unresolvable condition must not be polled")
-        assertEquals(1, probes, "should decide on the first probe")
+    }
+
+    /**
+     * Re-checked on a long cadence rather than the media one. "Never re-check" was the first
+     * correction and it overshot: a submitted form or a navigation resolves, and none of it would
+     * ever have been noticed, leaving the tab live for the whole session.
+     */
+    @Test
+    fun `unsaved input is re-checked slowly, not polled and not abandoned`() = runBlocking {
+        val waits = mutableListOf<Long>()
+        TabHibernation.awaitQuiet(probe = { INPUT }, onWait = { waits.add(it) }, maxRechecks = 3)
+        assertTrue(waits.isNotEmpty(), "the condition must be revisited at least once")
+        assertTrue(
+            waits.all { it == TabHibernation.UNSAVED_RECHECK_MS },
+            "expected the slow cadence, got $waits",
+        )
+        assertTrue(
+            TabHibernation.UNSAVED_RECHECK_MS > TabHibernation.MAX_RECHECK_MS,
+            "unsaved input must be checked less often than media",
+        )
+    }
+
+    @Test
+    fun `input that gets saved lets the tab hibernate`() = runBlocking {
+        var probes = 0
+        val hibernate =
+            TabHibernation.awaitQuiet(probe = { if (probes++ < 2) INPUT else IDLE }, onWait = { })
+        assertTrue(hibernate, "a resolved form should stop exempting the tab")
     }
 
     /** Rechecks must back off, or a three-hour video costs an eval every 30s for three hours. */
@@ -240,7 +261,9 @@ class TabHibernationConfigTest {
         val hibernate =
             TabHibernation.awaitQuiet(probe = { MEDIA }, onWait = { waits++ }, maxRechecks = 5)
         assertFalse(hibernate, "hibernating here would cut audio mid-play")
-        assertTrue(waits <= 6, "polling was not bounded: $waits")
+        // Exactly maxRechecks, not one more: the last attempt decides without sleeping on a
+        // result already determined, which used to park a live coroutine for up to 5 minutes.
+        assertEquals(5, waits, "expected no sleep on the deciding attempt")
     }
 
     // endregion
@@ -373,10 +396,17 @@ class TabHibernationConfigTest {
     fun `currentIdleMs reflects the host property at the time it is called`() {
         val previous = System.getProperty(TabHibernation.HOST_IDLE_PROPERTY)
         try {
+            // fromEnvironment explicitly null: the env var outranks the property, so a developer
+            // with BOSS_TAB_HIBERNATION_IDLE_MS set would otherwise fail this. The live property
+            // read is still what is being exercised.
             System.setProperty(TabHibernation.HOST_IDLE_PROPERTY, "123456")
-            assertEquals(123_456L, TabHibernation.currentIdleMs())
+            assertEquals(123_456L, TabHibernation.currentIdleMs(fromEnvironment = null))
             System.setProperty(TabHibernation.HOST_IDLE_PROPERTY, "654321")
-            assertEquals(654_321L, TabHibernation.currentIdleMs(), "value was captured, not re-read")
+            assertEquals(
+                654_321L,
+                TabHibernation.currentIdleMs(fromEnvironment = null),
+                "value was captured, not re-read",
+            )
         } finally {
             if (previous == null) {
                 System.clearProperty(TabHibernation.HOST_IDLE_PROPERTY)
@@ -384,6 +414,35 @@ class TabHibernationConfigTest {
                 System.setProperty(TabHibernation.HOST_IDLE_PROPERTY, previous)
             }
         }
+    }
+
+    /**
+     * The ratio's guards, now that it is a pure function. `total <= 0` is an unreadable machine,
+     * and a null numerator is an unreadable reading - neither may present as pressure.
+     */
+    @Test
+    fun `the available fraction guards its inputs`() {
+        assertNull(HibernationMemory.fraction(available = null, total = 100L))
+        assertNull(HibernationMemory.fraction(available = 50L, total = 0L))
+        assertNull(HibernationMemory.fraction(available = 50L, total = -1L))
+        assertNull(HibernationMemory.fraction(available = -1L, total = 100L))
+        assertEquals(0.5, HibernationMemory.fraction(available = 50L, total = 100L))
+        assertEquals(0.0, HibernationMemory.fraction(available = 0L, total = 100L))
+        // Clamped: a cgroup-limited total can be smaller than a host-wide MemAvailable.
+        assertEquals(1.0, HibernationMemory.fraction(available = 500L, total = 100L))
+    }
+
+    /**
+     * Numerator and denominator must come from the same place. The JDK reports a cgroup-limited
+     * total while /proc/meminfo reports the host's, and mixing them pins the ratio at 1.0 through
+     * the clamp - an accelerant that silently never fires.
+     */
+    @Test
+    fun `MemTotal is readable from the same meminfo text as MemAvailable`() {
+        val meminfo = "MemTotal:       32000000 kB\nMemAvailable:   20000000 kB"
+        assertEquals(32_000_000L, HibernationMemory.parseMemTotalKb(meminfo))
+        assertEquals(20_000_000L, HibernationMemory.parseMemAvailableKb(meminfo))
+        assertNull(HibernationMemory.parseMemTotalKb("MemFree: 1 kB"))
     }
 
     // endregion

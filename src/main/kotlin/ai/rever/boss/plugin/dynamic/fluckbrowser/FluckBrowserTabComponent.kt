@@ -709,11 +709,12 @@ internal object TabHibernation {
      * [TabHibernation] before the host published - a load-order dependency with no error and no
      * log line, which is the failure mode this file is otherwise written against.
      */
-    fun currentIdleMs(): Long =
-        resolveIdleMs(
-            fromEnvironment = System.getenv("BOSS_TAB_HIBERNATION_IDLE_MS"),
-            fromHost = System.getProperty(HOST_IDLE_PROPERTY),
-        )
+    fun currentIdleMs(
+        // Injectable for the same reason accelerate()'s thresholds are: reading the env var
+        // straight from here made the test that pins this read fail on any machine that had
+        // BOSS_TAB_HIBERNATION_IDLE_MS set, which is precisely the developer running it.
+        fromEnvironment: String? = System.getenv("BOSS_TAB_HIBERNATION_IDLE_MS"),
+    ): Long = resolveIdleMs(fromEnvironment, System.getProperty(HOST_IDLE_PROPERTY))
 
     /** Pure, so `TabHibernationConfigTest` can pin the opt-out without an environment. */
     internal fun resolveEnabled(raw: String?): Boolean {
@@ -812,6 +813,12 @@ internal object TabHibernation {
      * non-trivial amount of text and living inside a real `<form>`. Search boxes, empty fields and
      * `onbeforeunload` no longer count.
      *
+     * Every field must also be **rendered** and differ from its default. Without those two the
+     * password clause walked straight back into the same failure: a manager-autofilled password is
+     * non-empty without anyone typing, and a `display:none` login form left in the DOM of an
+     * authenticated SPA qualifies just as well - which under a permanent exemption meant the tab
+     * kept its whole Chromium process tree for the session.
+     *
      * **Known gaps**, all toward hibernating when perhaps it should not: only the top document is
      * visible, so cross-origin iframes are missed; pure Web Audio playback has no media element to
      * find; `contenteditable` regions and framework state held outside form elements are unseen.
@@ -844,9 +851,12 @@ internal object TabHibernation {
      *    JS eval every 30 seconds for three hours, and gives up after [MAX_RECHECKS] - at which
      *    point the tab is **left alone**, not hibernated. Cutting audio is the thing being
      *    avoided; a bound on polling must not become a licence to do it anyway.
-     *  - [BusyState.UNSAVED_INPUT] may never resolve, so there is nothing to wait for. Return
-     *    immediately without hibernating and without polling. The tab is exempt until the user
-     *    visits it again, which re-arms a fresh timer on the way out.
+     *  - [BusyState.UNSAVED_INPUT] may never resolve, so it is re-checked on a much longer
+     *    [UNSAVED_RECHECK_MS] cadence rather than the media one. "Never wait" was the first
+     *    correction and it overshot: a form gets submitted, a page navigates away, an SPA clears
+     *    its draft - all resolve, and none would ever have been noticed, leaving the tab live for
+     *    the session. One eval per tab per half hour is nothing like the 30-second loop that made
+     *    the original version worse than no deferral at all.
      *
      * Pure but for the two callbacks, so the policy is testable without a browser.
      */
@@ -855,18 +865,26 @@ internal object TabHibernation {
         onWait: suspend (Long) -> Unit,
         maxRechecks: Int = MAX_RECHECKS,
     ): Boolean {
-        var interval = MEDIA_RECHECK_MS
-        repeat(maxRechecks + 1) {
-            when (probe()) {
-                BusyState.IDLE -> return true
-                BusyState.UNSAVED_INPUT -> return false
-                BusyState.PLAYING_MEDIA -> {
-                    onWait(interval)
-                    interval = (interval * 2).coerceAtMost(MAX_RECHECK_MS)
+        var mediaInterval = MEDIA_RECHECK_MS
+        repeat(maxRechecks + 1) { attempt ->
+            val interval =
+                when (probe()) {
+                    BusyState.IDLE -> return true
+
+                    BusyState.UNSAVED_INPUT -> UNSAVED_RECHECK_MS
+
+                    BusyState.PLAYING_MEDIA -> {
+                        mediaInterval.also {
+                            mediaInterval = (mediaInterval * 2).coerceAtMost(MAX_RECHECK_MS)
+                        }
+                    }
                 }
-            }
+            // Checked before sleeping, not after. Sleeping on the final attempt parked a live
+            // coroutine for up to MAX_RECHECK_MS on a result already decided.
+            if (attempt == maxRechecks) return false
+            onWait(interval)
         }
-        // Still playing after the last recheck. Leave it be rather than cut the audio.
+        // Still busy after the last recheck. Leave it be rather than cut audio or drop typing.
         return false
     }
 
@@ -877,8 +895,17 @@ internal object TabHibernation {
 
     internal const val MAX_RECHECK_MS = 5 * 60_000L
 
-    /** After this many rechecks a still-audible tab is left alone rather than polled forever. */
+    /** After this many rechecks a still-busy tab is left alone rather than polled forever. */
     internal const val MAX_RECHECKS = 40
+
+    /**
+     * Gap between re-checks of a tab holding unsaved typing.
+     *
+     * Deliberately far longer than the media cadence: this condition may never resolve, so the
+     * cost of checking has to be negligible per tab. Half an hour is one eval per tab per half
+     * hour even across a large session.
+     */
+    internal const val UNSAVED_RECHECK_MS = 30 * 60_000L
 
     /** Minimum typed characters before a single-line field counts as unsaved work. */
     private const val MIN_MEANINGFUL_INPUT = 12
@@ -889,14 +916,17 @@ internal object TabHibernation {
             "if(q('video,audio').some(function(m){" +
             "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
             "})) return 'media';" +
+            "var shown=function(f){" +
+            "return !(f.offsetParent === null && f.getClientRects().length === 0);};" +
             "var dirty=q('textarea').some(function(f){" +
-            "return !f.disabled && !f.readOnly && (f.value||'').trim().length > 0 " +
+            "return !f.disabled && !f.readOnly && shown(f) && (f.value||'').trim().length > 0 " +
             "&& (f.value||'') !== (f.defaultValue||'');" +
             "});" +
             "if(!dirty) dirty=q('input').some(function(f){" +
-            "if(f.disabled || f.readOnly) return false;" +
+            "if(f.disabled || f.readOnly || !shown(f)) return false;" +
             "var t=(f.type||'text').toLowerCase();" +
-            "if(t==='password') return (f.value||'').length > 0;" +
+            "if(t==='password') return (f.value||'') !== (f.defaultValue||'') " +
+            "&& (f.value||'').length > 0;" +
             "if(t!=='text' && t!=='email' && t!=='tel' && t!=='url' && t!=='number') return false;" +
             "if(!f.form) return false;" +
             "return (f.value||'') !== (f.defaultValue||'') " +
