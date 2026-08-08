@@ -743,11 +743,17 @@ internal object TabHibernation {
             ?: 60_000L
     // Named for what it now compares. The env var keeps its old spelling for compatibility, but
     // the field used to hold a *free*-pages fraction, which is the metric this change proved wrong.
-    // Clamped: an unclamped 2 makes the accelerant permanent, which is precisely the bug this
-    // change removed, reachable again by configuration. Same non-positive guard as the timeouts.
+    // Rejected, not clamped. coerceIn(0.0, 1.0) turned a nonsensical 2 into 1.0 - and since
+    // availableFraction is itself clamped to that range, `available < 1.0` is true on essentially
+    // every machine, so the accelerant stayed permanent and the clamp merely relabelled the bug it
+    // claimed to fix. A value outside (0, 1) is not an instruction, so fall through to the default.
+    //
+    // Note this is stricter than the timeouts' `> 0` guard in one direction: 0 is rejected here
+    // rather than accepted as "never accelerate". Turning the accelerant off is what
+    // BOSS_TAB_HIBERNATION_PRESSURE_IDLE_MS equal to the baseline is for.
     private val pressureAvailableFraction: Double =
         System.getenv("BOSS_TAB_HIBERNATION_PRESSURE_FRACTION")?.trim()?.toDoubleOrNull()
-            ?.coerceIn(0.0, 1.0) ?: 0.15
+            ?.takeIf { it > 0.0 && it < 1.0 } ?: 0.15
 
     // Battery-aware (roadmap Phase 2). On battery, hibernate idle background tabs sooner to save
     // power. The AC/battery signal is detected in the host (PowerSource) and published to the
@@ -829,11 +835,13 @@ internal object TabHibernation {
     suspend fun busyState(handle: BrowserHandle): BusyState =
         try {
             withContext(Dispatchers.IO) {
-                when (withTimeoutOrNull(BUSY_CHECK_TIMEOUT_MS) { handle.executeJavaScript(BUSY_SCRIPT) }) {
-                    "media" -> BusyState.PLAYING_MEDIA
-                    "input" -> BusyState.UNSAVED_INPUT
-                    else -> BusyState.IDLE
-                }
+                // The 2s bound is advisory, not a guarantee: withTimeoutOrNull can only abandon a
+                // call that suspends, and if executeJavaScript blocks internally this IO thread
+                // stays parked until the renderer answers. Hence Dispatchers.IO rather than the
+                // caller's Main - a wedged renderer must not take the UI with it.
+                busyStateFromScriptResult(
+                    withTimeoutOrNull(BUSY_CHECK_TIMEOUT_MS) { handle.executeJavaScript(BUSY_SCRIPT) },
+                )
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -887,6 +895,24 @@ internal object TabHibernation {
         // Still busy after the last recheck. Leave it be rather than cut audio or drop typing.
         return false
     }
+
+    /**
+     * Maps the raw script result to a state.
+     *
+     * Separate and pure because it is the one link in this chain with no other coverage - the
+     * policy is tested against a fake probe, and the script itself cannot be unit-tested without a
+     * JS engine - and because its failure is silent and points the wrong way: anything unexpected
+     * reads as [BusyState.IDLE], which hibernates a tab that may be mid-playback, with no error
+     * and no log line. `executeJavaScript` returns `Any?`, so a wrapper type or a quoted JSON
+     * string would otherwise collapse every branch. Normalising first is cheap insurance against a
+     * marshalling change nobody would notice. Mirrors `middleClickUrlFromScriptResult` above.
+     */
+    internal fun busyStateFromScriptResult(result: Any?): BusyState =
+        when (result?.toString()?.trim()?.trim('"')?.lowercase()) {
+            "media" -> BusyState.PLAYING_MEDIA
+            "input" -> BusyState.UNSAVED_INPUT
+            else -> BusyState.IDLE
+        }
 
     private const val BUSY_CHECK_TIMEOUT_MS = 2_000L
 
@@ -1665,7 +1691,7 @@ internal fun FluckBrowserTabContent(
     // reload on the next switch back. The handle is owned by the parent Component and disposed in
     // its lifecycle.onDestroy callback (i.e. only on tab close).
     //
-    // Tab hibernation (memory saver), gated off by default. When a tab is backgrounded (this
+    // Tab hibernation (memory saver), on by default. When a tab is backgrounded (this
     // Composable leaves composition on a tab switch), arm an idle timer on the Component's
     // surviving coroutineScope; if the tab is still in the background when it fires, dispose the
     // live browser to free its Chromium process tree. The hoisted state (current URL, title,
@@ -1702,7 +1728,14 @@ internal fun FluckBrowserTabContent(
                             },
                             onWait = { delay(it) },
                         )
-                    if (!mayHibernate) return@launch
+                    if (!mayHibernate) {
+                        // Logged because this whole feature is an argument against silent
+                        // outcomes, and "my 40 tabs never released memory" is otherwise
+                        // indistinguishable in the field from "hibernation is broken".
+                        println("[FluckBrowser] Hibernation skipped: tab still busy")
+                        return@launch
+                    }
+                    println("[FluckBrowser] Hibernating idle tab to release its renderer")
                     val handle = browserHandle
                     browserHandle = null
                     isInitializing = true

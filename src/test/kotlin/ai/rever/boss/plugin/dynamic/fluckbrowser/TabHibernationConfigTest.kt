@@ -445,5 +445,30 @@ class TabHibernationConfigTest {
         assertNull(HibernationMemory.parseMemTotalKb("MemFree: 1 kB"))
     }
 
+    /**
+     * The only link in the probe chain with no other coverage, and its failure points the wrong
+     * way: anything unexpected reads as IDLE, which hibernates a tab that may be mid-playback,
+     * with no error and no log line. `executeJavaScript` returns `Any?`, so a marshalling change
+     * that wrapped or quoted the string would silently collapse every branch.
+     */
+    @Test
+    fun `the script result maps to a state, tolerating how it is marshalled`() {
+        assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("media"))
+        assertEquals(INPUT, TabHibernation.busyStateFromScriptResult("input"))
+        // Quoted, padded and differently-cased forms all still resolve.
+        assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("\"media\""))
+        assertEquals(INPUT, TabHibernation.busyStateFromScriptResult("  input  "))
+        assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("MEDIA"))
+    }
+
+    @Test
+    fun `an absent or unrecognized script result reads as idle`() {
+        assertEquals(IDLE, TabHibernation.busyStateFromScriptResult(""))
+        assertEquals(IDLE, TabHibernation.busyStateFromScriptResult(null))
+        assertEquals(IDLE, TabHibernation.busyStateFromScriptResult(false))
+        assertEquals(IDLE, TabHibernation.busyStateFromScriptResult(42))
+        assertEquals(IDLE, TabHibernation.busyStateFromScriptResult("undefined"))
+    }
+
     // endregion
 }

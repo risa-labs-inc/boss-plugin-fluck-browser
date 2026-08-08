@@ -18,12 +18,21 @@ import java.io.File
  */
 internal object HibernationMemory {
     /**
-     * How long a macOS `vm_stat` reading may be reused.
+     * How long a reading may be reused, on **every** platform.
      *
-     * `effectiveIdleMs()` is called once per tab backgrounding, which is user-paced, so this is
-     * about bursts (restoring a session, closing a split) rather than a poll loop.
+     * Deliberately longer than `TabHibernation.PRESSURE_RECHECK_CHUNK_MS`. The two used to be
+     * exactly equal, which sounds like a match and guarantees the opposite: the cached value is
+     * always just-expired when the next chunk wakes, so a single backgrounded tab forked
+     * `/usr/bin/vm_stat` every 30 seconds for its whole idle window - precisely what the cache
+     * exists to prevent. A longer TTL makes a hit actually possible.
+     *
+     * This started as a macOS-only cache sized for bursts (restoring a session, closing a split).
+     * The chunked re-evaluation in `TabHibernation.awaitIdleWindow` turned it into a poll loop,
+     * which is what it is now sized for.
      */
-    private const val CACHE_TTL_NANOS = 30_000L * 1_000_000L
+    internal const val CACHE_TTL_MS = 60_000L
+
+    private const val CACHE_TTL_NANOS = CACHE_TTL_MS * 1_000_000L
 
     private const val VM_STAT_TIMEOUT_SECONDS = 5L
 
@@ -33,44 +42,74 @@ internal object HibernationMemory {
 
     private val osName: String = System.getProperty("os.name").orEmpty().lowercase()
 
-    /** [bytes] is null for a reading that failed, which is cached like any other. */
-    private data class Reading(val bytes: Long?, val takenAtNanos: Long)
+    /** [fraction] is null for a reading that failed, which is cached like any other. */
+    private data class Reading(val fraction: Double?, val takenAtNanos: Long)
 
     @Volatile
-    private var macCache: Reading? = null
+    private var cache: Reading? = null
 
     /** Total installed RAM in bytes, or 0 when unreadable. */
     fun totalBytes(): Long = osBean?.totalMemorySize?.takeIf { it > 0L } ?: 0L
 
     /**
-     * Memory available without evicting the user's working set, or **null** when it cannot be read.
+     * Available memory as a fraction of total, or null when either reading failed.
      *
-     * The platform branch is **total**: on a known platform an unreadable value stays null rather
-     * than falling back to `freeMemorySize`, which would reintroduce exactly the bug above
-     * whenever `vm_stat` was slow or unavailable.
+     * Cached on **every** platform, not just macOS. The Linux path reads and parses
+     * `/proc/meminfo`, and before this it did so twice per call - once for `MemAvailable`, once
+     * for `MemTotal` - with no cache at all. A 40-tab session meant 80 file reads every 30 seconds
+     * for the whole idle window, while the comment at the call site claimed re-asking was nearly
+     * free.
      *
-     * Null and not 0, so a machine that genuinely has no memory available - the one case the
-     * accelerant exists for - stays distinguishable from one whose memory we could not read.
+     * Null rather than 0.0 on purpose. The caller must not read "could not measure" as "out of
+     * memory" and start hibernating the user's tabs after a minute.
      */
-    fun availableBytes(): Long? =
+    fun availableFraction(): Double? {
+        val now = System.nanoTime()
+        cache?.takeIf { now - it.takenAtNanos < CACHE_TTL_NANOS }?.let { return it.fraction }
+        // Synchronized on the miss. Tabs wake on roughly the cache cadence, so a session's tabs
+        // tend to cross the expiry boundary together - each seeing a stale cache and each taking
+        // its own reading. Re-checked inside the lock so only the first arrival pays.
+        return synchronized(this) { refresh(now) }
+    }
+
+    private fun refresh(now: Long): Double? {
+        cache?.takeIf { now - it.takenAtNanos < CACHE_TTL_NANOS }?.let { return it.fraction }
+        val reading = measureFraction()
+        cache = Reading(reading, now)
+        return reading
+    }
+
+    /**
+     * Takes a fresh reading, with numerator and denominator from the **same source**.
+     *
+     * On Linux both come out of one `/proc/meminfo` read: the JDK reports a cgroup-constrained
+     * total while the file reports the host's, and mixing them describes two different machines.
+     *
+     * That makes the ratio self-consistent rather than container-accurate - in an unmodified
+     * container `/proc/meminfo` still reports the host, so this describes the host. Reading
+     * `memory.max` from the cgroup would be the actual container figure, if that case ever proves
+     * worth handling.
+     */
+    private fun measureFraction(): Double? =
         when {
-            osName.startsWith("linux") -> linuxAvailableBytes()
-            osName.startsWith("mac") -> macAvailableBytes()
+            osName.startsWith("linux") -> {
+                val meminfo = readMeminfo()
+                fraction(
+                    available = meminfo?.let { parseMemAvailableKb(it) }?.times(1024L),
+                    total = meminfo?.let { parseMemTotalKb(it) }?.times(1024L) ?: totalBytes(),
+                )
+            }
+
+            osName.startsWith("mac") -> fraction(vmStatBytes(), totalBytes())
+
             // Windows only: ullAvailPhys already means "available" rather than "untouched".
-            osName.startsWith("windows") -> osBean?.freeMemorySize?.takeIf { it >= 0L }
+            osName.startsWith("windows") -> fraction(osBean?.freeMemorySize, totalBytes())
+
             // Anything else - FreeBSD, Solaris, an unrecognized name - is unknown rather than
             // freeMemorySize. Using the JDK reading there would reintroduce the free-vs-available
             // bug this class exists to fix, on exactly the platforms nobody is testing.
             else -> null
         }
-
-    /**
-     * Available memory as a fraction of total, or null when either reading failed.
-     *
-     * Null rather than 0.0 on purpose. The caller must not read "could not measure" as "out of
-     * memory" and start hibernating the user's tabs after a minute.
-     */
-    fun availableFraction(): Double? = fraction(availableBytes(), totalForCurrentPlatform())
 
     /**
      * Pure ratio, split out so the null propagation and guards are testable.
@@ -87,36 +126,17 @@ internal object HibernationMemory {
         return (available.toDouble() / total.toDouble()).coerceIn(0.0, 1.0)
     }
 
-    /**
-     * Total to divide by, taken from the **same source** as the numerator.
-     *
-     * On Linux the JDK reports a cgroup-constrained total while `/proc/meminfo` reports the host's,
-     * so mixing them describes two different machines. Under a container limit that pins the ratio
-     * at 1.0 through the clamp, and an accelerant that silently never fires is the exact class of
-     * silent wrongness this file exists to remove.
-     */
-    private fun totalForCurrentPlatform(): Long =
-        if (osName.startsWith("linux")) linuxMemTotalBytes() ?: totalBytes() else totalBytes()
-
-    private fun linuxMemTotalBytes(): Long? =
+    private fun readMeminfo(): String? =
         runCatching {
             val meminfo = File("/proc/meminfo")
-            if (!meminfo.exists()) return@runCatching null
-            parseMemTotalKb(meminfo.readText())?.times(1024L)
-        }.getOrNull()
-
-    /** `MemTotal` in kB from `/proc/meminfo` text, or null when absent. */
-    internal fun parseMemTotalKb(meminfo: String): Long? = parseKb(meminfo, "MemTotal:")
-
-    private fun linuxAvailableBytes(): Long? =
-        runCatching {
-            val meminfo = File("/proc/meminfo")
-            if (!meminfo.exists()) return@runCatching null
-            parseMemAvailableKb(meminfo.readText())?.times(1024L)
+            if (meminfo.exists()) meminfo.readText() else null
         }.getOrNull()
 
     /** `MemAvailable` in kB from `/proc/meminfo` text, or null when absent. */
     internal fun parseMemAvailableKb(meminfo: String): Long? = parseKb(meminfo, "MemAvailable:")
+
+    /** `MemTotal` in kB from `/proc/meminfo` text, or null when absent. */
+    internal fun parseMemTotalKb(meminfo: String): Long? = parseKb(meminfo, "MemTotal:")
 
     private fun parseKb(
         meminfo: String,
@@ -128,26 +148,6 @@ internal object HibernationMemory {
             ?.split(Regex("\\s+"))
             ?.getOrNull(1)
             ?.toLongOrNull()
-
-    private fun macAvailableBytes(): Long? {
-        val now = System.nanoTime()
-        macCache?.takeIf { now - it.takenAtNanos < CACHE_TTL_NANOS }?.let { return it.bytes }
-        // Synchronized on the miss. The TTL is close to the tab wake cadence, so a session's tabs
-        // tend to cross the expiry boundary together - each seeing a stale cache and each forking
-        // vm_stat. A 40-tab session forking 40 processes in one instant is the cost this cache
-        // exists to prevent. Re-checked inside the lock so only the first arrival pays.
-        return synchronized(this) { refreshMacReading(now) }
-    }
-
-    private fun refreshMacReading(now: Long): Long? {
-        macCache?.takeIf { now - it.takenAtNanos < CACHE_TTL_NANOS }?.let { return it.bytes }
-        // Failures are cached too. On a host where vm_stat consistently fails - sandboxing, a
-        // stripped image - caching only successes means forking a process on every evaluation
-        // forever, which is the cost this cache exists to avoid.
-        val reading = vmStatBytes()
-        macCache = Reading(reading, now)
-        return reading
-    }
 
     private fun vmStatBytes(): Long? =
         runCatching {
