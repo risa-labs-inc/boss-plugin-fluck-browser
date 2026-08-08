@@ -11,6 +11,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -103,16 +104,19 @@ class FluckBrowserFullscreenStateTest {
     @Test
     fun `releasing fullscreen state without a handle clears it safely`() {
         val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
         state.markFullscreenEntered()
+        assertNotNull(state.releaseBrowserHandle())
 
+        // Second release: fullscreen already cleared, handle already gone.
         assertNull(state.releaseBrowserHandle())
-
         assertFalse(state.isInFullscreen)
     }
 
     @Test
     fun `adopting a replacement handle clears stale fullscreen state`() {
         val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
         state.markFullscreenEntered()
         val replacement = fakeHandle()
 
@@ -153,14 +157,19 @@ class FluckBrowserFullscreenStateTest {
     }
 
     @Test
-    fun `exit request clears stale placeholder when no handle exists`() = runTest {
+    fun `a late host enter cannot resurrect fullscreen after release`() = runTest {
         val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
+        state.markFullscreenEntered()
+        assertTrue(state.isInFullscreen)
+
+        // Hibernation or crash recovery takes the handle, and the enter callback the host
+        // queued before that lands afterwards on the Component scope.
+        state.releaseBrowserHandle()
         state.markFullscreenEntered()
 
-        val requested = state.requestExitFullscreen(this)
-
-        assertFalse(requested)
         assertFalse(state.isInFullscreen)
+        assertNull(state.browserHandle)
     }
 
     @Test
@@ -176,15 +185,75 @@ class FluckBrowserFullscreenStateTest {
     }
 
     @Test
-    fun `exit request clears placeholder when host request throws`() = runTest {
+    fun `a throwing but live handle goes to FAILED, not a local restore`() = runTest {
         val state = FluckBrowserTabState()
-        state.adoptBrowserHandle(fakeHandle(exitFailure = IllegalStateException("stale handle")))
+        state.adoptBrowserHandle(fakeHandle(exitFailure = IllegalStateException("wedged")))
         state.markFullscreenEntered()
 
         val requested = state.requestExitFullscreen(this)
 
+        // isValid is still true, so this is evidence of a wedged host rather than a gone one.
+        // Restoring the tab here would compose a second parent for a view the host may hold.
         assertFalse(requested)
+        assertTrue(state.isInFullscreen)
+        assertEquals(FullscreenExitPhase.FAILED, state.fullscreenExitPhase)
+    }
+
+    @Test
+    fun `a throwing AND invalid handle is still treated as dead`() = runTest {
+        val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(
+            fakeHandle(isValid = { false }, exitFailure = IllegalStateException("gone")),
+        )
+        state.markFullscreenEntered()
+
+        assertFalse(state.requestExitFullscreen(this))
+
         assertFalse(state.isInFullscreen)
+    }
+
+    @Test
+    fun `fullscreen cannot be entered without a handle`() = runTest {
+        val state = FluckBrowserTabState()
+
+        // A late host callback marshalled onto the Component scope, landing after hibernation
+        // or crash recovery already released the handle. Fullscreen here would be unexitable,
+        // and the content `when` has no else branch to fall back to.
+        state.markFullscreenEntered()
+
+        assertFalse(state.isInFullscreen)
+    }
+
+    @Test
+    fun `a handle swap clears a failed exit phase`() = runTest {
+        val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
+        state.markFullscreenEntered()
+        assertTrue(state.requestExitFullscreen(this))
+        advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
+        runCurrent()
+        assertEquals(FullscreenExitPhase.FAILED, state.fullscreenExitPhase)
+
+        // The phase gates both the debounce and which affordances render, so a stale FAILED
+        // surviving a swap would be user-visible on a healthy new handle.
+        state.adoptBrowserHandle(fakeHandle())
+
+        assertEquals(FullscreenExitPhase.IDLE, state.fullscreenExitPhase)
+    }
+
+    @Test
+    fun `releasing the handle clears a failed exit phase`() = runTest {
+        val state = FluckBrowserTabState()
+        state.adoptBrowserHandle(fakeHandle())
+        state.markFullscreenEntered()
+        assertTrue(state.requestExitFullscreen(this))
+        advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
+        runCurrent()
+        assertEquals(FullscreenExitPhase.FAILED, state.fullscreenExitPhase)
+
+        state.releaseBrowserHandle()
+
+        assertEquals(FullscreenExitPhase.IDLE, state.fullscreenExitPhase)
     }
 
     @Test

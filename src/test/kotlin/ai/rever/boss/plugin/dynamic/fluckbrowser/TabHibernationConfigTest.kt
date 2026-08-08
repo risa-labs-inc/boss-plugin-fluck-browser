@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import ai.rever.boss.plugin.browser.BrowserHandle
+import java.lang.reflect.Proxy
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -269,12 +271,42 @@ class TabHibernationConfigTest {
      */
     @Test
     fun `fullscreen outranks the page probe, and a missing handle is idle`() = runBlocking {
+        // The live handle is the load-bearing half: it errors on every unstubbed call, so
+        // reaching FULLSCREEN proves the page was never probed. A null handle alone cannot
+        // tell "fullscreen wins" from "there was nobody to ask".
+        val exploding =
+            Proxy.newProxyInstance(
+                BrowserHandle::class.java.classLoader,
+                arrayOf(BrowserHandle::class.java),
+            ) { _, method, _ -> error("busyStateFor probed the page: ${method.name}") }
+                as BrowserHandle
+        assertEquals(FULLSCREEN, TabHibernation.busyStateFor(isInFullscreen = true, handle = exploding))
         assertEquals(
             FULLSCREEN,
             TabHibernation.busyStateFor(isInFullscreen = true, handle = null),
             "a null handle must not stop fullscreen being reported",
         )
         assertEquals(IDLE, TabHibernation.busyStateFor(isInFullscreen = false, handle = null))
+    }
+
+    /**
+     * The per-reason reset must not cost the global bound. A tab that alternates - toggling
+     * fullscreen on an audible video - resets the per-reason budget on every iteration, so
+     * without a total ceiling the loop never terminates and the interval never climbs past its
+     * first doubling.
+     */
+    @Test
+    fun `an alternating tab still terminates`() = runBlocking {
+        var probes = 0
+        var waits = 0
+        val hibernate =
+            TabHibernation.awaitQuiet(
+                probe = { if (probes++ % 2 == 0) FULLSCREEN else MEDIA },
+                onWait = { waits++ },
+                maxRechecks = 4,
+            )
+        assertTrue(hibernate != IDLE, "an always-busy tab must not be hibernated")
+        assertTrue(waits <= 4 * 2, "expected the total ceiling to stop the loop, got $waits waits")
     }
 
     /**

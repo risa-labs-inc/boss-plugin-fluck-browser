@@ -44,6 +44,9 @@ never ran.
 - **It never cuts audio.** A tab playing video or audio is re-checked rather than hibernated, and
   a tab still playing after about three hours is left alone entirely. Known gaps: playback inside
   a cross-origin iframe, and pure Web Audio with no media element, are not visible to the check.
+- **It never hibernates a fullscreen video.** A tab whose video is playing fullscreen in its own
+  window is waited out like an audible one, muted or not - the audio check alone could not see it,
+  because it asks the page and the page does not know which window it is being shown in.
 - **It does reload the page.** Anything the page has not saved - a half-written form, scroll
   position, in-page state - is discarded, the same way Chrome's own memory saver behaves. If that
   matters for how you work, turn it off with the variable below.
