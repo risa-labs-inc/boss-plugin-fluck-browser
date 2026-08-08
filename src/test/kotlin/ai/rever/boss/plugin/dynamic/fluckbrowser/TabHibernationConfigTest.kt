@@ -174,11 +174,12 @@ class TabHibernationConfigTest {
 
     private val IDLE = TabHibernation.BusyState.IDLE
     private val MEDIA = TabHibernation.BusyState.PLAYING_MEDIA
+    private val FULLSCREEN = TabHibernation.BusyState.FULLSCREEN
 
     @Test
     fun `an idle tab hibernates immediately`() = runBlocking {
         var waits = 0
-        assertTrue(TabHibernation.awaitQuiet(probe = { IDLE }, onWait = { waits++ }))
+        assertEquals(IDLE, TabHibernation.awaitQuiet(probe = { IDLE }, onWait = { waits++ }))
         assertEquals(0, waits, "an idle tab should not have waited")
     }
 
@@ -191,8 +192,60 @@ class TabHibernationConfigTest {
                 probe = { if (probes++ < 3) MEDIA else IDLE },
                 onWait = { waits.add(it) },
             )
-        assertTrue(hibernate, "a tab that went quiet should hibernate")
+        assertEquals(IDLE, hibernate, "a tab that went quiet should hibernate")
         assertEquals(3, waits.size)
+    }
+
+    /**
+     * Fullscreen must be waited out exactly like audio. It rides the same path only via
+     * `!= IDLE`, so a later `if (busy == PLAYING_MEDIA)` special case would silently start
+     * hibernating tabs mid-video again with nothing else failing.
+     */
+    @Test
+    fun `a fullscreen tab is waited out, then hibernates once it exits`() = runBlocking {
+        var probes = 0
+        val waits = mutableListOf<Long>()
+        val hibernate =
+            TabHibernation.awaitQuiet(
+                probe = { if (probes++ < 2) FULLSCREEN else IDLE },
+                onWait = { waits.add(it) },
+            )
+        assertEquals(IDLE, hibernate, "a tab that left fullscreen should hibernate")
+        assertEquals(2, waits.size)
+    }
+
+    @Test
+    fun `a tab still in fullscreen at the recheck limit is left alone`() = runBlocking {
+        val hibernate =
+            TabHibernation.awaitQuiet(probe = { FULLSCREEN }, onWait = {}, maxRechecks = 3)
+        // The terminal state is returned, not just "no", so the log line cannot drift from
+        // what was actually decided.
+        assertEquals(FULLSCREEN, hibernate)
+    }
+
+    /**
+     * The backoff and the budget are both there to bound the cost of probing an *audible* page.
+     * Carrying either across a change of reason charges the new reason for the old one's waits -
+     * and can hand a newly audible tab an already-spent budget, exempting it for no reason.
+     */
+    @Test
+    fun `a changed reason restarts the backoff and the budget`() = runBlocking {
+        var probes = 0
+        val waits = mutableListOf<Long>()
+        val hibernate =
+            TabHibernation.awaitQuiet(
+                // Four fullscreen rechecks would exhaust maxRechecks = 4 on their own; the
+                // switch to audio must hand it a fresh budget rather than a spent one.
+                probe = { if (probes++ < 4) FULLSCREEN else if (probes < 8) MEDIA else IDLE },
+                onWait = { waits.add(it) },
+                maxRechecks = 4,
+            )
+        assertEquals(IDLE, hibernate, "the budget should have restarted at the switch")
+        assertEquals(
+            TabHibernation.MEDIA_RECHECK_MS,
+            waits[4],
+            "the first wait after the reason changed should be back at the floor: $waits",
+        )
     }
 
     /** Rechecks must back off, or a three-hour video costs an eval every 30s for three hours. */
@@ -209,6 +262,22 @@ class TabHibernationConfigTest {
     }
 
     /**
+     * Fullscreen has to win over the page probe, and be answered without one. The JS probe runs
+     * inside the document, which cannot see which window the host is rendering it into, so asking
+     * it about fullscreen would be asking the wrong component - and on a null handle there is
+     * nobody to ask at all.
+     */
+    @Test
+    fun `fullscreen outranks the page probe, and a missing handle is idle`() = runBlocking {
+        assertEquals(
+            FULLSCREEN,
+            TabHibernation.busyStateFor(isInFullscreen = true, handle = null),
+            "a null handle must not stop fullscreen being reported",
+        )
+        assertEquals(IDLE, TabHibernation.busyStateFor(isInFullscreen = false, handle = null))
+    }
+
+    /**
      * A bound on polling must not become a licence to cut the audio. When a tab is *still* playing
      * after the last recheck, the answer is to leave it alone - not to hibernate it anyway.
      */
@@ -217,7 +286,7 @@ class TabHibernationConfigTest {
         var waits = 0
         val hibernate =
             TabHibernation.awaitQuiet(probe = { MEDIA }, onWait = { waits++ }, maxRechecks = 5)
-        assertFalse(hibernate, "hibernating here would cut audio mid-play")
+        assertEquals(MEDIA, hibernate, "hibernating here would cut audio mid-play")
         // Exactly maxRechecks, not one more: the last attempt decides without sleeping on a
         // result already determined, which used to park a live coroutine for up to 5 minutes.
         assertEquals(5, waits, "expected no sleep on the deciding attempt")
