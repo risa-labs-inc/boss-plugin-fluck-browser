@@ -171,8 +171,9 @@ class FluckBrowserTabComponent(
             callbacks = object : Callbacks {
                 override fun onDestroy() {
                     BrowserShareManager.unregisterTab(config.id)
-                    val handle = state.browserHandle
-                    state.browserHandle = null
+                    // Also asks the host to leave fullscreen, so closing a tab mid-video
+                    // cannot leave its detached fullscreen window on screen.
+                    val handle = state.releaseBrowserHandle()
                     // Off the UI thread so closing a tab never hitches the app.
                     if (handle != null) disposeBrowserHandleOffThread(handle)
                     // Adopt any in-flight (or completed-but-unconsumed) creation:
@@ -806,6 +807,15 @@ internal object TabHibernation {
 
         /** Audible playback. Transient by nature: wait, and it will stop. */
         PLAYING_MEDIA,
+
+        /**
+         * Video is fullscreen in a detached host window. Known locally rather than probed:
+         * the tab Composable is out of composition, so "backgrounded" says nothing about
+         * whether the user is watching. Transient like [PLAYING_MEDIA], and waited out the
+         * same way - hibernating here would dispose the handle out from under the window
+         * the user is actually looking at.
+         */
+        FULLSCREEN,
     }
 
     /**
@@ -863,13 +873,20 @@ internal object TabHibernation {
     /**
      * Waits for a backgrounded tab to become quiet. Returns true when it should now hibernate.
      *
-     * The two busy states get opposite treatment, which is the whole point of distinguishing them:
+     * Busy states are distinguished for their reason strings; both non-idle states get the same
+     * treatment, because both are transient and both are worth waiting out:
      *
      *  - [BusyState.PLAYING_MEDIA] is transient, so it is worth waiting out. Rechecks back off
      *    from [MEDIA_RECHECK_MS] toward [MAX_RECHECK_MS] so a three-hour video does not cost a
      *    JS eval every 30 seconds for three hours, and gives up after [MAX_RECHECKS] - at which
      *    point the tab is **left alone**, not hibernated. Cutting audio is the thing being
      *    avoided; a bound on polling must not become a licence to do it anyway.
+     *  - [BusyState.FULLSCREEN] rides the same path deliberately. Bailing out of the job entirely
+     *    would be simpler, but nothing re-arms the timer while a tab stays backgrounded, so a
+     *    fullscreen video watched once would exempt its tab from hibernation until the next tab
+     *    switch. Waiting means the tab hibernates on its own once fullscreen ends, and the
+     *    [MAX_RECHECKS] bound applies the same "leave it alone" ending.
+     *
      * Pure but for the two callbacks, so the policy is testable without a browser.
      */
     suspend fun awaitQuiet(
@@ -1062,8 +1079,36 @@ internal fun abandonBrowserCreation(pending: Deferred<BrowserHandle?>) {
 internal fun completedBrowserOrNull(creation: Deferred<BrowserHandle?>): BrowserHandle? =
     runCatching { creation.getCompleted() }.getOrNull()
 
+/**
+ * How long to wait for the host's `onExitFullscreen` before assuming it was dropped.
+ *
+ * A real host exit completes well inside this; it is a lost-callback deadline, not a budget.
+ */
+internal const val FULLSCREEN_EXIT_FALLBACK_MS = 2_000L
+
+/** What the fullscreen placeholder should say, driven by [FluckBrowserTabState]. */
+internal enum class FullscreenExitPhase {
+    /** Fullscreen is live and nobody has asked to leave it. */
+    IDLE,
+
+    /** An exit was requested and the host has not called back yet. */
+    EXITING,
+
+    /**
+     * The host accepted two exit requests and never called back, so its view is presumed
+     * still parented in the fullscreen window. See [FluckBrowserTabState.scheduleFullscreenExitFallback]
+     * for why this does not restore the tab.
+     */
+    FAILED,
+}
+
 internal class FluckBrowserTabState {
+    // private set, with adoptBrowserHandle/releaseBrowserHandle as the only writers. The
+    // fullscreen flag below is only correct because *every* handle transition clears it;
+    // a public setter would let the next `browserHandle = x` added anywhere reintroduce the
+    // stale-placeholder bug silently, with no test failing. Structural, not conventional.
     var browserHandle: BrowserHandle? by mutableStateOf<BrowserHandle?>(null)
+        private set
     // In-flight (or completed-but-unconsumed) browser creation. Runs on
     // [browserCreationScope] so a tab switch mid-boot neither cancels it nor
     // spawns a duplicate when the tab re-enters composition.
@@ -1111,7 +1156,147 @@ internal class FluckBrowserTabState {
     // tab re-enters composition, which would otherwise re-open the last menu — visible
     // if the tab is switched away from with a menu still up.
     var shownContextMenuRequest: Int = 0
+
+    // Do NOT shadow this with a remember-local (see PR #15): setFullscreenHandler is installed
+    // once per handle, so a remembered flag is orphaned by the first tab switch and the host
+    // callbacks go on writing into a state object nobody observes.
     var isInFullscreen: Boolean by mutableStateOf(false)
+        private set
+    var fullscreenExitPhase: FullscreenExitPhase by mutableStateOf(FullscreenExitPhase.IDLE)
+        private set
+
+    // Main-thread confined along with the two fullscreen fields above: the host callbacks are
+    // marshalled through the Component's scope before they reach markFullscreen*, and
+    // Dispatchers.Main is single-threaded and FIFO, so the epoch check inside the fallback
+    // cannot interleave with a re-entry.
+    private var fullscreenExitFallbackJob: kotlinx.coroutines.Job? = null
+    // Bumped on every fullscreen transition so a fallback armed for one session can recognise
+    // that it woke into a different one and do nothing.
+    private var fullscreenEpoch = 0
+
+    /**
+     * Takes ownership of a freshly created handle.
+     *
+     * Clears fullscreen state first: a replacement handle never reports `onExitFullscreen` for a
+     * session it was not part of, so a stale `true` would strand the tab on the placeholder.
+     */
+    fun adoptBrowserHandle(handle: BrowserHandle) {
+        if (browserHandle != null) {
+            println("[FluckBrowser] Adopting a handle over a live one; the previous handle leaks")
+        }
+        clearFullscreenState()
+        browserHandle = handle
+    }
+
+    /**
+     * Releases the current handle and returns it for disposal.
+     *
+     * Asking the host to leave fullscreen first is what keeps a detached fullscreen window from
+     * outliving the tab that owned it. `requestExitFullscreen` is a non-blocking post, so this is
+     * safe on the lifecycle thread and callers may dispose immediately afterwards; BossConsole#36
+     * (merged) also detaches a matching fullscreen view from `BrowserHandle` disposal, which is
+     * what covers the invalid-handle case this cannot reach.
+     */
+    fun releaseBrowserHandle(): BrowserHandle? {
+        val handle = browserHandle
+        if (isInFullscreen) {
+            requestHostExitFullscreen(handle)
+        }
+        browserHandle = null
+        clearFullscreenState()
+        return handle
+    }
+
+    /**
+     * Asks the host to leave fullscreen. Returns true when a live handle accepted the request,
+     * meaning a callback is expected and [scheduleFullscreenExitFallback] should be armed.
+     *
+     * Returning false is terminal in both directions: either there was nothing to exit, or the
+     * handle is gone and the tab has already been restored locally.
+     */
+    fun requestExitFullscreen(): Boolean {
+        if (!isInFullscreen) return false
+        // Debounce. A pending request already owns this exit, and re-posting it on every click
+        // would only reset the phase the user is waiting to see change.
+        if (fullscreenExitPhase == FullscreenExitPhase.EXITING) return false
+        if (!requestHostExitFullscreen(browserHandle)) {
+            // A handle that is null, invalid, or throwing cannot still own a fullscreen view,
+            // so there is nothing for the restored tab to collide with.
+            clearFullscreenState()
+            return false
+        }
+        fullscreenExitPhase = FullscreenExitPhase.EXITING
+        return true
+    }
+
+    /**
+     * Self-heals an exit whose host callback never arrives: retry once, then stop.
+     *
+     * Deliberately does **not** restore the tab when the handle is still live. Clearing
+     * `isInFullscreen` would drop to the `browserHandle != null` branch and compose
+     * `browserHandle.Content()` for a native view the host still has parented in its fullscreen
+     * window - one parent per view, so the likely result is a blank tab *and* the loss of the
+     * only exit affordance. Holding the placeholder in [FullscreenExitPhase.FAILED] keeps the
+     * retry available, which is worth more than a tab that looks restored and is not.
+     */
+    fun scheduleFullscreenExitFallback(coroutineScope: CoroutineScope) {
+        if (fullscreenExitFallbackJob?.isActive == true) return
+        val scheduledEpoch = fullscreenEpoch
+        fullscreenExitFallbackJob =
+            coroutineScope.launch {
+                delay(FULLSCREEN_EXIT_FALLBACK_MS)
+                if (!isInFullscreen || scheduledEpoch != fullscreenEpoch) return@launch
+
+                println("[FluckBrowser] Fullscreen exit callback timed out; retrying host request")
+                if (!requestHostExitFullscreen(browserHandle)) {
+                    println("[FluckBrowser] Fullscreen exit retry rejected by a dead handle; restoring tab")
+                    // Cancels the coroutine running this line. Safe only because nothing
+                    // suspends afterwards - do not add a delay or a suspending log below.
+                    clearFullscreenState()
+                    return@launch
+                }
+                delay(FULLSCREEN_EXIT_FALLBACK_MS)
+                if (!isInFullscreen || scheduledEpoch != fullscreenEpoch) return@launch
+
+                println("[FluckBrowser] Fullscreen exit timed out twice; holding the placeholder for retry")
+                fullscreenExitPhase = FullscreenExitPhase.FAILED
+            }
+    }
+
+    /** Idempotent: a duplicate host enter must not drop a fallback armed for the live session. */
+    fun markFullscreenEntered() {
+        if (isInFullscreen) return
+        cancelFullscreenExitFallback()
+        fullscreenEpoch++
+        fullscreenExitPhase = FullscreenExitPhase.IDLE
+        isInFullscreen = true
+    }
+
+    fun markFullscreenExited() {
+        clearFullscreenState()
+    }
+
+    private fun clearFullscreenState() {
+        cancelFullscreenExitFallback()
+        fullscreenEpoch++
+        fullscreenExitPhase = FullscreenExitPhase.IDLE
+        isInFullscreen = false
+    }
+
+    private fun cancelFullscreenExitFallback() {
+        fullscreenExitFallbackJob?.cancel()
+        fullscreenExitFallbackJob = null
+    }
+
+    /** Returns true only when a valid handle accepted the host exit request. */
+    private fun requestHostExitFullscreen(handle: BrowserHandle?): Boolean =
+        runCatching {
+            if (handle == null || !handle.isValid) return@runCatching false
+            handle.requestExitFullscreen()
+            true
+        }.onFailure { error ->
+            println("[FluckBrowser] Failed to request fullscreen exit: ${error.message}")
+        }.getOrDefault(false)
 }
 
 @Composable
@@ -1154,7 +1339,10 @@ internal fun FluckBrowserTabContent(
     // Property-reference delegation: `var x by ::y` compiles to direct
     // get/set on hoistedState, so the local names below behave the same
     // as before but their backing storage lives on the Component.
-    var browserHandle by hoistedState::browserHandle
+    // browserHandle is read-only here - every transition goes through
+    // hoistedState.adoptBrowserHandle/releaseBrowserHandle so fullscreen
+    // state can never outlive the handle that owns it.
+    val browserHandle by hoistedState::browserHandle
     var isInitializing by hoistedState::isInitializing
     var isLoading by hoistedState::isLoading
     var urlBarText by hoistedState::urlBarText
@@ -1168,7 +1356,6 @@ internal fun FluckBrowserTabContent(
     var historyIndex by hoistedState::historyIndex
     var contextMenuInfo by hoistedState::contextMenuInfo
     var contextMenuRequest by hoistedState::contextMenuRequest
-    var isInFullscreen by hoistedState::isInFullscreen
 
     // Local-only state (not shared across composition) — derived/transient,
     // doesn't need to survive tab switches.
@@ -1338,7 +1525,7 @@ internal fun FluckBrowserTabContent(
             }
             if (completed) hoistedState.browserCreation = null
             if (handle != null) {
-                browserHandle = handle
+                hoistedState.adoptBrowserHandle(handle)
                 isInitializing = false
 
                 // Register this tab+handle so the co-browse share server can enumerate
@@ -1522,11 +1709,15 @@ internal fun FluckBrowserTabContent(
                 if (tabId.isNotEmpty()) {
                     handle.setFullscreenHandler(
                         tabId = tabId,
+                        // Marshalled onto the Component's scope, not applied inline: the host may
+                        // call back from a CEF thread, and these two mutate main-thread-confined
+                        // fullscreen state. Dispatchers.Main is FIFO, so a rapid exit-then-enter
+                        // still lands in order.
                         onEnterFullscreen = {
-                            isInFullscreen = true
+                            coroutineScope.launch { hoistedState.markFullscreenEntered() }
                         },
                         onExitFullscreen = {
-                            isInFullscreen = false
+                            coroutineScope.launch { hoistedState.markFullscreenExited() }
                         }
                     )
                 }
@@ -1610,14 +1801,14 @@ internal fun FluckBrowserTabContent(
                         // invalid handle too — even a crashed/stale handle still
                         // holds listener registrations and view state worth
                         // releasing, and dispose() is safe on invalid handles.
-                        browserHandle = null
-                        disposeBrowserHandleOffThread(handle)
-                        isInitializing = true
+                        //
                         // Fullscreen belongs to the handle, not the tab: the replacement
                         // never reports onExitFullscreen for a session it wasn't part of,
                         // so a stale `true` would strand the tab on FullscreenPlaceholder
-                        // with an exit button that can't do anything.
-                        isInFullscreen = false
+                        // with an exit button that can't do anything. releaseBrowserHandle
+                        // makes that structural rather than a line to remember here.
+                        disposeBrowserHandleOffThread(hoistedState.releaseBrowserHandle() ?: handle)
+                        isInitializing = true
                         error = "Browser crashed. Recovering..."
 
                         // Restore URL after small delay (home needs no restore)
@@ -1631,10 +1822,8 @@ internal fun FluckBrowserTabContent(
                     } else {
                         // Max recovery attempts reached
                         error = "Browser recovery failed after $maxRecoveryAttempts attempts. Please close and reopen this tab."
-                        browserHandle = null
-                        disposeBrowserHandleOffThread(handle)
+                        disposeBrowserHandleOffThread(hoistedState.releaseBrowserHandle() ?: handle)
                         isInitializing = false
-                        isInFullscreen = false
                     }
                     break
                 }
@@ -1691,12 +1880,23 @@ internal fun FluckBrowserTabContent(
                         idleMsNow = { withContext(Dispatchers.IO) { TabHibernation.effectiveIdleMs() } },
                         sleep = { delay(it) },
                     )
-                    // Audible tabs are waited out rather than cut off mid-play.
+                    // Audible and fullscreen tabs are waited out rather than cut off mid-play.
+                    // Fullscreen is checked first and locally: the probe runs JS in the page,
+                    // which says nothing about whether the host is showing that page in a
+                    // detached fullscreen window while this Composable is out of composition.
+                    var lastBusy = TabHibernation.BusyState.IDLE
                     val mayHibernate =
                         TabHibernation.awaitQuiet(
                             probe = {
-                                browserHandle?.let { TabHibernation.busyState(it) }
-                                    ?: TabHibernation.BusyState.IDLE
+                                val busy =
+                                    if (hoistedState.isInFullscreen) {
+                                        TabHibernation.BusyState.FULLSCREEN
+                                    } else {
+                                        browserHandle?.let { TabHibernation.busyState(it) }
+                                            ?: TabHibernation.BusyState.IDLE
+                                    }
+                                lastBusy = busy
+                                busy
                             },
                             onWait = { delay(it) },
                         )
@@ -1704,14 +1904,18 @@ internal fun FluckBrowserTabContent(
                         // Logged because this whole feature is an argument against silent
                         // outcomes, and "my 40 tabs never released memory" is otherwise
                         // indistinguishable in the field from "hibernation is broken".
-                        println("[FluckBrowser] Hibernation skipped: tab still playing audio")
+                        val reason =
+                            if (lastBusy == TabHibernation.BusyState.FULLSCREEN) {
+                                "tab still in fullscreen"
+                            } else {
+                                "tab still playing audio"
+                            }
+                        println("[FluckBrowser] Hibernation skipped: $reason")
                         return@launch
                     }
                     println("[FluckBrowser] Hibernating idle tab to release its renderer")
-                    val handle = browserHandle
-                    browserHandle = null
+                    val handle = hoistedState.releaseBrowserHandle()
                     isInitializing = true
-                    isInFullscreen = false
                     // Off the UI thread so hibernating a background tab can't hitch
                     // the foreground UI.
                     if (handle != null) disposeBrowserHandleOffThread(handle)
@@ -2017,12 +2221,16 @@ internal fun FluckBrowserTabContent(
                         }
                     )
                 }
-                isInFullscreen -> {
+                hoistedState.isInFullscreen -> {
                     // Fullscreen placeholder - browser is displayed in a separate fullscreen window
                     FullscreenPlaceholder(
+                        phase = hoistedState.fullscreenExitPhase,
                         onExitClick = {
-                            // Request exit through the browser's fullscreen API
-                            browserHandle?.requestExitFullscreen()
+                            // Arm the self-heal only when a live handle took the request; a
+                            // rejected one has already restored the tab.
+                            if (hoistedState.requestExitFullscreen()) {
+                                hoistedState.scheduleFullscreenExitFallback(coroutineScope)
+                            }
                         }
                     )
                 }
@@ -4376,7 +4584,20 @@ private fun QuickDialogTextField(
  * Clicking this placeholder exits fullscreen and returns browser content to the tab.
  */
 @Composable
-private fun FullscreenPlaceholder(onExitClick: () -> Unit) {
+private fun FullscreenPlaceholder(
+    phase: FullscreenExitPhase,
+    onExitClick: () -> Unit,
+) {
+    // The exit round trip can take up to two FULLSCREEN_EXIT_FALLBACK_MS windows, which is long
+    // enough that an unchanged placeholder reads as a broken one and the user keeps clicking.
+    val (title, hint) = when (phase) {
+        FullscreenExitPhase.IDLE ->
+            "Tab is in fullscreen mode" to "Click here or press ESC to exit fullscreen"
+        FullscreenExitPhase.EXITING ->
+            "Exiting fullscreen..." to "Waiting for the browser window to close"
+        FullscreenExitPhase.FAILED ->
+            "Couldn't exit fullscreen" to "Click to try again, or close this tab"
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -4395,12 +4616,12 @@ private fun FullscreenPlaceholder(onExitClick: () -> Unit) {
                 tint = BossThemeColors.TextSecondary
             )
             Text(
-                text = "Tab is in fullscreen mode",
+                text = title,
                 style = MaterialTheme.typography.h6,
                 color = BossThemeColors.TextPrimary
             )
             Text(
-                text = "Click here or press ESC to exit fullscreen",
+                text = hint,
                 style = MaterialTheme.typography.body2,
                 color = BossThemeColors.TextSecondary
             )
