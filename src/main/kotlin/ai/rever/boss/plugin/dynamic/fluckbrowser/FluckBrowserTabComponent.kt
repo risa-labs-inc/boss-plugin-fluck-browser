@@ -54,6 +54,8 @@ import androidx.compose.material.icons.outlined.Fullscreen
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.StarBorder
+import ai.rever.boss.plugin.dynamic.fluckbrowser.menu.NativeContextMenu
+import ai.rever.boss.plugin.dynamic.fluckbrowser.menu.NativeMenuNode
 import androidx.compose.runtime.*
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -3233,10 +3235,32 @@ object SwingContextMenu {
         items: List<ContextMenuItem>,
         onDismiss: () -> Unit = {}
     ) {
-        // Dismiss any existing popup first
-        currentPopup?.let {
-            it.isVisible = false
+        // Take down whatever is on screen FIRST. If a previous call fell through to Swing and
+        // that popup is still up, going native without dismissing it would leave two menus
+        // visible and drop the reference to the one hide() could still have closed.
+        currentPopup?.let { it.isVisible = false }
+
+        // A real NSMenu where the platform allows it. It is an OS-owned window, so unlike a Swing
+        // popup it can never be occluded by the browser's hardware-accelerated surface - the very
+        // problem isLightWeightPopupEnabled below exists to work around.
+        val nodes =
+            items.map { item ->
+                if (item.isDivider) {
+                    NativeMenuNode.Separator
+                } else {
+                    NativeMenuNode.Item(label = item.text, action = item.onClick)
+                }
+            }
+        if (NativeContextMenu.show(screenX, screenY, nodes, onDismiss)) {
+            currentPopup = null
+            return
         }
+        // The native attempt declined AFTER possibly leaving a previous NSMenu on screen: show()
+        // only greys and detaches the outgoing menu once it has committed, and per measured fact 2
+        // detaching does not close it. Without this the user would see the Swing menu drawn over a
+        // still-open native one - the very thing the dismissal above exists to prevent. No-op when
+        // nothing is attached, so the non-macOS path is unaffected.
+        NativeContextMenu.hide()
 
         val popup = JPopupMenu().apply {
             // Dark theme colors matching BOSS style
@@ -3332,6 +3356,7 @@ object SwingContextMenu {
     }
 
     fun hide() {
+        NativeContextMenu.hide()
         currentPopup?.let {
             it.isVisible = false
             currentPopup = null
