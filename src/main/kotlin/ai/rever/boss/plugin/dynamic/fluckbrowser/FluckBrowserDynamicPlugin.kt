@@ -43,6 +43,13 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
     }
 
     override fun dispose() {
+        // FIRST: let go of any context menu. DismissWatcher registers an AWTEventListener on the
+        // HOST's Toolkit, and NativeContextMenu is a plugin-classloader singleton holding a host
+        // Window. Unload with that listener still installed and the host keeps a strong reference
+        // into unloaded plugin code - the classloader can never be collected, and every mouse
+        // move and key press in the whole app is dispatched into it until the JVM exits.
+        SwingContextMenu.hide()
+
         // Tear down the share server (stops any active capture) before unregistering.
         BrowserShareManager.shutdown()
         pluginContext?.tabRegistry?.unregisterTabType(FluckBrowserTabType.typeId)
