@@ -54,6 +54,8 @@ import androidx.compose.material.icons.outlined.Fullscreen
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.StarBorder
+import ai.rever.boss.plugin.dynamic.fluckbrowser.menu.NativeContextMenu
+import ai.rever.boss.plugin.dynamic.fluckbrowser.menu.NativeMenuNode
 import androidx.compose.runtime.*
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -3233,6 +3235,22 @@ object SwingContextMenu {
         items: List<ContextMenuItem>,
         onDismiss: () -> Unit = {}
     ) {
+        // A real NSMenu where the platform allows it. It is an OS-owned window, so unlike a Swing
+        // popup it can never be occluded by the browser's hardware-accelerated surface - the very
+        // problem isLightWeightPopupEnabled below exists to work around.
+        val nodes =
+            items.map { item ->
+                if (item.isDivider) {
+                    NativeMenuNode.Separator
+                } else {
+                    NativeMenuNode.Item(label = item.text, action = item.onClick)
+                }
+            }
+        if (NativeContextMenu.show(screenX, screenY, nodes, onDismiss)) {
+            currentPopup = null
+            return
+        }
+
         // Dismiss any existing popup first
         currentPopup?.let {
             it.isVisible = false
@@ -3332,6 +3350,7 @@ object SwingContextMenu {
     }
 
     fun hide() {
+        NativeContextMenu.hide()
         currentPopup?.let {
             it.isVisible = false
             currentPopup = null
