@@ -3255,11 +3255,12 @@ object SwingContextMenu {
             currentPopup = null
             return
         }
-
-        // Dismiss any existing popup first
-        currentPopup?.let {
-            it.isVisible = false
-        }
+        // The native attempt declined AFTER possibly leaving a previous NSMenu on screen: show()
+        // only greys and detaches the outgoing menu once it has committed, and per measured fact 2
+        // detaching does not close it. Without this the user would see the Swing menu drawn over a
+        // still-open native one - the very thing the dismissal above exists to prevent. No-op when
+        // nothing is attached, so the non-macOS path is unaffected.
+        NativeContextMenu.hide()
 
         val popup = JPopupMenu().apply {
             // Dark theme colors matching BOSS style

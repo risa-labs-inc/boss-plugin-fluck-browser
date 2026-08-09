@@ -10,6 +10,8 @@ import java.awt.Toolkit
 import java.awt.Window
 import java.awt.event.AWTEventListener
 import java.awt.event.MouseEvent
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.swing.SwingUtilities
 
 /**
@@ -144,8 +146,11 @@ internal object NativeContextMenu {
      * built for, so a menu that outlives the tab that opened it cannot act on state that has
      * gone away.
      */
-    @Volatile
-    private var generation: Long = 0L
+    // Atomic, not @Volatile: hide() bumps outside onEdt so teardown from any thread closes the
+    // fence immediately, which makes `generation += 1` followed by a separate read two operations
+    // a concurrent show() can interleave with - landing on generation == shown for a menu that was
+    // already invalidated. That is precisely the fail-open this fence must never have.
+    private val generation = AtomicLong(0)
 
     fun isSupported(): Boolean =
         shouldUseNativeMenus(settingEnabled = nativeMenusEnabled, isMacOs = OsFamily.isMac)
@@ -195,9 +200,8 @@ internal object NativeContextMenu {
         val at = Point(screenX, screenY)
         val invoker = resolveInvoker(at) ?: return false
 
-        generation += 1
-        val shown = generation
-        val isCurrent = { generation == shown }
+        val shown = generation.incrementAndGet()
+        val isCurrent = { generation.get() == shown }
 
         run {
             // Grey the outgoing menu before losing the handle: per measured fact 2 it may still
@@ -238,6 +242,12 @@ internal object NativeContextMenu {
      * lets go of it, so it cannot act on state the tab has already torn down.
      */
     fun hide() {
+        // Synchronously, before anything is posted: this is what dispose() actually needs. The
+        // host's Toolkit holds this listener and it closes over plugin classes, so if a host ever
+        // calls dispose() off the EDT and closes the classloader before a posted runnable drained,
+        // the listener would outlive the unload - the exact leak dispose() exists to prevent.
+        // Toolkit.add/removeAWTEventListener are internally synchronized, so this is safe here.
+        watcher.clear()
         // Unconditional, deliberately. An earlier version skipped the bump when nothing was
         // attached, to protect an item's own ActionEvent from being fenced off when hide() runs
         // from teardown triggered BY the menu dismissing itself. But `attached` is also nulled by
@@ -248,7 +258,7 @@ internal object NativeContextMenu {
         // The two hazards are not equal: a dropped click is an annoyance, an orphan menu acting on
         // a disposed tab is the failure this whole design exists to exclude. So the fence always
         // closes, and losing a queued ActionEvent in that narrow race is the accepted cost.
-        generation += 1
+        generation.incrementAndGet()
         onEdt {
             watcher.clear()
             attached?.let { (_, menu) -> runCatching { disableAll(menu) } }
@@ -355,7 +365,9 @@ private fun NativeMenuNode.Item.toAwtItem(
  * and it owns process-wide state (an AWT-wide listener) that must be cleaned up exactly.
  */
 private class DismissWatcher {
-    private var current: AWTEventListener? = null
+    // AtomicReference because clear() is now called synchronously from hide(), which runs on
+    // whatever thread teardown happens on, while install() runs on the EDT.
+    private val current = AtomicReference<AWTEventListener?>(null)
 
     /**
      * `WINDOW_EVENT_MASK` is included because dismissing by switching applications produces no
@@ -371,11 +383,11 @@ private class DismissWatcher {
                 override fun eventDispatched(event: AWTEvent) {
                     if (!isDismissalEvent(event.id, System.currentTimeMillis() - armedAt)) return
                     runCatching { toolkit.removeAWTEventListener(this) }
-                    if (current === this) current = null
+                    current.compareAndSet(this, null)
                     onDismiss()
                 }
             }
-        current = listener
+        current.set(listener)
         // Requires AWTPermission("listenToAllAWTEvents"). If a host's policy refuses, lose the
         // dismissal signal rather than the menu.
         return runCatching {
@@ -386,18 +398,19 @@ private class DismissWatcher {
             )
             listener
         }.getOrElse {
-            current = null
+            current.set(null)
             null
         }
     }
 
     fun clear() {
-        current?.let { runCatching { Toolkit.getDefaultToolkit().removeAWTEventListener(it) } }
-        current = null
+        current.getAndSet(null)?.let {
+            runCatching { Toolkit.getDefaultToolkit().removeAWTEventListener(it) }
+        }
     }
 
     fun clearIf(listener: AWTEventListener?) {
-        if (listener != null && current === listener) clear()
+        if (listener != null && current.get() === listener) clear()
     }
 
     companion object {
