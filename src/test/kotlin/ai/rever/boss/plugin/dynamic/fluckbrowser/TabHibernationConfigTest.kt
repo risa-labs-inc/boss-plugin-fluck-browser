@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import ai.rever.boss.plugin.browser.BrowserHandle
+import java.lang.reflect.Proxy
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -174,11 +176,12 @@ class TabHibernationConfigTest {
 
     private val IDLE = TabHibernation.BusyState.IDLE
     private val MEDIA = TabHibernation.BusyState.PLAYING_MEDIA
+    private val FULLSCREEN = TabHibernation.BusyState.FULLSCREEN
 
     @Test
     fun `an idle tab hibernates immediately`() = runBlocking {
         var waits = 0
-        assertTrue(TabHibernation.awaitQuiet(probe = { IDLE }, onWait = { waits++ }))
+        assertEquals(IDLE, TabHibernation.awaitQuiet(probe = { IDLE }, onWait = { waits++ }))
         assertEquals(0, waits, "an idle tab should not have waited")
     }
 
@@ -191,8 +194,76 @@ class TabHibernationConfigTest {
                 probe = { if (probes++ < 3) MEDIA else IDLE },
                 onWait = { waits.add(it) },
             )
-        assertTrue(hibernate, "a tab that went quiet should hibernate")
+        assertEquals(IDLE, hibernate, "a tab that went quiet should hibernate")
         assertEquals(3, waits.size)
+    }
+
+    /**
+     * Fullscreen must be waited out exactly like audio. It rides the same path only via
+     * `!= IDLE`, so a later `if (busy == PLAYING_MEDIA)` special case would silently start
+     * hibernating tabs mid-video again with nothing else failing.
+     */
+    @Test
+    fun `a fullscreen tab is waited out, then hibernates once it exits`() = runBlocking {
+        var probes = 0
+        val waits = mutableListOf<Long>()
+        val hibernate =
+            TabHibernation.awaitQuiet(
+                probe = { if (probes++ < 2) FULLSCREEN else IDLE },
+                onWait = { waits.add(it) },
+            )
+        assertEquals(IDLE, hibernate, "a tab that left fullscreen should hibernate")
+        assertEquals(2, waits.size)
+    }
+
+    @Test
+    fun `a tab still in fullscreen at the recheck limit is left alone`() = runBlocking {
+        val hibernate =
+            TabHibernation.awaitQuiet(probe = { FULLSCREEN }, onWait = {}, maxRechecks = 3)
+        // The terminal state is returned, not just "no", so the log line cannot drift from
+        // what was actually decided.
+        assertEquals(FULLSCREEN, hibernate)
+    }
+
+    /**
+     * The *budget* is what must restart across a change of reason: carrying a spent one over
+     * hands a newly audible tab an already-exhausted allowance and exempts it for no reason.
+     * The interval deliberately does not - see the test below.
+     */
+    @Test
+    fun `a changed reason restarts the budget`() = runBlocking {
+        var probes = 0
+        val waits = mutableListOf<Long>()
+        val hibernate =
+            TabHibernation.awaitQuiet(
+                // Four fullscreen rechecks would exhaust maxRechecks = 4 on their own; the
+                // switch to audio must hand it a fresh budget rather than a spent one.
+                probe = { if (probes++ < 4) FULLSCREEN else if (probes < 8) MEDIA else IDLE },
+                onWait = { waits.add(it) },
+                maxRechecks = 4,
+            )
+        assertEquals(IDLE, hibernate, "the budget should have restarted at the switch")
+    }
+
+    /**
+     * The budget resets on a changed reason; the interval must not. Resetting both pins an
+     * alternating tab at the floor for the whole total ceiling - more probing than no reset at
+     * all, and the opposite of what the backoff is for.
+     */
+    @Test
+    fun `a changed reason does not restart the backoff`() = runBlocking {
+        var probes = 0
+        val waits = mutableListOf<Long>()
+        TabHibernation.awaitQuiet(
+            probe = { if (probes++ % 2 == 0) FULLSCREEN else MEDIA },
+            onWait = { waits.add(it) },
+            maxRechecks = 4,
+        )
+        assertTrue(waits.size >= 4, "expected several waits, got $waits")
+        for (i in 1 until waits.size) {
+            assertTrue(waits[i] >= waits[i - 1], "interval reset at $i despite alternating: $waits")
+        }
+        assertTrue(waits.last() > TabHibernation.MEDIA_RECHECK_MS, "never climbed off the floor: $waits")
     }
 
     /** Rechecks must back off, or a three-hour video costs an eval every 30s for three hours. */
@@ -209,6 +280,52 @@ class TabHibernationConfigTest {
     }
 
     /**
+     * Fullscreen has to win over the page probe, and be answered without one. The JS probe runs
+     * inside the document, which cannot see which window the host is rendering it into, so asking
+     * it about fullscreen would be asking the wrong component - and on a null handle there is
+     * nobody to ask at all.
+     */
+    @Test
+    fun `fullscreen outranks the page probe, and a missing handle is idle`() = runBlocking {
+        // The live handle is the load-bearing half: it errors on every unstubbed call, so
+        // reaching FULLSCREEN proves the page was never probed. A null handle alone cannot
+        // tell "fullscreen wins" from "there was nobody to ask".
+        val exploding =
+            Proxy.newProxyInstance(
+                BrowserHandle::class.java.classLoader,
+                arrayOf(BrowserHandle::class.java),
+            ) { _, method, _ -> error("busyStateFor probed the page: ${method.name}") }
+                as BrowserHandle
+        assertEquals(FULLSCREEN, TabHibernation.busyStateFor(fullscreenBlocks = true, handle = exploding))
+        assertEquals(
+            FULLSCREEN,
+            TabHibernation.busyStateFor(fullscreenBlocks = true, handle = null),
+            "a null handle must not stop fullscreen being reported",
+        )
+        assertEquals(IDLE, TabHibernation.busyStateFor(fullscreenBlocks = false, handle = null))
+    }
+
+    /**
+     * The per-reason reset must not cost the global bound. A tab that alternates - toggling
+     * fullscreen on an audible video - resets the per-reason budget on every iteration, so
+     * without a total ceiling the loop never terminates and the interval never climbs past its
+     * first doubling.
+     */
+    @Test
+    fun `an alternating tab still terminates`() = runBlocking {
+        var probes = 0
+        var waits = 0
+        val hibernate =
+            TabHibernation.awaitQuiet(
+                probe = { if (probes++ % 2 == 0) FULLSCREEN else MEDIA },
+                onWait = { waits++ },
+                maxRechecks = 4,
+            )
+        assertTrue(hibernate != IDLE, "an always-busy tab must not be hibernated")
+        assertTrue(waits <= 4 * 2, "expected the total ceiling to stop the loop, got $waits waits")
+    }
+
+    /**
      * A bound on polling must not become a licence to cut the audio. When a tab is *still* playing
      * after the last recheck, the answer is to leave it alone - not to hibernate it anyway.
      */
@@ -217,7 +334,7 @@ class TabHibernationConfigTest {
         var waits = 0
         val hibernate =
             TabHibernation.awaitQuiet(probe = { MEDIA }, onWait = { waits++ }, maxRechecks = 5)
-        assertFalse(hibernate, "hibernating here would cut audio mid-play")
+        assertEquals(MEDIA, hibernate, "hibernating here would cut audio mid-play")
         // Exactly maxRechecks, not one more: the last attempt decides without sleeping on a
         // result already determined, which used to park a live coroutine for up to 5 minutes.
         assertEquals(5, waits, "expected no sleep on the deciding attempt")
