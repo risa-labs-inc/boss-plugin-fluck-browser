@@ -166,4 +166,60 @@ class NativeContextMenuTest {
         assertFalse(shouldUseNativeMenus(settingEnabled = false, isMacOs = true))
         assertFalse(shouldUseNativeMenus(settingEnabled = true, isMacOs = false))
     }
+
+    // ----- the return contract -----
+
+    @Test
+    fun `show declines off the EDT rather than reporting a menu it cannot confirm`() {
+        // The caller picks between this and its own menu from the return value, so reporting
+        // success before knowing a menu appears would leave the right-click doing nothing.
+        // This test thread is not the EDT.
+        assertFalse(NativeContextMenu.show(0, 0, listOf(item("Back"))))
+    }
+
+    @Test
+    fun `show declines an empty plan`() {
+        assertFalse(NativeContextMenu.show(0, 0, emptyList()))
+        assertFalse(NativeContextMenu.show(0, 0, List(2) { NativeMenuNode.Separator }))
+    }
+
+    @Test
+    fun `hide is safe with nothing attached and does not throw`() {
+        // Callers invoke hide() from teardown that may run when no menu was ever shown.
+        NativeContextMenu.hide()
+        NativeContextMenu.hide()
+    }
+
+    // ----- the focused-window shortcut -----
+
+    @Test
+    fun `a focused window that does not contain the click is not eligible`() {
+        // The case the shortcut used to get wrong: two BOSS windows, focus on one, right-click
+        // in the other. Using the focused window subtracts the wrong origin and the menu lands
+        // far from the pointer. pickInvoker encodes the rule the shortcut must also satisfy.
+        val picked =
+            pickInvoker(
+                listOf(
+                    candidate("focused-elsewhere", active = true, x = 0, y = 0, w = 100, h = 100),
+                    candidate("under-the-click", x = 500, y = 500, w = 300, h = 300),
+                ),
+                at = Point(600, 600),
+            )
+        assertEquals("under-the-click", picked?.window)
+    }
+
+    @Test
+    fun `a popup window is never eligible even when it is the active one`() {
+        // getWindows() returns the heavyweight windows Swing makes for popups, including the
+        // menu being replaced; one of those becoming the invoker nests a menu inside a menu.
+        val picked =
+            pickInvoker(
+                listOf(
+                    candidate("popup", active = true, frameOrDialog = false),
+                    candidate("frame", w = 900, h = 900),
+                ),
+                at = null,
+            )
+        assertEquals("frame", picked?.window)
+    }
 }

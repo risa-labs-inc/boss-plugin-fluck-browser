@@ -3235,6 +3235,11 @@ object SwingContextMenu {
         items: List<ContextMenuItem>,
         onDismiss: () -> Unit = {}
     ) {
+        // Take down whatever is on screen FIRST. If a previous call fell through to Swing and
+        // that popup is still up, going native without dismissing it would leave two menus
+        // visible and drop the reference to the one hide() could still have closed.
+        currentPopup?.let { it.isVisible = false }
+
         // A real NSMenu where the platform allows it. It is an OS-owned window, so unlike a Swing
         // popup it can never be occluded by the browser's hardware-accelerated surface - the very
         // problem isLightWeightPopupEnabled below exists to work around.

@@ -120,6 +120,9 @@ internal object OsFamily {
  * [shouldUseNativeMenus] ever widens past macOS.
  */
 internal object NativeContextMenu {
+    // EDT-only. show() declines off the EDT and hide() posts, so both are only ever mutated
+    // there; @Volatile keeps the hide() read that guards the bump honest either way.
+    @Volatile
     private var attached: Pair<Window, java.awt.PopupMenu>? = null
     private val watcher = DismissWatcher()
 
@@ -128,9 +131,23 @@ internal object NativeContextMenu {
      * built for, so a menu that outlives the tab that opened it cannot act on state that has
      * gone away.
      */
+    @Volatile
     private var generation: Long = 0L
 
-    fun isSupported(): Boolean = OsFamily.isMac
+    fun isSupported(): Boolean =
+        shouldUseNativeMenus(settingEnabled = nativeMenusEnabled, isMacOs = OsFamily.isMac)
+
+    /**
+     * Escape hatch, since a plugin cannot be patched as quickly as it ships: set
+     * `-Dboss.nativeContextMenus=false` (or `BOSS_NATIVE_CONTEXT_MENUS=false`) to fall back to
+     * the drawn menu everywhere.
+     */
+    private val nativeMenusEnabled: Boolean by lazy {
+        val raw =
+            System.getProperty("boss.nativeContextMenus")
+                ?: System.getenv("BOSS_NATIVE_CONTEXT_MENUS")
+        raw?.lowercase() != "false"
+    }
 
     /**
      * Returns false when nothing was shown, in which case the caller must draw its own menu.
@@ -146,21 +163,24 @@ internal object NativeContextMenu {
         onDismiss: () -> Unit = {},
     ): Boolean {
         if (!isSupported()) return false
+        // Everything below touches AWT peers and must decide synchronously, because the caller
+        // uses the return value to choose between this and its own menu. Posting the work would
+        // mean returning true before knowing whether a menu appears, and a later failure would
+        // then leave the right-click doing nothing at all - the outcome the fallback exists to
+        // prevent. Callers are on the EDT (Compose's main dispatcher); off it, decline.
+        if (!SwingUtilities.isEventDispatchThread()) return false
+
         val planned = planNativeMenu(nodes, OsFamily.isWindows)
         if (planned.isEmpty()) return false
+
+        val at = Point(screenX, screenY)
+        val invoker = resolveInvoker(at) ?: return false
 
         generation += 1
         val shown = generation
         val isCurrent = { generation == shown }
 
-        onEdt {
-            val at = Point(screenX, screenY)
-            val invoker = resolveInvoker(at)
-            if (invoker == null) {
-                onDismiss()
-                return@onEdt
-            }
-
+        run {
             detach()
             val popup = java.awt.PopupMenu()
             var myWatcher: AWTEventListener? = null
@@ -173,8 +193,14 @@ internal object NativeContextMenu {
             invoker.add(popup)
             attached = invoker to popup
 
-            val local = at.toInvokerCoordinates(invoker)
-            popup.show(invoker, local.x, local.y)
+            val local = at.toInvokerCoordinates(invoker) ?: run { detach(); return false }
+            // The one call that can still fail. An escaping exception here would leave the
+            // caller believing a menu is up when none is, so decline and let it draw its own.
+            val opened = runCatching { popup.show(invoker, local.x, local.y) }.isSuccess
+            if (!opened) {
+                detach()
+                return false
+            }
             myWatcher = watcher.install(dismissed)
             // No watcher means no dismissal signal will ever arrive; report it now rather than
             // leaving the caller believing the menu is still up.
@@ -188,7 +214,11 @@ internal object NativeContextMenu {
      * lets go of it, so it cannot act on state the tab has already torn down.
      */
     fun hide() {
-        generation += 1
+        // Only invalidate while a menu is actually attached. Callers routinely call hide() from
+        // teardown that runs BECAUSE the menu just dismissed itself; bumping unconditionally
+        // would fence off the item's own ActionEvent if it is still queued, so the click the
+        // user just made would silently do nothing.
+        if (attached != null) generation += 1
         onEdt {
             watcher.clear()
             attached?.let { (_, menu) -> runCatching { disableAll(menu) } }
@@ -196,21 +226,24 @@ internal object NativeContextMenu {
         }
     }
 
-    private fun Point?.toInvokerCoordinates(invoker: Window): Point {
-        val origin = runCatching { invoker.locationOnScreen }.getOrNull()
-        val screen = this
-        return if (origin == null || screen == null) {
-            Point(0, 0)
-        } else {
-            Point(screen.x - origin.x, screen.y - origin.y)
-        }
+    /** Null when the origin is unknowable - better to decline than to guess the top-left. */
+    private fun Point?.toInvokerCoordinates(invoker: Window): Point? {
+        val origin = runCatching { invoker.locationOnScreen }.getOrNull() ?: return null
+        val screen = this ?: return null
+        return Point(screen.x - origin.x, screen.y - origin.y)
     }
 
     private fun resolveInvoker(at: Point?): Window? {
+        // The focused window is only a shortcut if it satisfies what pickInvoker would demand of
+        // it. With two BOSS windows open, or focus sitting on a detached browser window, the
+        // focused one need not contain the click - and using it anyway subtracts the wrong
+        // origin, putting the menu far from the pointer. It must also be a real frame or dialog,
+        // since getWindows() hands back the heavyweight windows Swing creates for popups.
         KeyboardFocusManager
             .getCurrentKeyboardFocusManager()
             .focusedWindow
-            ?.takeIf { it.isShowing }
+            ?.takeIf { it is Frame || it is Dialog }
+            ?.takeIf { it.isShowing && (at == null || it.bounds.contains(at)) }
             ?.let { return it }
 
         val candidates =
