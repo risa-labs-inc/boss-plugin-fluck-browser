@@ -154,6 +154,32 @@ class NativeContextMenuTest {
     }
 
     @Test
+    fun `only window events meaning the user went elsewhere count as dismissal`() {
+        // Window events are the exception to the input-grab argument: they are in the mask
+        // BECAUSE they get through while a menu is open. This plugin opens its own top-level
+        // window (ShareLinkDialog), and host toasts and heavyweight tooltips open others, so
+        // accepting any id here would read those as the menu closing.
+        val grace = NativeContextMenu.dismissGraceMs
+        assertTrue(NativeContextMenu.isDismissalEvent(java.awt.event.WindowEvent.WINDOW_DEACTIVATED, grace))
+        assertTrue(NativeContextMenu.isDismissalEvent(java.awt.event.WindowEvent.WINDOW_LOST_FOCUS, grace))
+
+        assertFalse(NativeContextMenu.isDismissalEvent(java.awt.event.WindowEvent.WINDOW_OPENED, grace))
+        assertFalse(NativeContextMenu.isDismissalEvent(java.awt.event.WindowEvent.WINDOW_ACTIVATED, grace))
+        assertFalse(NativeContextMenu.isDismissalEvent(java.awt.event.WindowEvent.WINDOW_GAINED_FOCUS, grace))
+        assertFalse(NativeContextMenu.isDismissalEvent(java.awt.event.WindowEvent.WINDOW_STATE_CHANGED, grace))
+    }
+
+    @Test
+    fun `a window deactivation inside the grace window still does not count`() {
+        assertFalse(
+            NativeContextMenu.isDismissalEvent(
+                java.awt.event.WindowEvent.WINDOW_DEACTIVATED,
+                NativeContextMenu.dismissGraceMs - 1,
+            ),
+        )
+    }
+
+    @Test
     fun `an ordinary event after the grace window counts, a mouse release never does`() {
         val grace = NativeContextMenu.dismissGraceMs
         assertTrue(NativeContextMenu.isDismissalEvent(java.awt.event.MouseEvent.MOUSE_MOVED, grace))

@@ -10,6 +10,7 @@ import java.awt.Toolkit
 import java.awt.Window
 import java.awt.event.AWTEventListener
 import java.awt.event.MouseEvent
+import java.awt.event.WindowEvent
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import javax.swing.SwingUtilities
@@ -135,8 +136,8 @@ internal object OsFamily {
  * [shouldUseNativeMenus] ever widens past macOS.
  */
 internal object NativeContextMenu {
-    // EDT-only. show() declines off the EDT and hide() posts, so both are only ever mutated
-    // there; @Volatile keeps the hide() read that guards the bump honest either way.
+    // show() declines off the EDT, but hide() runs on whatever thread teardown happens on and
+    // reads this to grey an orphan, so the reference has to be safely published.
     @Volatile
     private var attached: Pair<Window, java.awt.PopupMenu>? = null
     private val watcher = DismissWatcher()
@@ -182,6 +183,10 @@ internal object NativeContextMenu {
         nodes: List<NativeMenuNode>,
         onDismiss: () -> Unit = {},
     ): Boolean {
+        // Cheap gate first, so a Linux or Windows right-click does not build and copy the whole
+        // node list for a path that cannot be taken.
+        if (!isSupported()) return false
+
         // Everything below touches AWT peers and must decide synchronously, because the caller
         // uses the return value to choose between this and its own menu. Posting the work would
         // mean returning true before knowing whether a menu appears, and a later failure would
@@ -189,7 +194,7 @@ internal object NativeContextMenu {
         // prevent. Callers are on the EDT (Compose's main dispatcher); off it, decline.
         val planned = planNativeMenu(nodes, OsFamily.isWindows)
         if (!canShowNatively(
-                isSupported = isSupported(),
+                isSupported = true,
                 isEventDispatchThread = SwingUtilities.isEventDispatchThread(),
                 plannedSize = planned.size,
             )
@@ -210,38 +215,44 @@ internal object NativeContextMenu {
         // outcome the boolean return exists to prevent, so the contract has to be total.
         val opened =
             runCatching {
-
                 // Grey the outgoing menu before losing the handle: per measured fact 2 it may still
                 // be tracking on screen, and once detached hide() cannot disable it. Its items are
                 // already inert via the fence, but a menu that looks live and does nothing reads as
                 // a hang. Reachable via the keyboard menu key, which does not consume the grab.
                 attached?.let { (_, menu) -> runCatching { disableAll(menu) } }
                 detach()
+
                 val popup = java.awt.PopupMenu()
                 var myWatcher: AWTEventListener? = null
+                // Fires at most once: an item click calls it directly and the watcher normally
+                // calls it too, but the KDoc promises the caller exactly one dismissal.
+                val fired = java.util.concurrent.atomic.AtomicBoolean(false)
                 val dismissed = {
                     detachIf(popup)
                     watcher.clearIf(myWatcher)
-                    onDismiss()
+                    if (fired.compareAndSet(false, true)) onDismiss()
                 }
                 materialize(popup, planned, isCurrent, dismissed)
                 invoker.add(popup)
                 attached = invoker to popup
 
-                val local = at.toInvokerCoordinates(invoker) ?: return@runCatching false
+                val local = at.toInvokerCoordinates(invoker)
+                // Armed BEFORE show(), and declining if it cannot be installed. Reporting
+                // dismissal for a menu that is about to be on screen would fence every one of its
+                // items while leaving it visible - and per measured fact 2 nothing could take it
+                // down. install() does not depend on the popup, so this ordering costs nothing.
+                myWatcher = if (local == null) null else watcher.install(dismissed)
+                if (local == null || myWatcher == null) {
+                    detach()
+                    return@runCatching false
+                }
                 popup.show(invoker, local.x, local.y)
-                myWatcher = watcher.install(dismissed)
-                // No watcher means no dismissal signal will ever arrive; report it now rather than
-                // leaving the caller believing the menu is still up.
-                if (myWatcher == null) dismissed()
-        
                 true
             }.getOrElse {
                 detach()
                 false
             }
-        if (!opened) return false
-        return true
+        return opened
     }
 
     /**
@@ -249,6 +260,7 @@ internal object NativeContextMenu {
      * lets go of it, so it cannot act on state the tab has already torn down.
      */
     fun hide() {
+        if (!isSupported()) return
         // Synchronously, before anything is posted: this is what dispose() actually needs. The
         // host's Toolkit holds this listener and it closes over plugin classes, so if a host ever
         // calls dispose() off the EDT and closes the classloader before a posted runnable drained,
@@ -391,7 +403,13 @@ private class DismissWatcher {
                     if (!isDismissalEvent(event.id, System.currentTimeMillis() - armedAt)) return
                     runCatching { toolkit.removeAWTEventListener(this) }
                     current.compareAndSet(this, null)
-                    onDismiss()
+                    // Posted, not called inline. This runs on the EDT, and an item's ActionEvent
+                    // may already be queued behind the same input burst that told us the menu
+                    // closed. Calling onDismiss here would close the caller's state, dispose its
+                    // effect and fence the generation BEFORE that action ran, so the item the user
+                    // just clicked would silently do nothing. invokeLater puts this behind
+                    // anything already queued, making the order deterministic instead of a race.
+                    SwingUtilities.invokeLater { onDismiss() }
                 }
             }
         current.set(listener)
@@ -434,7 +452,20 @@ private class DismissWatcher {
         fun isDismissalEvent(
             eventId: Int,
             elapsedMs: Long,
-        ): Boolean = elapsedMs >= DISMISS_GRACE_MS && eventId != MouseEvent.MOUSE_RELEASED
+        ): Boolean {
+            if (elapsedMs < DISMISS_GRACE_MS) return false
+            // Window events are the exception to measured fact 3. That fact is about INPUT: an
+            // open menu holds the input grab and lets nothing through. Window events are in the
+            // mask precisely BECAUSE they do get through, so the soundness argument does not
+            // cover them and "any id" would read a plugin dialog, a host toast or a background
+            // app taking focus as a dismissal. Only the two that actually mean the user went
+            // elsewhere count.
+            if (eventId in WindowEvent.WINDOW_FIRST..WindowEvent.WINDOW_LAST) {
+                return eventId == WindowEvent.WINDOW_DEACTIVATED ||
+                    eventId == WindowEvent.WINDOW_LOST_FOCUS
+            }
+            return eventId != MouseEvent.MOUSE_RELEASED
+        }
     }
 }
 
