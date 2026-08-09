@@ -238,11 +238,17 @@ internal object NativeContextMenu {
      * lets go of it, so it cannot act on state the tab has already torn down.
      */
     fun hide() {
-        // Only invalidate while a menu is actually attached. Callers routinely call hide() from
-        // teardown that runs BECAUSE the menu just dismissed itself; bumping unconditionally
-        // would fence off the item's own ActionEvent if it is still queued, so the click the
-        // user just made would silently do nothing.
-        if (attached != null) generation += 1
+        // Unconditional, deliberately. An earlier version skipped the bump when nothing was
+        // attached, to protect an item's own ActionEvent from being fenced off when hide() runs
+        // from teardown triggered BY the menu dismissing itself. But `attached` is also nulled by
+        // the *heuristic* watcher - there is no real dismissal event (measured fact 3) - so if the
+        // watcher fired while the NSMenu was still tracking, teardown would skip the bump and the
+        // still-open menu's items would stay live, firing into a disposed tab.
+        //
+        // The two hazards are not equal: a dropped click is an annoyance, an orphan menu acting on
+        // a disposed tab is the failure this whole design exists to exclude. So the fence always
+        // closes, and losing a queued ActionEvent in that narrow race is the accepted cost.
+        generation += 1
         onEdt {
             watcher.clear()
             attached?.let { (_, menu) -> runCatching { disableAll(menu) } }
