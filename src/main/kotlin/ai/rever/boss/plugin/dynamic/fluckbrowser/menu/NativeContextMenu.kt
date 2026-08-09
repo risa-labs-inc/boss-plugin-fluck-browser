@@ -49,6 +49,19 @@ internal fun shouldUseNativeMenus(
 ): Boolean = settingEnabled && isMacOs
 
 /**
+ * Whether a native menu can be produced at all.
+ *
+ * Lifted out of [NativeContextMenu.show] because `isSupported()` short-circuits everything on a
+ * non-macOS machine, so a test that goes through `show()` on CI only ever re-tests the platform
+ * gate and can never reach the EDT or empty-plan guards it claims to cover.
+ */
+internal fun canShowNatively(
+    isSupported: Boolean,
+    isEventDispatchThread: Boolean,
+    plannedSize: Int,
+): Boolean = isSupported && isEventDispatchThread && plannedSize > 0
+
+/**
  * Normalise a menu for native rendering: drop leading, trailing and consecutive separators, drop
  * empty submenus, and double `&` on Windows where `AppendMenu` reads it as a mnemonic prefix.
  *
@@ -152,9 +165,11 @@ internal object NativeContextMenu {
     /**
      * Returns false when nothing was shown, in which case the caller must draw its own menu.
      *
-     * [screenX]/[screenY] are the exact coordinates Chromium reported for the right-click, which
-     * is more precise than reading the cursor: the callback runs after JavaScript probes, by
-     * which time the pointer may have moved.
+     * [screenX]/[screenY] are screen coordinates supplied by the caller. Today that caller reads
+     * the pointer at menu-build time, so this is not more precise than reading the cursor here -
+     * the callback runs after the JavaScript probes, and every hop between the click and the read
+     * is drift. Taking them as a parameter is what would let a caller pass Chromium's own
+     * reported click position instead, which `BrowserContextMenuInfo` would have to carry.
      */
     fun show(
         screenX: Int,
@@ -162,16 +177,20 @@ internal object NativeContextMenu {
         nodes: List<NativeMenuNode>,
         onDismiss: () -> Unit = {},
     ): Boolean {
-        if (!isSupported()) return false
         // Everything below touches AWT peers and must decide synchronously, because the caller
         // uses the return value to choose between this and its own menu. Posting the work would
         // mean returning true before knowing whether a menu appears, and a later failure would
         // then leave the right-click doing nothing at all - the outcome the fallback exists to
         // prevent. Callers are on the EDT (Compose's main dispatcher); off it, decline.
-        if (!SwingUtilities.isEventDispatchThread()) return false
-
         val planned = planNativeMenu(nodes, OsFamily.isWindows)
-        if (planned.isEmpty()) return false
+        if (!canShowNatively(
+                isSupported = isSupported(),
+                isEventDispatchThread = SwingUtilities.isEventDispatchThread(),
+                plannedSize = planned.size,
+            )
+        ) {
+            return false
+        }
 
         val at = Point(screenX, screenY)
         val invoker = resolveInvoker(at) ?: return false
@@ -181,6 +200,11 @@ internal object NativeContextMenu {
         val isCurrent = { generation == shown }
 
         run {
+            // Grey the outgoing menu before losing the handle: per measured fact 2 it may still
+            // be tracking on screen, and once detached hide() cannot disable it. Its items are
+            // already inert via the fence, but a menu that looks live and does nothing reads as
+            // a hang. Reachable via the keyboard menu key, which does not consume the grab.
+            attached?.let { (_, menu) -> runCatching { disableAll(menu) } }
             detach()
             val popup = java.awt.PopupMenu()
             var myWatcher: AWTEventListener? = null

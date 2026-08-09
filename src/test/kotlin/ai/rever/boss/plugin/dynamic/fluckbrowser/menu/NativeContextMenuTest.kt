@@ -222,4 +222,27 @@ class NativeContextMenuTest {
             )
         assertEquals("frame", picked?.window)
     }
+    // ----- the show() decision, testable off macOS -----
+
+    @Test
+    fun `a native menu needs support, the EDT and a non-empty plan`() {
+        assertTrue(canShowNatively(isSupported = true, isEventDispatchThread = true, plannedSize = 1))
+    }
+
+    @Test
+    fun `each precondition alone is enough to decline`() {
+        // Going through show() on a Linux runner only ever re-tests the platform gate, so these
+        // guards need coverage that actually runs everywhere.
+        assertFalse(canShowNatively(isSupported = false, isEventDispatchThread = true, plannedSize = 1))
+        assertFalse(canShowNatively(isSupported = true, isEventDispatchThread = false, plannedSize = 1))
+        assertFalse(canShowNatively(isSupported = true, isEventDispatchThread = true, plannedSize = 0))
+    }
+
+    @Test
+    fun `a menu of only separators plans to nothing and so declines`() {
+        val planned = planNativeMenu(List(3) { NativeMenuNode.Separator })
+        assertFalse(
+            canShowNatively(isSupported = true, isEventDispatchThread = true, plannedSize = planned.size),
+        )
+    }
 }
