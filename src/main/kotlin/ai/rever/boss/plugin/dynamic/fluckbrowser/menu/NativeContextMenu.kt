@@ -203,37 +203,44 @@ internal object NativeContextMenu {
         val shown = generation.incrementAndGet()
         val isCurrent = { generation.get() == shown }
 
-        run {
-            // Grey the outgoing menu before losing the handle: per measured fact 2 it may still
-            // be tracking on screen, and once detached hide() cannot disable it. Its items are
-            // already inert via the fence, but a menu that looks live and does nothing reads as
-            // a hang. Reachable via the keyboard menu key, which does not consume the grab.
-            attached?.let { (_, menu) -> runCatching { disableAll(menu) } }
-            detach()
-            val popup = java.awt.PopupMenu()
-            var myWatcher: AWTEventListener? = null
-            val dismissed = {
-                detachIf(popup)
-                watcher.clearIf(myWatcher)
-                onDismiss()
-            }
-            materialize(popup, planned, isCurrent, dismissed)
-            invoker.add(popup)
-            attached = invoker to popup
+        // The WHOLE block, not just popup.show(). PopupMenu/MenuItem/Menu construction and
+        // invoker.add all create AWT peers and can throw - HeadlessException most obviously. An
+        // exception escaping here would escape SwingContextMenu.show() too, so the user would get
+        // no native menu AND no Swing menu, and the request would be burned. That is exactly the
+        // outcome the boolean return exists to prevent, so the contract has to be total.
+        val opened =
+            runCatching {
 
-            val local = at.toInvokerCoordinates(invoker) ?: run { detach(); return false }
-            // The one call that can still fail. An escaping exception here would leave the
-            // caller believing a menu is up when none is, so decline and let it draw its own.
-            val opened = runCatching { popup.show(invoker, local.x, local.y) }.isSuccess
-            if (!opened) {
+                // Grey the outgoing menu before losing the handle: per measured fact 2 it may still
+                // be tracking on screen, and once detached hide() cannot disable it. Its items are
+                // already inert via the fence, but a menu that looks live and does nothing reads as
+                // a hang. Reachable via the keyboard menu key, which does not consume the grab.
+                attached?.let { (_, menu) -> runCatching { disableAll(menu) } }
                 detach()
-                return false
+                val popup = java.awt.PopupMenu()
+                var myWatcher: AWTEventListener? = null
+                val dismissed = {
+                    detachIf(popup)
+                    watcher.clearIf(myWatcher)
+                    onDismiss()
+                }
+                materialize(popup, planned, isCurrent, dismissed)
+                invoker.add(popup)
+                attached = invoker to popup
+
+                val local = at.toInvokerCoordinates(invoker) ?: return@runCatching false
+                popup.show(invoker, local.x, local.y)
+                myWatcher = watcher.install(dismissed)
+                // No watcher means no dismissal signal will ever arrive; report it now rather than
+                // leaving the caller believing the menu is still up.
+                if (myWatcher == null) dismissed()
+        
+                true
+            }.getOrElse {
+                detach()
+                false
             }
-            myWatcher = watcher.install(dismissed)
-            // No watcher means no dismissal signal will ever arrive; report it now rather than
-            // leaving the caller believing the menu is still up.
-            if (myWatcher == null) dismissed()
-        }
+        if (!opened) return false
         return true
     }
 
