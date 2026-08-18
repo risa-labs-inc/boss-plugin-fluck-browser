@@ -1173,6 +1173,42 @@ internal enum class FullscreenExitPhase {
     FAILED,
 }
 
+/**
+ * Run [block] against a live browser handle, or do nothing.
+ *
+ * Every call on a [BrowserHandle] crosses into the host's JxBrowser objects, and a browser whose
+ * engine has been replaced does not fail quietly there - it throws ObjectClosedException. The
+ * handle's own `isValid` guard cannot close that race from the host side: it is a check on one
+ * side of it, and `Browser.isClosed` answers `false` for a browser whose engine died with its IPC
+ * channel, because the notification that would flip it has no channel left to arrive on.
+ *
+ * Uncaught, that exception lands on the *plugin*. From a `launch` it reaches the coroutine's last
+ * resort handler; from a click it unwinds through composition. Either way the host's crash
+ * interceptor tears down the whole plugin: on 17 Aug a single Enter in the URL bar closed all 13
+ * open browser tabs, while the orphaned Chromium process kept playing the video from one of them.
+ *
+ * The tab does not need the exception to recover - the validity poll rebuilds the browser within
+ * 500ms - so it stops here, at the plugin's own boundary. What must not happen is the plugin
+ * dying on the way.
+ *
+ * Cancellation is re-thrown: swallowing it inside a coroutine breaks structured concurrency, and
+ * the tab-switch path cancels these scopes routinely.
+ */
+internal inline fun <T> BrowserHandle?.onBrowser(
+    op: String,
+    block: (BrowserHandle) -> T,
+): T? {
+    val handle = this ?: return null
+    return try {
+        block(handle)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        println("[FluckBrowser] Browser call '$op' failed: ${e.message}")
+        null
+    }
+}
+
 internal class FluckBrowserTabState {
     // private set, with adoptBrowserHandle/releaseBrowserHandle as the only writers. The
     // fullscreen flag below is only correct because *every* handle transition clears it;
@@ -2230,22 +2266,22 @@ internal fun FluckBrowserTabContent(
                         when (keyEvent.key) {
                             Key.R -> {
                                 // Reload - Cmd+R / Ctrl+R
-                                browserHandle?.reload()
+                                browserHandle.onBrowser("reload") { it.reload() }
                                 true
                             }
                             Key.Zero -> {
                                 // Reset zoom - Cmd+0 / Ctrl+0
-                                browserHandle?.resetZoom()
+                                browserHandle.onBrowser("resetZoom") { it.resetZoom() }
                                 true
                             }
                             Key.Equals, Key.NumPadAdd -> {
                                 // Zoom in - Cmd++ or Cmd+= / Ctrl++ or Ctrl+=
-                                browserHandle?.zoomIn()
+                                browserHandle.onBrowser("zoomIn") { it.zoomIn() }
                                 true
                             }
                             Key.Minus, Key.NumPadSubtract -> {
                                 // Zoom out - Cmd+- / Ctrl+-
-                                browserHandle?.zoomOut()
+                                browserHandle.onBrowser("zoomOut") { it.zoomOut() }
                                 true
                             }
                             else -> false
@@ -2328,21 +2364,21 @@ internal fun FluckBrowserTabContent(
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
                 coroutineScope.launch {
-                    browserHandle?.loadUrl(url)
+                    browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
                 }
             },
             canGoBack = canGoBack,
             canGoForward = canGoForward,
-            onBack = { browserHandle?.goBack() },
-            onForward = { browserHandle?.goForward() },
-            onReload = { browserHandle?.reload() },
-            onStop = { browserHandle?.stop() },
+            onBack = { browserHandle.onBrowser("goBack") { it.goBack() } },
+            onForward = { browserHandle.onBrowser("goForward") { it.goForward() } },
+            onReload = { browserHandle.onBrowser("reload") { it.reload() } },
+            onStop = { browserHandle.onBrowser("stop") { it.stop() } },
             isLoading = isLoading,
             isSecure = isSecure,
             zoomLevel = zoomLevel,
             onZoomChange = { level ->
                 zoomLevel = level
-                browserHandle?.setZoomLevel(level)
+                browserHandle.onBrowser("setZoomLevel") { it.setZoomLevel(level) }
             },
             isBookmarked = isBookmarked,
             onBookmarkClick = {
@@ -2395,7 +2431,7 @@ internal fun FluckBrowserTabContent(
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
                 coroutineScope.launch {
-                    browserHandle?.loadUrl(suggestion.url)
+                    browserHandle.onBrowser("loadUrl") { it.loadUrl(suggestion.url) }
                 }
             },
             onDismissSuggestions = {
@@ -2470,7 +2506,7 @@ internal fun FluckBrowserTabContent(
                     dashboardContentProvider.DashboardContent(
                         onNavigate = { url ->
                             coroutineScope.launch {
-                                browserHandle?.loadUrl(url)
+                                browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
                             }
                         }
                     )
@@ -2518,14 +2554,14 @@ internal fun FluckBrowserTabContent(
 
                                 when (browserMouseNavigationForButton(awtEvent?.button)) {
                                     BrowserMouseNavigation.BACK -> {
-                                        if (browserHandle?.canGoBack() == true) {
-                                            browserHandle?.goBack()
+                                        if (browserHandle.onBrowser("canGoBack") { it.canGoBack() } == true) {
+                                            browserHandle.onBrowser("goBack") { it.goBack() }
                                         }
                                         event.changes.forEach { it.consume() }
                                     }
                                     BrowserMouseNavigation.FORWARD -> {
-                                        if (browserHandle?.canGoForward() == true) {
-                                            browserHandle?.goForward()
+                                        if (browserHandle.onBrowser("canGoForward") { it.canGoForward() } == true) {
+                                            browserHandle.onBrowser("goForward") { it.goForward() }
                                         }
                                         event.changes.forEach { it.consume() }
                                     }
@@ -2598,7 +2634,7 @@ internal fun FluckBrowserTabContent(
                             canGoForward = canGoForward,
                             onNavigate = { url ->
                                 coroutineScope.launch {
-                                    browserHandle?.loadUrl(url)
+                                    browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
                                 }
                             },
                             onOpenInNewTab = onOpenInNewTab,
@@ -2780,7 +2816,7 @@ internal fun FluckBrowserTabContent(
                                     isUserEditingUrl = false
                                     lastUserEditTime = 0L
                                     coroutineScope.launch {
-                                        browserHandle?.loadUrl(entry.url)
+                                        browserHandle.onBrowser("loadUrl") { it.loadUrl(entry.url) }
                                     }
                                 }
                                 .padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
@@ -2987,22 +3023,22 @@ internal fun buildContextMenuItems(
         // Edit operations for text fields (first, like main branch)
         add(ContextMenuItem(
             text = "Cut",
-            onClick = { browserHandle?.cut() }
+            onClick = { browserHandle.onBrowser("cut") { it.cut() } }
         ))
 
         add(ContextMenuItem(
             text = "Copy",
-            onClick = { browserHandle?.copySelection() }
+            onClick = { browserHandle.onBrowser("copySelection") { it.copySelection() } }
         ))
 
         add(ContextMenuItem(
             text = "Paste",
-            onClick = { browserHandle?.paste() }
+            onClick = { browserHandle.onBrowser("paste") { it.paste() } }
         ))
 
         add(ContextMenuItem(
             text = "Select All",
-            onClick = { browserHandle?.selectAll() }
+            onClick = { browserHandle.onBrowser("selectAll") { it.selectAll() } }
         ))
 
         add(ContextMenuItem(isDivider = true))
@@ -3038,11 +3074,13 @@ internal fun buildContextMenuItems(
                             onClick = {
                                 // Fill credentials using the browser handle
                                 coroutineScope?.launch {
-                                    browserHandle?.fillCredentials(
-                                        username = secret.username,
-                                        password = secret.password,
-                                        fillBoth = true
-                                    )
+                                    browserHandle.onBrowser("fillCredentials") {
+                                        it.fillCredentials(
+                                            username = secret.username,
+                                            password = secret.password,
+                                            fillBoth = true
+                                        )
+                                    }
                                 }
                             }
                         ))
@@ -3076,7 +3114,7 @@ internal fun buildContextMenuItems(
         // Reload
         add(ContextMenuItem(
             text = "Reload",
-            onClick = { browserHandle?.reload() }
+            onClick = { browserHandle.onBrowser("reload") { it.reload() } }
         ))
 
         // Copy Page URL
@@ -3090,7 +3128,7 @@ internal fun buildContextMenuItems(
         // Developer tools
         add(ContextMenuItem(
             text = "Inspect Element",
-            onClick = { browserHandle?.showDevTools() }
+            onClick = { browserHandle.onBrowser("showDevTools") { it.showDevTools() } }
         ))
     } else {
         // Default context menu
@@ -3099,21 +3137,21 @@ internal fun buildContextMenuItems(
         if (canGoBack) {
             add(ContextMenuItem(
                 text = "Back",
-                onClick = { browserHandle?.goBack() }
+                onClick = { browserHandle.onBrowser("goBack") { it.goBack() } }
             ))
         }
 
         if (canGoForward) {
             add(ContextMenuItem(
                 text = "Forward",
-                onClick = { browserHandle?.goForward() }
+                onClick = { browserHandle.onBrowser("goForward") { it.goForward() } }
             ))
         }
 
         // Always show reload
         add(ContextMenuItem(
             text = "Reload",
-            onClick = { browserHandle?.reload() }
+            onClick = { browserHandle.onBrowser("reload") { it.reload() } }
         ))
 
         add(ContextMenuItem(isDivider = true))
@@ -3122,7 +3160,7 @@ internal fun buildContextMenuItems(
         if (info?.hasVideo == true) {
             add(ContextMenuItem(
                 text = "Picture in Picture",
-                onClick = { browserHandle?.requestPictureInPicture() }
+                onClick = { browserHandle.onBrowser("requestPictureInPicture") { it.requestPictureInPicture() } }
             ))
             add(ContextMenuItem(isDivider = true))
         }
@@ -3216,7 +3254,7 @@ internal fun buildContextMenuItems(
         // Developer tools (always at the end)
         add(ContextMenuItem(
             text = "Inspect Element",
-            onClick = { browserHandle?.showDevTools() }
+            onClick = { browserHandle.onBrowser("showDevTools") { it.showDevTools() } }
         ))
     }
 }
@@ -4428,11 +4466,13 @@ private fun SecretSelectionDialog(
                                      currentDomain.lowercase().contains(extractMainDomain(secret.website)?.lowercase() ?: "")),
                                 onClick = {
                                     coroutineScope.launch {
-                                        browserHandle?.fillCredentials(
-                                            username = secret.username,
-                                            password = secret.password,
-                                            fillBoth = true
-                                        )
+                                        browserHandle.onBrowser("fillCredentials") {
+                                            it.fillCredentials(
+                                                username = secret.username,
+                                                password = secret.password,
+                                                fillBoth = true
+                                            )
+                                        }
                                         onDismiss()
                                     }
                                 }
