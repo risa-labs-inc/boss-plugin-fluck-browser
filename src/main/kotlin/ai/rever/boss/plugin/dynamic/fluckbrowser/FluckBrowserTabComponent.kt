@@ -1209,6 +1209,56 @@ internal inline fun <T> BrowserHandle?.onBrowser(
     }
 }
 
+/**
+ * Fill [secret] into the page.
+ *
+ * Scripted from here rather than delegated to `BrowserHandle.fillCredentials`, because that API
+ * takes no "which field" argument and so can only guess - and its guess wrote the password into
+ * Google's `display: none` decoy while the visible email box stayed empty. See [CredentialFill].
+ *
+ * [targetIndex] is the field's position in the eligible-login-field list when the caller knows it
+ * (the suggestion list does; the right-click menu does not and relies on `document.activeElement`).
+ *
+ * The host call remains the fallback for a page that cannot be scripted at all. It is tried only
+ * when the script produced no answer whatsoever, never to second-guess an answer it did give: a
+ * script reporting "no password box on this page" is correct about a two-step sign-in, and
+ * retrying through the old guess is exactly how the password reached a hidden field.
+ */
+internal suspend fun BrowserHandle?.fillCredential(
+    secret: SecretEntryData,
+    targetIndex: Int? = null,
+): CredentialFill.Result {
+    val answer =
+        onBrowser("fillCredential") {
+            it.executeJavaScript(
+                CredentialFill.script(secret.username, secret.password, targetIndex)
+            ) as? String
+        }
+    val scripted = CredentialFill.parseResult(answer)
+    if (scripted.username != CredentialFill.FieldOutcome.UNKNOWN ||
+        scripted.password != CredentialFill.FieldOutcome.UNKNOWN
+    ) {
+        return scripted
+    }
+
+    val hostFilled =
+        onBrowser("fillCredentials") {
+            it.fillCredentials(
+                username = secret.username,
+                password = secret.password,
+                fillBoth = true
+            )
+        }
+    // The host answers a bare Boolean, so which field it managed is unknowable from here. UNKNOWN
+    // on the password side is honest rather than lazy: claiming ABSENT would suppress a notice the
+    // user may need.
+    return if (hostFilled == true) {
+        CredentialFill.Result(CredentialFill.FieldOutcome.FILLED, CredentialFill.FieldOutcome.UNKNOWN)
+    } else {
+        scripted
+    }
+}
+
 internal class FluckBrowserTabState {
     // private set, with adoptBrowserHandle/releaseBrowserHandle as the only writers. The
     // fullscreen flag below is only correct because *every* handle transition clears it;
@@ -1723,6 +1773,12 @@ internal fun FluckBrowserTabContent(
     // inherit whatever was left of the first one's timer.
     var fillNotice by remember { mutableStateOf<String?>(null) }
     var fillNoticeSeq by remember { mutableStateOf(0) }
+    val showFillNotice: (CredentialFill.Result) -> Unit = { result ->
+        CredentialFill.notice(result)?.let {
+            fillNotice = it
+            fillNoticeSeq++
+        }
+    }
 
     // Retry state for browser creation. retryCount drives the auto-retry backoff;
     // initNonce (hoisted, see FluckBrowserTabState) guarantees the init effect
@@ -2688,9 +2744,13 @@ internal fun FluckBrowserTabContent(
                                 quickCreateWebsitePrefill = websitePrefill
                                 showQuickCreateDialog = true
                             },
-                            onFillFailed = {
-                                fillNotice = FILL_FAILED_NOTICE
-                                fillNoticeSeq++
+                            onFillCredential = { secret ->
+                                coroutineScope.launch {
+                                    // No target index: the host reported this menu against the
+                                    // clicked field, and the page's own activeElement is what
+                                    // identifies it.
+                                    showFillNotice(browserHandle.fillCredential(secret))
+                                }
                             },
                             isBookmarked = isBookmarked,
                             onAddBookmark = {
@@ -2796,18 +2856,14 @@ internal fun FluckBrowserTabContent(
                                 // reads as the click having done nothing.
                                 dismissedSuggestionId = suggestionField.dismissId
                                 coroutineScope.launch {
-                                    val filled =
-                                        browserHandle.onBrowser("fillCredentials") {
-                                            it.fillCredentials(
-                                                username = secret.username,
-                                                password = secret.password,
-                                                fillBoth = true
-                                            )
-                                        }
-                                    if (filled != true) {
-                                        fillNotice = FILL_FAILED_NOTICE
-                                        fillNoticeSeq++
-                                    }
+                                    // The list is anchored to one specific box, so say which one
+                                    // rather than making the script re-derive it.
+                                    showFillNotice(
+                                        browserHandle.fillCredential(
+                                            secret,
+                                            targetIndex = suggestionField.index,
+                                        )
+                                    )
                                 }
                             },
                             onShowAll = {
@@ -2868,10 +2924,7 @@ internal fun FluckBrowserTabContent(
                         quickCreateWebsitePrefill = websitePrefill
                         showQuickCreateDialog = true
                     },
-                    onFillFailed = {
-                        fillNotice = FILL_FAILED_NOTICE
-                        fillNoticeSeq++
-                    }
+                    onFillResult = showFillNotice
                 )
             }
 
@@ -3213,10 +3266,10 @@ internal fun buildContextMenuItems(
     onAddNewSecret: (websitePrefill: String) -> Unit = {},
     isBookmarked: Boolean = false,
     onAddBookmark: () -> Unit = {},
-    // Called when a chosen credential lands nowhere. Without it the menu item is
-    // indistinguishable from one that was never clicked, which is how a resolver picking a
-    // hidden field stayed invisible for so long.
-    onFillFailed: () -> Unit = {}
+    // The fill itself belongs to the caller: it owns the page-scripting path and the notice a
+    // fill that lands nowhere has to produce. Building a menu and performing a fill are separate
+    // jobs, and the second one needs a suspend context this builder does not have.
+    onFillCredential: (SecretEntryData) -> Unit = {}
 ): List<ContextMenuItem> = buildList {
     // Check if form field is focused (editable element)
     if (info?.isEditable == true) {
@@ -3273,20 +3326,7 @@ internal fun buildContextMenuItems(
 
                         add(ContextMenuItem(
                             text = "$displayName ($usernamePreview)",
-                            onClick = {
-                                // Fill credentials using the browser handle
-                                coroutineScope?.launch {
-                                    val filled =
-                                        browserHandle.onBrowser("fillCredentials") {
-                                            it.fillCredentials(
-                                                username = secret.username,
-                                                password = secret.password,
-                                                fillBoth = true
-                                            )
-                                        }
-                                    if (filled != true) onFillFailed()
-                                }
-                            }
+                            onClick = { onFillCredential(secret) }
                         ))
                     }
                 } else {
@@ -4490,7 +4530,7 @@ private fun SecretSelectionDialog(
     coroutineScope: CoroutineScope,
     onDismiss: () -> Unit,
     onAddNewSecret: (websitePrefill: String) -> Unit,
-    onFillFailed: () -> Unit = {}
+    onFillResult: (CredentialFill.Result) -> Unit = {}
 ) {
     var searchQuery by remember { mutableStateOf("") }
 
@@ -4671,16 +4711,9 @@ private fun SecretSelectionDialog(
                                      currentDomain.lowercase().contains(extractMainDomain(secret.website)?.lowercase() ?: "")),
                                 onClick = {
                                     coroutineScope.launch {
-                                        val filled =
-                                            browserHandle.onBrowser("fillCredentials") {
-                                                it.fillCredentials(
-                                                    username = secret.username,
-                                                    password = secret.password,
-                                                    fillBoth = true
-                                                )
-                                            }
+                                        val result = browserHandle.fillCredential(secret)
                                         onDismiss()
-                                        if (filled != true) onFillFailed()
+                                        onFillResult(result)
                                     }
                                 }
                             )

@@ -66,6 +66,13 @@ internal data class FocusedLoginField(
      * carried over to the next site would silently hide the list there.
      */
     val dismissId: String get() = "$pageUrl#$key"
+
+    /**
+     * Position in the page's eligible-login-field list, which is what the fill script accepts as
+     * its target. Null if [key] is not in the shape the probe produces, so a malformed answer
+     * falls back to resolving from `document.activeElement` rather than filling field 0.
+     */
+    val index: Int? get() = key.substringBefore('|').toIntOrNull()
 }
 
 /** What one run of [LOGIN_FIELD_PROBE_JS] found. */
@@ -134,54 +141,70 @@ private const val PROBE_IDLE = "IDLE"
  * user cannot see is not a field to offer a credential for. Google's sign-in page carries a
  * `display: none` password input, and offering to fill *that* is what this whole change is about.
  */
+/**
+ * Field-eligibility helpers shared by the focus probe and the fill script.
+ *
+ * One copy because the two must agree on what counts as a field a person could have typed into.
+ * Offering a credential for a box and then filling a different one is the failure this whole
+ * change exists to remove, and two copies of these rules is how that comes back.
+ *
+ * The rules mirror the host's `bossFillable` deliberately - see BossConsole#215. `getClientRects()`
+ * rather than `offsetParent`, because the latter is null for every `position: fixed` element and
+ * would reject the visible field on a modal login.
+ */
+internal val FIELD_ELIGIBILITY_JS =
+    """
+    function rects(el) {
+        try { return el.getClientRects().length; } catch (e) { return 0; }
+    }
+    function fillable(el) {
+        if (!el || el.tagName !== 'INPUT') return false;
+        var t = (el.type || 'text').toLowerCase();
+        if (t !== 'text' && t !== 'email' && t !== 'tel' && t !== 'password') return false;
+        if (el.disabled || el.readOnly) return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        if (rects(el) === 0) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return false;
+        if (r.left < -2000 || r.top < -2000) return false;
+        var cs = window.getComputedStyle(el);
+        if (!cs) return true;
+        if (cs.display === 'none') return false;
+        if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
+        if (parseFloat(cs.opacity || '1') === 0) return false;
+        return true;
+    }
+    function tokens(el) {
+        return (el.getAttribute('autocomplete') || '').toLowerCase().split(/[\s,]+/);
+    }
+    function hasToken(el, want) {
+        var parts = tokens(el);
+        for (var i = 0; i < parts.length; i++) { if (parts[i] === want) return true; }
+        return false;
+    }
+    function hints(el) {
+        var s = [
+            el.name, el.id, el.getAttribute('aria-label'),
+            el.placeholder, el.getAttribute('autocomplete')
+        ].join(' ').toLowerCase();
+        return /user|e-?mail|login|account|identifier|signin/.test(s);
+    }
+    // A login field, not merely a text box: offering credentials beside a site's search bar
+    // would be noise on most of the web. A password box always qualifies; a text box has to
+    // say so through its autocomplete token, its type, or its name.
+    function isLoginField(el) {
+        if (!fillable(el)) return false;
+        if ((el.type || '').toLowerCase() === 'password') return true;
+        if (hasToken(el, 'username') || hasToken(el, 'email')) return true;
+        if ((el.type || '').toLowerCase() === 'email') return true;
+        return hints(el);
+    }
+    """.trimIndent()
+
 internal val LOGIN_FIELD_PROBE_JS =
     """
     (function() {
-        function rects(el) {
-            try { return el.getClientRects().length; } catch (e) { return 0; }
-        }
-        function fillable(el) {
-            if (!el || el.tagName !== 'INPUT') return false;
-            var t = (el.type || 'text').toLowerCase();
-            if (t !== 'text' && t !== 'email' && t !== 'tel' && t !== 'password') return false;
-            if (el.disabled || el.readOnly) return false;
-            if (el.getAttribute('aria-hidden') === 'true') return false;
-            if (rects(el) === 0) return false;
-            var r = el.getBoundingClientRect();
-            if (r.width < 2 || r.height < 2) return false;
-            if (r.left < -2000 || r.top < -2000) return false;
-            var cs = window.getComputedStyle(el);
-            if (!cs) return true;
-            if (cs.display === 'none') return false;
-            if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
-            if (parseFloat(cs.opacity || '1') === 0) return false;
-            return true;
-        }
-        function tokens(el) {
-            return (el.getAttribute('autocomplete') || '').toLowerCase().split(/[\s,]+/);
-        }
-        function hasToken(el, want) {
-            var parts = tokens(el);
-            for (var i = 0; i < parts.length; i++) { if (parts[i] === want) return true; }
-            return false;
-        }
-        function hints(el) {
-            var s = [
-                el.name, el.id, el.getAttribute('aria-label'),
-                el.placeholder, el.getAttribute('autocomplete')
-            ].join(' ').toLowerCase();
-            return /user|e-?mail|login|account|identifier|signin/.test(s);
-        }
-        // A login field, not merely a text box: offering credentials beside a site's search bar
-        // would be noise on most of the web. A password box always qualifies; a text box has to
-        // say so through its autocomplete token, its type, or its name.
-        function isLoginField(el) {
-            if (!fillable(el)) return false;
-            if ((el.type || '').toLowerCase() === 'password') return true;
-            if (hasToken(el, 'username') || hasToken(el, 'email')) return true;
-            if ((el.type || '').toLowerCase() === 'email') return true;
-            return hints(el);
-        }
+$FIELD_ELIGIBILITY_JS
         var all = document.querySelectorAll('input');
         var fields = [];
         for (var i = 0; i < all.length; i++) {
