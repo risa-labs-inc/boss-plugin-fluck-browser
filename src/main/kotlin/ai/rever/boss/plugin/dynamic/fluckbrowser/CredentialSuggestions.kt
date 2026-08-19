@@ -115,8 +115,11 @@ internal fun parseLoginFieldProbe(raw: Any?): LoginFieldProbe {
 /**
  * How long to wait before probing again.
  *
- * Each probe is a synchronous round-trip into Chromium on the UI thread, so the rate has to earn
- * itself. It does that by being tied to what is actually on screen:
+ * Each probe is a synchronous round-trip into Chromium. It no longer runs on the UI thread - the
+ * caller dispatches it to `Dispatchers.IO`, because `executeJavaScript` blocks until the renderer
+ * answers and a renderer in a long task would otherwise park the EDT. That removes the worst
+ * consequence but not the cost: it is still a thread and an IPC per probe, so the rate is tied to
+ * what is actually on screen:
  *
  * - **Focused** - the list is (or is about to be) open beside the box, and it has to follow the
  *   field as the page scrolls. This is the only rate that is quick, and it only runs while the
@@ -137,26 +140,16 @@ private const val PROBE_NONE = "NONE"
 private const val PROBE_IDLE = "IDLE"
 
 /**
- * Answers "is the user in a login box, and where is it" in one round-trip.
- *
- * One script rather than a cheap gate plus a detailed follow-up, because two scripts would be two
- * blocking IPC calls per poll and the gate's answer is a by-product of the work the detailed one
- * already does.
- *
- * The eligibility rules mirror the host's `bossFillable`, and for the same reason: a field the
- * user cannot see is not a field to offer a credential for. Google's sign-in page carries a
- * `display: none` password input, and offering to fill *that* is what this whole change is about.
- */
-/**
  * Field-eligibility helpers shared by the focus probe and the fill script.
  *
  * One copy because the two must agree on what counts as a field a person could have typed into.
  * Offering a credential for a box and then filling a different one is the failure this whole
  * change exists to remove, and two copies of these rules is how that comes back.
  *
- * The rules mirror the host's `bossFillable` deliberately - see BossConsole#215. `getClientRects()`
- * rather than `offsetParent`, because the latter is null for every `position: fixed` element and
- * would reject the visible field on a modal login.
+ * `getClientRects()` rather than `offsetParent`, because the latter is null for every
+ * `position: fixed` element and would reject the visible field on a modal login. The host once had
+ * an equivalent test; do not go looking for it, BossConsole#215 deleted that resolver along with
+ * the API it served, and these rules are now the only copy.
  */
 internal val FIELD_ELIGIBILITY_JS =
     """
@@ -212,6 +205,18 @@ internal val FIELD_ELIGIBILITY_JS =
     }
     """.trimIndent()
 
+/**
+ * Answers "is the user in a login box, and where is it" in one round-trip.
+ *
+ * One script rather than a cheap gate plus a detailed follow-up, because two scripts would be two
+ * blocking IPC calls per poll and the gate's answer is a by-product of the work the detailed one
+ * already does.
+ *
+ * Eligibility comes from [FIELD_ELIGIBILITY_JS], shared with the fill script so the two cannot
+ * disagree about what counts as a field. A field the user cannot see is not a field to offer a
+ * credential for: Google's sign-in page carries a `display: none` password input, and filling
+ * *that* is the bug this whole feature was written against.
+ */
 internal val LOGIN_FIELD_PROBE_JS =
     """
     (function() {
