@@ -12,7 +12,8 @@ import kotlin.test.assertTrue
  * The probe script itself is JavaScript and only means anything against a real document, so it is
  * verified by running it on real login pages. What is pinned here is everything around it -
  * particularly that an answer this code cannot understand costs the *slowest* poll rate rather
- * than the fastest, since the probe is a blocking round-trip into Chromium on the UI thread.
+ * than the fastest, since each probe is a blocking round-trip into Chromium - dispatched off the
+ * UI thread, but still a thread and an IPC per poll.
  */
 class CredentialSuggestionsTest {
     private val focusedJson =
@@ -103,8 +104,9 @@ class CredentialSuggestionsTest {
 
     @Test
     fun `even the quickest rate stays clear of a per-frame poll`() {
-        // The lower bound that keeps this from becoming a UI-thread cost: each probe blocks the
-        // EDT on a Chromium round-trip, so the fastest rate has to stay well above frame time.
+        // The lower bound. The call is dispatched to Dispatchers.IO so it no longer blocks the
+        // EDT, but it still costs a thread and an IPC per poll, so the fastest rate has to stay
+        // well clear of frame time.
         assertTrue(
             loginProbeDelayMs(parseLoginFieldProbe(focusedJson)) >= 200L,
             "the focused rate must not approach per-frame polling",
