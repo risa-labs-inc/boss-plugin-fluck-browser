@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -108,6 +109,52 @@ class CredentialSuggestionsTest {
             loginProbeDelayMs(parseLoginFieldProbe(focusedJson)) >= 200L,
             "the focused rate must not approach per-frame polling",
         )
+    }
+
+    // ------------------------------------------------------- shouldOfferSuggestions
+
+    private fun field(hasValue: Boolean = false) =
+        (parseLoginFieldProbe(if (hasValue) focusedJson.replace("\"hasValue\":false", "\"hasValue\":true") else focusedJson)
+            as LoginFieldProbe.Focused).field
+
+    @Test
+    fun `the list is offered for an empty focused box with matches`() {
+        assertTrue(shouldOfferSuggestions(field(), dismissedId = null, matchCount = 2))
+    }
+
+    @Test
+    fun `nothing is offered when no box is focused`() {
+        assertFalse(shouldOfferSuggestions(null, dismissedId = null, matchCount = 2))
+    }
+
+    @Test
+    fun `a dismissal for this box on this page is respected`() {
+        val f = field()
+        assertFalse(shouldOfferSuggestions(f, dismissedId = f.dismissId, matchCount = 2))
+        // ...but a dismissal made elsewhere is not this box.
+        assertTrue(shouldOfferSuggestions(f, dismissedId = "https://other.example/#0|u||text", matchCount = 2))
+    }
+
+    @Test
+    fun `a box with something already typed is left alone`() {
+        // Also what closes the list after a successful fill.
+        assertFalse(shouldOfferSuggestions(field(hasValue = true), dismissedId = null, matchCount = 2))
+    }
+
+    @Test
+    fun `no matching credential means no list`() {
+        assertFalse(shouldOfferSuggestions(field(), dismissedId = null, matchCount = 0))
+    }
+
+    // ------------------------------------------------------------ result normalisation
+
+    @Test
+    fun `a non-String result is normalised rather than dropped`() {
+        // executeJavaScript returns Any?. A wrapper type or a quoted string used to collapse to
+        // NoLoginField, so the feature would silently never appear.
+        assertEquals(LoginFieldProbe.Idle, parseLoginFieldProbe(StringBuilder("IDLE")))
+        assertEquals(LoginFieldProbe.Idle, parseLoginFieldProbe("\"IDLE\""))
+        assertEquals(LoginFieldProbe.NoLoginField, parseLoginFieldProbe(StringBuilder("NONE")))
     }
 
     @Test

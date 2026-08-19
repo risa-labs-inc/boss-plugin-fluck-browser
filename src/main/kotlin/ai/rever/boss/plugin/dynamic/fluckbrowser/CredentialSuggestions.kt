@@ -96,15 +96,21 @@ private val probeJson = Json { ignoreUnknownKeys = true }
  * showing nothing is the right failure, and it also backs the poll off to its slowest rate, so a
  * page that somehow answers garbage forever costs almost nothing.
  */
-internal fun parseLoginFieldProbe(raw: String?): LoginFieldProbe =
-    when {
-        raw == null || raw.isBlank() -> LoginFieldProbe.NoLoginField
-        raw == PROBE_NONE -> LoginFieldProbe.NoLoginField
-        raw == PROBE_IDLE -> LoginFieldProbe.Idle
+internal fun parseLoginFieldProbe(raw: Any?): LoginFieldProbe {
+    // Any?, and normalised before matching. `executeJavaScript` returns Any?, so a wrapper type or
+    // a quoted string would collapse every branch to NoLoginField and the feature would simply
+    // never appear, with no log line. Mirrors busyStateFromScriptResult and
+    // middleClickUrlFromScriptResult, which normalise for the same reason.
+    val text = raw?.toString()?.trim()?.trim('"')?.trim() ?: return LoginFieldProbe.NoLoginField
+    return when {
+        text.isBlank() -> LoginFieldProbe.NoLoginField
+        text == PROBE_NONE -> LoginFieldProbe.NoLoginField
+        text == PROBE_IDLE -> LoginFieldProbe.Idle
         else ->
-            runCatching { LoginFieldProbe.Focused(probeJson.decodeFromString<FocusedLoginField>(raw)) }
+            runCatching { LoginFieldProbe.Focused(probeJson.decodeFromString<FocusedLoginField>(text)) }
                 .getOrElse { LoginFieldProbe.NoLoginField }
     }
+}
 
 /**
  * How long to wait before probing again.
@@ -167,6 +173,11 @@ internal val FIELD_ELIGIBILITY_JS =
         var r = el.getBoundingClientRect();
         if (r.width < 2 || r.height < 2) return false;
         if (r.left < -2000 || r.top < -2000) return false;
+        // Inside the viewport, not merely on the page. Focusing a box and then scrolling does not
+        // blur it, and the suggestion popup is an always-on-top window anchored to this rect - off
+        // the viewport it gets drawn over the toolbar or outside the tab entirely, not clipped.
+        if (r.bottom <= 0 || r.right <= 0) return false;
+        if (r.top >= window.innerHeight || r.left >= window.innerWidth) return false;
         var cs = window.getComputedStyle(el);
         if (!cs) return true;
         if (cs.display === 'none') return false;
@@ -205,6 +216,10 @@ internal val LOGIN_FIELD_PROBE_JS =
     """
     (function() {
 $FIELD_ELIGIBILITY_JS
+        // document.activeElement survives the browser view losing focus, so without this the list
+        // would still be drawn - over the URL bar's own autocomplete, or after the user alt-tabbed
+        // away entirely. Also drops an unfocused tab to the slowest poll rate.
+        if (!document.hasFocus()) return 'IDLE';
         var all = document.querySelectorAll('input');
         var fields = [];
         for (var i = 0; i < all.length; i++) {
@@ -347,3 +362,33 @@ internal val SUGGESTION_MAX_WIDTH = 420.dp
 internal const val FILL_FAILED_NOTICE = "No login box on this page could be filled"
 
 internal const val FILL_NOTICE_DURATION_MS = 4_000L
+
+/**
+ * Advisory bound on one probe, mirroring `HibernationPolicy.BUSY_CHECK_TIMEOUT_MS`.
+ *
+ * `withTimeoutOrNull` can only abandon a call that suspends, so a call blocked inside JxBrowser
+ * keeps its thread regardless. It is worth setting anyway: the thread it keeps is an IO one, and
+ * the timeout does bound the queued case.
+ */
+internal const val LOGIN_PROBE_TIMEOUT_MS = 2_000L
+
+/**
+ * Whether to draw the suggestion list, given what the probe found and what the user has done.
+ *
+ * Pure and separate because it is policy over three inputs, and inline in a composable it had no
+ * coverage at all - the same reason `shouldClearContextMenuTarget` and
+ * `browserMouseNavigationForButton` live outside their call sites in this plugin.
+ */
+internal fun shouldOfferSuggestions(
+    field: FocusedLoginField?,
+    dismissedId: String?,
+    matchCount: Int,
+): Boolean {
+    if (field == null) return false
+    // Dismissed for this box on this page. Scoped by dismissId, not key - see FocusedLoginField.
+    if (field.dismissId == dismissedId) return false
+    // Something is already typed. Offering to overwrite it is worse than staying out of the way,
+    // and this is also what closes the list after a successful fill.
+    if (field.hasValue) return false
+    return matchCount > 0
+}

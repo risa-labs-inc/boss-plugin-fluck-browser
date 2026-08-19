@@ -2192,24 +2192,45 @@ internal fun FluckBrowserTabContent(
     // Watch the page for a focused login box, so a saved credential can be offered beside it
     // without the user having to discover the right-click menu first.
     //
-    // Each probe is a blocking round-trip into Chromium on the UI thread, so three things keep it
-    // honest. It does not start at all when there is no credential to offer. Its rate is decided
-    // by what it last found, which means the quick rate only applies while the user is actually
-    // in a login box (see loginProbeDelayMs). And an inactive tab is not composed - the host drops
-    // a background tab's Composable - so this stops on its own rather than running per open tab.
+    // Four things keep the cost honest. It does not start unless this page actually has a saved
+    // credential to offer - not merely "the user owns a secret", which is true for almost everyone
+    // and would leave every tab probing every page forever. Its rate is decided by what it last
+    // found, so the quick rate only applies while the user is in a login box (see
+    // loginProbeDelayMs). An inactive tab is not composed - the host drops a background tab's
+    // Composable - so this stops on its own rather than running per open tab. And the call itself
+    // runs off the UI thread.
     //
-    // A push channel would be better than any of that, but nothing on BrowserHandle carries a
-    // page event to a plugin today; adding one is an api change, and this needs none.
-    LaunchedEffect(browserHandle, allSecrets.isEmpty()) {
-        if (allSecrets.isEmpty()) {
+    // That last one is not optional. executeJavaScript blocks until the renderer answers, and a
+    // renderer in a long task - heavy JS, a modal beforeunload, a devtools breakpoint - would park
+    // the EDT on every one of these. HibernationPolicy.busyState makes the same call and says why
+    // it uses Dispatchers.IO: a wedged renderer must not take the UI with it. That call runs every
+    // 30s and this one can run every 300ms, so the argument is strictly stronger here.
+    //
+    // A push channel would be better than any of this, but nothing on BrowserHandle carries a page
+    // event to a plugin today; adding one is an api change, and this needs none.
+    val probeDomain = remember(currentUrl) { extractMainDomain(currentUrl) }
+    val hasCredentialsForPage =
+        remember(probeDomain, allSecrets) {
+            probeDomain != null && matchSecretsForDomain(probeDomain, allSecrets).isNotEmpty()
+        }
+    LaunchedEffect(browserHandle, hasCredentialsForPage) {
+        if (!hasCredentialsForPage) {
             focusedLoginField = null
             return@LaunchedEffect
         }
         while (true) {
             val probe =
                 parseLoginFieldProbe(
-                    browserHandle.onBrowser("loginFieldProbe") {
-                        it.executeJavaScript(LOGIN_FIELD_PROBE_JS) as? String
+                    withContext(Dispatchers.IO) {
+                        // The bound is advisory, exactly as in busyState: withTimeoutOrNull can
+                        // only abandon a call that suspends, so a call blocked inside JxBrowser
+                        // keeps this IO thread until the renderer answers. What it buys is that
+                        // the thread it keeps is not the one drawing the UI.
+                        browserHandle.onBrowser("loginFieldProbe") {
+                            withTimeoutOrNull(LOGIN_PROBE_TIMEOUT_MS) {
+                                it.executeJavaScript(LOGIN_FIELD_PROBE_JS)
+                            }
+                        }
                     }
                 )
             focusedLoginField = (probe as? LoginFieldProbe.Focused)?.field
@@ -2804,10 +2825,8 @@ internal fun FluckBrowserTabContent(
                         ?.let { matchSecretsForDomain(it, allSecrets) }
                         .orEmpty()
                 }
-            if (suggestionField != null &&
-                suggestionField.dismissId != dismissedSuggestionId &&
-                !suggestionField.hasValue &&
-                suggestionMatches.isNotEmpty()
+            if (shouldOfferSuggestions(suggestionField, dismissedSuggestionId, suggestionMatches.size) &&
+                suggestionField != null
             ) {
                 Box(
                     modifier = Modifier
@@ -2878,7 +2897,9 @@ internal fun FluckBrowserTabContent(
                         Icon(
                             Icons.Default.Warning,
                             contentDescription = null,
-                            tint = MaterialTheme.colors.primary,
+                            // error, not primary: an accent-tinted warning reads as informational,
+                            // and this only ever appears when a fill did not land.
+                            tint = MaterialTheme.colors.error,
                             modifier = Modifier.size(16.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
@@ -3141,7 +3162,19 @@ internal fun extractMainDomain(url: String): String? {
         val parts = host.split(".")
         if (parts.size >= 2) {
             // Common multi-part TLDs
-            val multiPartTlds = setOf("co.uk", "com.au", "co.jp", "co.nz", "com.br", "co.in")
+            // Not a public-suffix list, but the suffixes that matter most here. Without them
+            // every tenant of a shared host reduces to the same registrable domain, so a
+            // credential saved on one person's *.vercel.app would be offered, unprompted, beside
+            // a login box on anyone else's. That was harmless while this only ranked a menu; it is
+            // not now that it gates an unprompted suggestion.
+            val multiPartTlds =
+                setOf(
+                    "co.uk", "org.uk", "ac.uk", "com.au", "co.jp", "co.nz", "com.br", "co.in",
+                    "co.za", "com.cn", "co.kr",
+                    "github.io", "vercel.app", "herokuapp.com", "netlify.app", "pages.dev",
+                    "web.app", "firebaseapp.com", "appspot.com", "myshopify.com", "blogspot.com",
+                    "azurewebsites.net", "cloudfront.net", "workers.dev",
+                )
             val lastTwo = "${parts[parts.size - 2]}.${parts[parts.size - 1]}"
 
             if (multiPartTlds.contains(lastTwo) && parts.size >= 3) {
@@ -3208,12 +3241,34 @@ internal fun matchSecretsForDomain(
     val pageDomain = domain.trim().lowercase()
     if (pageDomain.isEmpty()) return emptyList()
 
-    return secrets.filter { secret ->
-        val secretDomain = secretWebsiteDomain(secret.website) ?: return@filter false
-        secretDomain == pageDomain ||
-            secretDomain.endsWith(".$pageDomain") ||
-            pageDomain.endsWith(".$secretDomain")
-    }.take(maxResults)
+    return secrets.filter { secretMatchesDomain(pageDomain, it) }.take(maxResults)
+}
+
+/**
+ * Whether one secret belongs to [pageDomain].
+ *
+ * Extracted so there is exactly one rule. The "Select Secret to Fill" dialog carried a
+ * hand-inlined copy of the old substring test, and its `?: ""` fallback made it worse than the
+ * original: `contains("")` is always true, so every secret whose website does not parse as a
+ * domain - "GOOGLE", "android", a GitHub Actions secret label - was badged as matching the current
+ * site. That dialog is where the suggestion list's "Other logins..." row sends the user, so the
+ * fix to [matchSecretsForDomain] stopped one click short of where it was needed.
+ *
+ * [pageDomain] is expected already reduced by [extractMainDomain].
+ */
+internal fun secretMatchesDomain(
+    pageDomain: String,
+    secret: SecretEntryData,
+): Boolean {
+    val page = pageDomain.trim().lowercase()
+    if (page.isEmpty()) return false
+    val secretDomain = secretWebsiteDomain(secret.website) ?: return false
+    // Equality carries the common case, since both sides are already registrable domains. The
+    // suffix arms only fire for the dotless hosts secretWebsiteDomain returns verbatim (localhost,
+    // 127.*), which extractMainDomain does not reduce.
+    return secretDomain == page ||
+        secretDomain.endsWith(".$page") ||
+        page.endsWith(".$secretDomain")
 }
 
 /**
@@ -4686,9 +4741,10 @@ private fun SecretSelectionDialog(
                         items(filteredSecrets) { secret ->
                             SecretListItem(
                                 secret = secret,
+                                // The same predicate the list and the menu use. This was a
+                                // hand-inlined copy of the old substring rule.
                                 isMatched = currentDomain != null &&
-                                    (secret.website.lowercase().contains(currentDomain.lowercase()) ||
-                                     currentDomain.lowercase().contains(extractMainDomain(secret.website)?.lowercase() ?: "")),
+                                    secretMatchesDomain(currentDomain, secret),
                                 onClick = {
                                     coroutineScope.launch {
                                         val result = browserHandle.fillCredential(secret)

@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 import ai.rever.boss.plugin.api.SecretEntryData
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -127,6 +128,45 @@ class SecretDomainMatchTest {
         val secrets = (1..9).map { secret("google.com", "user$it@gmail.com") }
         assertEquals(5, matchSecretsForDomain("google.com", secrets).size)
         assertEquals(2, matchSecretsForDomain("google.com", secrets, maxResults = 2).size)
+    }
+
+    // ---------------------------------------------------------- secretMatchesDomain
+
+    @Test
+    fun `a non-domain label never matches, which is what the dialog badge got wrong`() {
+        // The "Select Secret to Fill" dialog hand-inlined the old substring rule with a `?: ""`
+        // fallback, and `contains("")` is always true - so every secret whose website does not
+        // parse as a domain was badged "matches current website". That dialog is where the
+        // suggestion list's "Other logins..." row sends the user.
+        assertFalse(secretMatchesDomain("google.com", secret("GOOGLE", "GEMINI_API_KEY")))
+        assertFalse(secretMatchesDomain("google.com", secret("android")))
+        assertFalse(secretMatchesDomain("google.com", secret("risa-labs-inc/BossConsole - Actions secret")))
+    }
+
+    @Test
+    fun `the badge and the list cannot disagree`() {
+        // One rule, three call sites. Anything matchSecretsForDomain returns must also badge.
+        val secrets =
+            listOf(secret("google.com", "me@gmail.com"), secret("GOOGLE", "KEY"), secret("github.com"))
+        val listed = matchSecretsForDomain("google.com", secrets)
+        secrets.forEach { s ->
+            assertEquals(
+                listed.contains(s),
+                secretMatchesDomain("google.com", s),
+                "disagreement on ${s.website}",
+            )
+        }
+    }
+
+    @Test
+    fun `tenants of a shared host are not each other`() {
+        // Without the suffix entries both sides reduce to "vercel.app", so a credential saved on
+        // one person's deploy would be offered beside a login box on anyone else's.
+        assertFalse(secretMatchesDomain("evil.vercel.app", secret("myapp.vercel.app")))
+        assertFalse(secretMatchesDomain("attacker.github.io", secret("alice.github.io")))
+        assertFalse(secretMatchesDomain("b.herokuapp.com", secret("a.herokuapp.com")))
+        // The same tenant still matches itself.
+        assertTrue(secretMatchesDomain("myapp.vercel.app", secret("myapp.vercel.app")))
     }
 
     @Test
