@@ -1711,6 +1711,19 @@ internal fun FluckBrowserTabContent(
     var quickCreateWebsitePrefill by remember { mutableStateOf("") }
     var allSecrets by remember { mutableStateOf<List<SecretEntryData>>(emptyList()) }
 
+    // Inline credential suggestions: which login box the page has focus in, and which one the
+    // user has already waved away. See CredentialSuggestions.kt for the probe behind this.
+    var focusedLoginField by remember { mutableStateOf<FocusedLoginField?>(null) }
+    var dismissedSuggestionId by remember { mutableStateOf<String?>(null) }
+
+    // A fill that lands needs no announcement. One that does not is otherwise indistinguishable
+    // from a click that never registered, which is exactly how a resolver picking the wrong field
+    // went unnoticed for so long. The sequence number, not the message, keys the auto-dismiss:
+    // two failures in a row are two notices, and keying on the text would leave the second to
+    // inherit whatever was left of the first one's timer.
+    var fillNotice by remember { mutableStateOf<String?>(null) }
+    var fillNoticeSeq by remember { mutableStateOf(0) }
+
     // Retry state for browser creation. retryCount drives the auto-retry backoff;
     // initNonce (hoisted, see FluckBrowserTabState) guarantees the init effect
     // re-runs on every explicit Retry and on a late-completing boot.
@@ -2137,6 +2150,34 @@ internal fun FluckBrowserTabContent(
             } catch (e: Exception) {
                 // Silently fail
             }
+        }
+    }
+
+    // Watch the page for a focused login box, so a saved credential can be offered beside it
+    // without the user having to discover the right-click menu first.
+    //
+    // Each probe is a blocking round-trip into Chromium on the UI thread, so three things keep it
+    // honest. It does not start at all when there is no credential to offer. Its rate is decided
+    // by what it last found, which means the quick rate only applies while the user is actually
+    // in a login box (see loginProbeDelayMs). And an inactive tab is not composed - the host drops
+    // a background tab's Composable - so this stops on its own rather than running per open tab.
+    //
+    // A push channel would be better than any of that, but nothing on BrowserHandle carries a
+    // page event to a plugin today; adding one is an api change, and this needs none.
+    LaunchedEffect(browserHandle, allSecrets.isEmpty()) {
+        if (allSecrets.isEmpty()) {
+            focusedLoginField = null
+            return@LaunchedEffect
+        }
+        while (true) {
+            val probe =
+                parseLoginFieldProbe(
+                    browserHandle.onBrowser("loginFieldProbe") {
+                        it.executeJavaScript(LOGIN_FIELD_PROBE_JS) as? String
+                    }
+                )
+            focusedLoginField = (probe as? LoginFieldProbe.Focused)?.field
+            delay(loginProbeDelayMs(probe))
         }
     }
 
@@ -2647,6 +2688,10 @@ internal fun FluckBrowserTabContent(
                                 quickCreateWebsitePrefill = websitePrefill
                                 showQuickCreateDialog = true
                             },
+                            onFillFailed = {
+                                fillNotice = FILL_FAILED_NOTICE
+                                fillNoticeSeq++
+                            },
                             isBookmarked = isBookmarked,
                             onAddBookmark = {
                                 // Add or remove bookmark using the host API
@@ -2700,6 +2745,116 @@ internal fun FluckBrowserTabContent(
                 }
             }
 
+            // Inline credential suggestions, anchored under the page's focused login box.
+            //
+            // The anchor is a zero-size Box offset to where the field is: BossPopup measures its
+            // anchor and, under HARDWARE_ACCELERATED, draws the list in an always-on-top window at
+            // that spot. Drawn in place it would be invisible the moment it extended over the page,
+            // because Chromium composites its own native window over the Compose scene - the same
+            // reason the URL autocomplete list goes through BossPopup.
+            //
+            // focusable = false is load-bearing rather than cosmetic here: a focusable overlay
+            // takes focus off the browser view, which blurs the very field the fill targets.
+            val suggestionField = focusedLoginField
+            val suggestionMatches =
+                remember(suggestionField?.pageUrl, allSecrets) {
+                    suggestionField
+                        ?.pageUrl
+                        ?.let { extractMainDomain(it) }
+                        ?.let { matchSecretsForDomain(it, allSecrets) }
+                        .orEmpty()
+                }
+            if (suggestionField != null &&
+                suggestionField.dismissId != dismissedSuggestionId &&
+                !suggestionField.hasValue &&
+                suggestionMatches.isNotEmpty()
+            ) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        // CSS pixels scaled by the tab's zoom: the page reports its geometry in
+                        // its own coordinate space, which only equals the view's at 100%.
+                        .offset(
+                            x = (suggestionField.left * zoomLevel).dp,
+                            y = ((suggestionField.top + suggestionField.height) * zoomLevel).dp,
+                        )
+                        .width(
+                            (suggestionField.width * zoomLevel).dp
+                                .coerceIn(SUGGESTION_MIN_WIDTH, SUGGESTION_MAX_WIDTH)
+                        ),
+                ) {
+                    BossPopup(
+                        onDismissRequest = { dismissedSuggestionId = suggestionField.dismissId },
+                        focusable = false,
+                        anchoring = BossPopupAnchoring.AnchorBounds,
+                    ) {
+                        CredentialSuggestionList(
+                            secrets = suggestionMatches,
+                            onPick = { secret ->
+                                // Dismissed before the fill, not after: the fill suspends, and
+                                // leaving the list up over a box that is already being filled
+                                // reads as the click having done nothing.
+                                dismissedSuggestionId = suggestionField.dismissId
+                                coroutineScope.launch {
+                                    val filled =
+                                        browserHandle.onBrowser("fillCredentials") {
+                                            it.fillCredentials(
+                                                username = secret.username,
+                                                password = secret.password,
+                                                fillBoth = true
+                                            )
+                                        }
+                                    if (filled != true) {
+                                        fillNotice = FILL_FAILED_NOTICE
+                                        fillNoticeSeq++
+                                    }
+                                }
+                            },
+                            onShowAll = {
+                                dismissedSuggestionId = suggestionField.dismissId
+                                showAllSecretsDialog = true
+                            },
+                            onDismiss = { dismissedSuggestionId = suggestionField.dismissId },
+                        )
+                    }
+                }
+            }
+
+            // Why a fill did nothing. Only failures are announced - a fill that worked is visible
+            // in the page itself, and a toast for it would be noise on every login.
+            fillNotice?.let { notice ->
+                LaunchedEffect(fillNoticeSeq) {
+                    delay(FILL_NOTICE_DURATION_MS)
+                    fillNotice = null
+                }
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 24.dp),
+                    color = BossThemeColors.SurfaceColor,
+                    shape = RoundedCornerShape(6.dp),
+                    elevation = 6.dp,
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            Icons.Default.Warning,
+                            contentDescription = null,
+                            tint = MaterialTheme.colors.primary,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            notice,
+                            color = BossThemeColors.TextPrimary,
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
+            }
+
             // Secret Selection Dialog
             if (showAllSecretsDialog) {
                 SecretSelectionDialog(
@@ -2712,6 +2867,10 @@ internal fun FluckBrowserTabContent(
                         showAllSecretsDialog = false
                         quickCreateWebsitePrefill = websitePrefill
                         showQuickCreateDialog = true
+                    },
+                    onFillFailed = {
+                        fillNotice = FILL_FAILED_NOTICE
+                        fillNoticeSeq++
                     }
                 )
             }
@@ -2935,7 +3094,7 @@ data class ContextMenuItem(
  * Extract main domain from URL for secret matching.
  * e.g., "https://mail.google.com/inbox" -> "google.com"
  */
-private fun extractMainDomain(url: String): String? {
+internal fun extractMainDomain(url: String): String? {
     return try {
         val uri = java.net.URI(url)
         val host = uri.host ?: return null
@@ -2966,22 +3125,61 @@ private fun extractMainDomain(url: String): String? {
 }
 
 /**
- * Match secrets against a domain.
- * Returns secrets where the website field matches the domain.
+ * The registrable domain a secret's `website` refers to, or null if it does not name a site.
+ *
+ * [extractMainDomain] answers null for a bare authority, because `java.net.URI("google.com")`
+ * parses it as a *path* and reports no host. Most stored websites are bare - "github.com",
+ * "accounts.google.com" - so the bare form is retried with a scheme rather than treated as
+ * unparseable.
+ *
+ * A value with no dot in it is not a domain and gets null. That is what keeps a secret labelled
+ * "GOOGLE" (an API key) out of the login list for google.com, and one labelled "android" out of
+ * every list. The single exception is `localhost`, which [extractMainDomain] already treats as a
+ * host in its own right, so a secret saved for it has to resolve the same way or it would never
+ * match the page it was saved on.
  */
-private fun matchSecretsForDomain(
+internal fun secretWebsiteDomain(website: String): String? {
+    val trimmed = website.trim().lowercase()
+    if (trimmed.isEmpty()) return null
+    extractMainDomain(trimmed)?.let { return it }
+    val authority =
+        trimmed
+            .substringBefore('/')
+            .substringBefore('?')
+            .substringAfter('@')
+            .substringBefore(':')
+    if (authority == LOCALHOST || authority.startsWith("127.")) return authority
+    if (!authority.contains('.')) return null
+    return extractMainDomain("https://$authority")
+}
+
+private const val LOCALHOST = "localhost"
+
+/**
+ * Match secrets against the page's registrable domain.
+ *
+ * Domain relationships, not substrings. The old rule accepted a match in either direction with
+ * `contains`, which meant a secret whose website was the bare word "GOOGLE" - the Gemini API key -
+ * was offered as a **login credential** for google.com, because "google.com".contains("google").
+ * Every short label was a wildcard over every domain containing it.
+ *
+ * Equality plus either-way suffix keeps the cases that matter: a secret saved for
+ * "accounts.google.com" is offered on google.com and vice versa, since both reduce to the same
+ * registrable domain, while "google.com" and "notgoogle.com" stay unrelated.
+ */
+internal fun matchSecretsForDomain(
     domain: String,
     secrets: List<SecretEntryData>,
     maxResults: Int = 5
 ): List<SecretEntryData> {
-    val lowerDomain = domain.lowercase()
+    val pageDomain = domain.trim().lowercase()
+    if (pageDomain.isEmpty()) return emptyList()
 
     return secrets.filter { secret ->
-        val secretDomain = extractMainDomain(secret.website)?.lowercase()
-            ?: secret.website.lowercase()
-
-        secretDomain.contains(lowerDomain) || lowerDomain.contains(secretDomain) ||
-                secret.website.lowercase().contains(lowerDomain)
+        val secretDomain = secretWebsiteDomain(secret.website) ?: return@filter false
+        secretDomain == pageDomain ||
+            secretDomain.endsWith(".$pageDomain") ||
+            pageDomain.endsWith(".$secretDomain")
     }.take(maxResults)
 }
 
@@ -2989,7 +3187,7 @@ private fun matchSecretsForDomain(
  * Get display name for a website.
  * Extracts a clean, readable name from the website URL.
  */
-private fun getDisplayName(website: String): String {
+internal fun getDisplayName(website: String): String {
     return try {
         val domain = extractMainDomain(website) ?: website
         // Capitalize first letter of domain
@@ -3014,7 +3212,11 @@ internal fun buildContextMenuItems(
     onShowAllSecrets: () -> Unit = {},
     onAddNewSecret: (websitePrefill: String) -> Unit = {},
     isBookmarked: Boolean = false,
-    onAddBookmark: () -> Unit = {}
+    onAddBookmark: () -> Unit = {},
+    // Called when a chosen credential lands nowhere. Without it the menu item is
+    // indistinguishable from one that was never clicked, which is how a resolver picking a
+    // hidden field stayed invisible for so long.
+    onFillFailed: () -> Unit = {}
 ): List<ContextMenuItem> = buildList {
     // Check if form field is focused (editable element)
     if (info?.isEditable == true) {
@@ -3074,13 +3276,15 @@ internal fun buildContextMenuItems(
                             onClick = {
                                 // Fill credentials using the browser handle
                                 coroutineScope?.launch {
-                                    browserHandle.onBrowser("fillCredentials") {
-                                        it.fillCredentials(
-                                            username = secret.username,
-                                            password = secret.password,
-                                            fillBoth = true
-                                        )
-                                    }
+                                    val filled =
+                                        browserHandle.onBrowser("fillCredentials") {
+                                            it.fillCredentials(
+                                                username = secret.username,
+                                                password = secret.password,
+                                                fillBoth = true
+                                            )
+                                        }
+                                    if (filled != true) onFillFailed()
                                 }
                             }
                         ))
@@ -4285,7 +4489,8 @@ private fun SecretSelectionDialog(
     browserHandle: BrowserHandle?,
     coroutineScope: CoroutineScope,
     onDismiss: () -> Unit,
-    onAddNewSecret: (websitePrefill: String) -> Unit
+    onAddNewSecret: (websitePrefill: String) -> Unit,
+    onFillFailed: () -> Unit = {}
 ) {
     var searchQuery by remember { mutableStateOf("") }
 
@@ -4466,14 +4671,16 @@ private fun SecretSelectionDialog(
                                      currentDomain.lowercase().contains(extractMainDomain(secret.website)?.lowercase() ?: "")),
                                 onClick = {
                                     coroutineScope.launch {
-                                        browserHandle.onBrowser("fillCredentials") {
-                                            it.fillCredentials(
-                                                username = secret.username,
-                                                password = secret.password,
-                                                fillBoth = true
-                                            )
-                                        }
+                                        val filled =
+                                            browserHandle.onBrowser("fillCredentials") {
+                                                it.fillCredentials(
+                                                    username = secret.username,
+                                                    password = secret.password,
+                                                    fillBoth = true
+                                                )
+                                            }
                                         onDismiss()
+                                        if (filled != true) onFillFailed()
                                     }
                                 }
                             )
