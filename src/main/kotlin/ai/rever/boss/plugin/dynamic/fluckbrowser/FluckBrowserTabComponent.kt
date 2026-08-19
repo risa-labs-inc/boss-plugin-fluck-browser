@@ -1209,6 +1209,36 @@ internal inline fun <T> BrowserHandle?.onBrowser(
     }
 }
 
+/**
+ * Fill [secret] into the page.
+ *
+ * Scripted from here rather than delegated to `BrowserHandle.fillCredentials`, because that API
+ * takes no "which field" argument and so can only guess - and its guess wrote the password into
+ * Google's `display: none` decoy while the visible email box stayed empty. See [CredentialFill].
+ *
+ * [targetIndex] is the field's position in the eligible-login-field list when the caller knows it
+ * (the suggestion list does; the right-click menu does not and relies on `document.activeElement`).
+ *
+ * There is deliberately **no fallback to `fillCredentials`**. An earlier version had one, for a
+ * page that could not be scripted at all - but it could never help: both paths go through
+ * `mainFrame().executeJavaScript`, so every condition that makes this return null (a torn-down
+ * handle, no main frame, a throwing call) fails the host's injector for the same reason. A
+ * fallback that cannot succeed where the primary failed is not a safety net, it is a second way to
+ * write a password somewhere nobody asked for. `fillCredentials` is being removed from the api
+ * outright, so this is the only credential-fill path there is.
+ */
+internal suspend fun BrowserHandle?.fillCredential(
+    secret: SecretEntryData,
+    targetIndex: Int? = null,
+): CredentialFill.Result =
+    CredentialFill.parseResult(
+        onBrowser("fillCredential") {
+            it.executeJavaScript(
+                CredentialFill.script(secret.username, secret.password, targetIndex)
+            ) as? String
+        }
+    )
+
 internal class FluckBrowserTabState {
     // private set, with adoptBrowserHandle/releaseBrowserHandle as the only writers. The
     // fullscreen flag below is only correct because *every* handle transition clears it;
@@ -1711,6 +1741,25 @@ internal fun FluckBrowserTabContent(
     var quickCreateWebsitePrefill by remember { mutableStateOf("") }
     var allSecrets by remember { mutableStateOf<List<SecretEntryData>>(emptyList()) }
 
+    // Inline credential suggestions: which login box the page has focus in, and which one the
+    // user has already waved away. See CredentialSuggestions.kt for the probe behind this.
+    var focusedLoginField by remember { mutableStateOf<FocusedLoginField?>(null) }
+    var dismissedSuggestionId by remember { mutableStateOf<String?>(null) }
+
+    // A fill that lands needs no announcement. One that does not is otherwise indistinguishable
+    // from a click that never registered, which is exactly how a resolver picking the wrong field
+    // went unnoticed for so long. The sequence number, not the message, keys the auto-dismiss:
+    // two failures in a row are two notices, and keying on the text would leave the second to
+    // inherit whatever was left of the first one's timer.
+    var fillNotice by remember { mutableStateOf<String?>(null) }
+    var fillNoticeSeq by remember { mutableStateOf(0) }
+    val showFillNotice: (CredentialFill.Result) -> Unit = { result ->
+        CredentialFill.notice(result)?.let {
+            fillNotice = it
+            fillNoticeSeq++
+        }
+    }
+
     // Retry state for browser creation. retryCount drives the auto-retry backoff;
     // initNonce (hoisted, see FluckBrowserTabState) guarantees the init effect
     // re-runs on every explicit Retry and on a late-completing boot.
@@ -2137,6 +2186,55 @@ internal fun FluckBrowserTabContent(
             } catch (e: Exception) {
                 // Silently fail
             }
+        }
+    }
+
+    // Watch the page for a focused login box, so a saved credential can be offered beside it
+    // without the user having to discover the right-click menu first.
+    //
+    // Four things keep the cost honest. It does not start unless this page actually has a saved
+    // credential to offer - not merely "the user owns a secret", which is true for almost everyone
+    // and would leave every tab probing every page forever. Its rate is decided by what it last
+    // found, so the quick rate only applies while the user is in a login box (see
+    // loginProbeDelayMs). An inactive tab is not composed - the host drops a background tab's
+    // Composable - so this stops on its own rather than running per open tab. And the call itself
+    // runs off the UI thread.
+    //
+    // That last one is not optional. executeJavaScript blocks until the renderer answers, and a
+    // renderer in a long task - heavy JS, a modal beforeunload, a devtools breakpoint - would park
+    // the EDT on every one of these. HibernationPolicy.busyState makes the same call and says why
+    // it uses Dispatchers.IO: a wedged renderer must not take the UI with it. That call runs every
+    // 30s and this one can run every 300ms, so the argument is strictly stronger here.
+    //
+    // A push channel would be better than any of this, but nothing on BrowserHandle carries a page
+    // event to a plugin today; adding one is an api change, and this needs none.
+    val probeDomain = remember(currentUrl) { extractMainDomain(currentUrl) }
+    val hasCredentialsForPage =
+        remember(probeDomain, allSecrets) {
+            probeDomain != null && matchSecretsForDomain(probeDomain, allSecrets).isNotEmpty()
+        }
+    LaunchedEffect(browserHandle, hasCredentialsForPage) {
+        if (!hasCredentialsForPage) {
+            focusedLoginField = null
+            return@LaunchedEffect
+        }
+        while (true) {
+            val probe =
+                parseLoginFieldProbe(
+                    withContext(Dispatchers.IO) {
+                        // The bound is advisory, exactly as in busyState: withTimeoutOrNull can
+                        // only abandon a call that suspends, so a call blocked inside JxBrowser
+                        // keeps this IO thread until the renderer answers. What it buys is that
+                        // the thread it keeps is not the one drawing the UI.
+                        browserHandle.onBrowser("loginFieldProbe") {
+                            withTimeoutOrNull(LOGIN_PROBE_TIMEOUT_MS) {
+                                it.executeJavaScript(LOGIN_FIELD_PROBE_JS)
+                            }
+                        }
+                    }
+                )
+            focusedLoginField = (probe as? LoginFieldProbe.Focused)?.field
+            delay(loginProbeDelayMs(probe))
         }
     }
 
@@ -2647,6 +2745,14 @@ internal fun FluckBrowserTabContent(
                                 quickCreateWebsitePrefill = websitePrefill
                                 showQuickCreateDialog = true
                             },
+                            onFillCredential = { secret ->
+                                coroutineScope.launch {
+                                    // No target index: the host reported this menu against the
+                                    // clicked field, and the page's own activeElement is what
+                                    // identifies it.
+                                    showFillNotice(browserHandle.fillCredential(secret))
+                                }
+                            },
                             isBookmarked = isBookmarked,
                             onAddBookmark = {
                                 // Add or remove bookmark using the host API
@@ -2700,6 +2806,112 @@ internal fun FluckBrowserTabContent(
                 }
             }
 
+            // Inline credential suggestions, anchored under the page's focused login box.
+            //
+            // The anchor is a zero-size Box offset to where the field is: BossPopup measures its
+            // anchor and, under HARDWARE_ACCELERATED, draws the list in an always-on-top window at
+            // that spot. Drawn in place it would be invisible the moment it extended over the page,
+            // because Chromium composites its own native window over the Compose scene - the same
+            // reason the URL autocomplete list goes through BossPopup.
+            //
+            // focusable = false is load-bearing rather than cosmetic here: a focusable overlay
+            // takes focus off the browser view, which blurs the very field the fill targets.
+            val suggestionField = focusedLoginField
+            val suggestionMatches =
+                remember(suggestionField?.pageUrl, allSecrets) {
+                    suggestionField
+                        ?.pageUrl
+                        ?.let { extractMainDomain(it) }
+                        ?.let { matchSecretsForDomain(it, allSecrets) }
+                        .orEmpty()
+                }
+            if (shouldOfferSuggestions(suggestionField, dismissedSuggestionId, suggestionMatches.size) &&
+                suggestionField != null
+            ) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        // CSS pixels scaled by the tab's zoom: the page reports its geometry in
+                        // its own coordinate space, which only equals the view's at 100%.
+                        .offset(
+                            x = (suggestionField.left * zoomLevel).dp,
+                            y = ((suggestionField.top + suggestionField.height) * zoomLevel).dp,
+                        )
+                        .width(
+                            (suggestionField.width * zoomLevel).dp
+                                .coerceIn(SUGGESTION_MIN_WIDTH, SUGGESTION_MAX_WIDTH)
+                        ),
+                ) {
+                    BossPopup(
+                        onDismissRequest = { dismissedSuggestionId = suggestionField.dismissId },
+                        focusable = false,
+                        anchoring = BossPopupAnchoring.AnchorBounds,
+                    ) {
+                        CredentialSuggestionList(
+                            secrets = suggestionMatches,
+                            onPick = { secret ->
+                                // Dismissed before the fill, not after: the fill suspends, and
+                                // leaving the list up over a box that is already being filled
+                                // reads as the click having done nothing.
+                                dismissedSuggestionId = suggestionField.dismissId
+                                coroutineScope.launch {
+                                    // The list is anchored to one specific box, so say which one
+                                    // rather than making the script re-derive it.
+                                    showFillNotice(
+                                        browserHandle.fillCredential(
+                                            secret,
+                                            targetIndex = suggestionField.index,
+                                        )
+                                    )
+                                }
+                            },
+                            onShowAll = {
+                                dismissedSuggestionId = suggestionField.dismissId
+                                showAllSecretsDialog = true
+                            },
+                            onDismiss = { dismissedSuggestionId = suggestionField.dismissId },
+                        )
+                    }
+                }
+            }
+
+            // Why a fill did nothing. Only failures are announced - a fill that worked is visible
+            // in the page itself, and a toast for it would be noise on every login.
+            fillNotice?.let { notice ->
+                LaunchedEffect(fillNoticeSeq) {
+                    delay(FILL_NOTICE_DURATION_MS)
+                    fillNotice = null
+                }
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 24.dp),
+                    color = BossThemeColors.SurfaceColor,
+                    shape = RoundedCornerShape(6.dp),
+                    elevation = 6.dp,
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            Icons.Default.Warning,
+                            contentDescription = null,
+                            // error, not primary: an accent-tinted warning reads as informational,
+                            // and this only ever appears when a fill did not land.
+                            tint = MaterialTheme.colors.error,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            notice,
+                            color = BossThemeColors.TextPrimary,
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
+            }
+
             // Secret Selection Dialog
             if (showAllSecretsDialog) {
                 SecretSelectionDialog(
@@ -2712,7 +2924,8 @@ internal fun FluckBrowserTabContent(
                         showAllSecretsDialog = false
                         quickCreateWebsitePrefill = websitePrefill
                         showQuickCreateDialog = true
-                    }
+                    },
+                    onFillResult = showFillNotice
                 )
             }
 
@@ -2935,7 +3148,7 @@ data class ContextMenuItem(
  * Extract main domain from URL for secret matching.
  * e.g., "https://mail.google.com/inbox" -> "google.com"
  */
-private fun extractMainDomain(url: String): String? {
+internal fun extractMainDomain(url: String): String? {
     return try {
         val uri = java.net.URI(url)
         val host = uri.host ?: return null
@@ -2949,7 +3162,19 @@ private fun extractMainDomain(url: String): String? {
         val parts = host.split(".")
         if (parts.size >= 2) {
             // Common multi-part TLDs
-            val multiPartTlds = setOf("co.uk", "com.au", "co.jp", "co.nz", "com.br", "co.in")
+            // Not a public-suffix list, but the suffixes that matter most here. Without them
+            // every tenant of a shared host reduces to the same registrable domain, so a
+            // credential saved on one person's *.vercel.app would be offered, unprompted, beside
+            // a login box on anyone else's. That was harmless while this only ranked a menu; it is
+            // not now that it gates an unprompted suggestion.
+            val multiPartTlds =
+                setOf(
+                    "co.uk", "org.uk", "ac.uk", "com.au", "co.jp", "co.nz", "com.br", "co.in",
+                    "co.za", "com.cn", "co.kr",
+                    "github.io", "vercel.app", "herokuapp.com", "netlify.app", "pages.dev",
+                    "web.app", "firebaseapp.com", "appspot.com", "myshopify.com", "blogspot.com",
+                    "azurewebsites.net", "cloudfront.net", "workers.dev",
+                )
             val lastTwo = "${parts[parts.size - 2]}.${parts[parts.size - 1]}"
 
             if (multiPartTlds.contains(lastTwo) && parts.size >= 3) {
@@ -2966,30 +3191,91 @@ private fun extractMainDomain(url: String): String? {
 }
 
 /**
- * Match secrets against a domain.
- * Returns secrets where the website field matches the domain.
+ * The registrable domain a secret's `website` refers to, or null if it does not name a site.
+ *
+ * [extractMainDomain] answers null for a bare authority, because `java.net.URI("google.com")`
+ * parses it as a *path* and reports no host. Most stored websites are bare - "github.com",
+ * "accounts.google.com" - so the bare form is retried with a scheme rather than treated as
+ * unparseable.
+ *
+ * A value with no dot in it is not a domain and gets null. That is what keeps a secret labelled
+ * "GOOGLE" (an API key) out of the login list for google.com, and one labelled "android" out of
+ * every list. The single exception is `localhost`, which [extractMainDomain] already treats as a
+ * host in its own right, so a secret saved for it has to resolve the same way or it would never
+ * match the page it was saved on.
  */
-private fun matchSecretsForDomain(
+internal fun secretWebsiteDomain(website: String): String? {
+    val trimmed = website.trim().lowercase()
+    if (trimmed.isEmpty()) return null
+    extractMainDomain(trimmed)?.let { return it }
+    val authority =
+        trimmed
+            .substringBefore('/')
+            .substringBefore('?')
+            .substringAfter('@')
+            .substringBefore(':')
+    if (authority == LOCALHOST || authority.startsWith("127.")) return authority
+    if (!authority.contains('.')) return null
+    return extractMainDomain("https://$authority")
+}
+
+private const val LOCALHOST = "localhost"
+
+/**
+ * Match secrets against the page's registrable domain.
+ *
+ * Domain relationships, not substrings. The old rule accepted a match in either direction with
+ * `contains`, which meant a secret whose website was the bare word "GOOGLE" - the Gemini API key -
+ * was offered as a **login credential** for google.com, because "google.com".contains("google").
+ * Every short label was a wildcard over every domain containing it.
+ *
+ * Equality plus either-way suffix keeps the cases that matter: a secret saved for
+ * "accounts.google.com" is offered on google.com and vice versa, since both reduce to the same
+ * registrable domain, while "google.com" and "notgoogle.com" stay unrelated.
+ */
+internal fun matchSecretsForDomain(
     domain: String,
     secrets: List<SecretEntryData>,
     maxResults: Int = 5
 ): List<SecretEntryData> {
-    val lowerDomain = domain.lowercase()
+    val pageDomain = domain.trim().lowercase()
+    if (pageDomain.isEmpty()) return emptyList()
 
-    return secrets.filter { secret ->
-        val secretDomain = extractMainDomain(secret.website)?.lowercase()
-            ?: secret.website.lowercase()
+    return secrets.filter { secretMatchesDomain(pageDomain, it) }.take(maxResults)
+}
 
-        secretDomain.contains(lowerDomain) || lowerDomain.contains(secretDomain) ||
-                secret.website.lowercase().contains(lowerDomain)
-    }.take(maxResults)
+/**
+ * Whether one secret belongs to [pageDomain].
+ *
+ * Extracted so there is exactly one rule. The "Select Secret to Fill" dialog carried a
+ * hand-inlined copy of the old substring test, and its `?: ""` fallback made it worse than the
+ * original: `contains("")` is always true, so every secret whose website does not parse as a
+ * domain - "GOOGLE", "android", a GitHub Actions secret label - was badged as matching the current
+ * site. That dialog is where the suggestion list's "Other logins..." row sends the user, so the
+ * fix to [matchSecretsForDomain] stopped one click short of where it was needed.
+ *
+ * [pageDomain] is expected already reduced by [extractMainDomain].
+ */
+internal fun secretMatchesDomain(
+    pageDomain: String,
+    secret: SecretEntryData,
+): Boolean {
+    val page = pageDomain.trim().lowercase()
+    if (page.isEmpty()) return false
+    val secretDomain = secretWebsiteDomain(secret.website) ?: return false
+    // Equality carries the common case, since both sides are already registrable domains. The
+    // suffix arms only fire for the dotless hosts secretWebsiteDomain returns verbatim (localhost,
+    // 127.*), which extractMainDomain does not reduce.
+    return secretDomain == page ||
+        secretDomain.endsWith(".$page") ||
+        page.endsWith(".$secretDomain")
 }
 
 /**
  * Get display name for a website.
  * Extracts a clean, readable name from the website URL.
  */
-private fun getDisplayName(website: String): String {
+internal fun getDisplayName(website: String): String {
     return try {
         val domain = extractMainDomain(website) ?: website
         // Capitalize first letter of domain
@@ -3014,7 +3300,11 @@ internal fun buildContextMenuItems(
     onShowAllSecrets: () -> Unit = {},
     onAddNewSecret: (websitePrefill: String) -> Unit = {},
     isBookmarked: Boolean = false,
-    onAddBookmark: () -> Unit = {}
+    onAddBookmark: () -> Unit = {},
+    // The fill itself belongs to the caller: it owns the page-scripting path and the notice a
+    // fill that lands nowhere has to produce. Building a menu and performing a fill are separate
+    // jobs, and the second one needs a suspend context this builder does not have.
+    onFillCredential: (SecretEntryData) -> Unit = {}
 ): List<ContextMenuItem> = buildList {
     // Check if form field is focused (editable element)
     if (info?.isEditable == true) {
@@ -3071,18 +3361,7 @@ internal fun buildContextMenuItems(
 
                         add(ContextMenuItem(
                             text = "$displayName ($usernamePreview)",
-                            onClick = {
-                                // Fill credentials using the browser handle
-                                coroutineScope?.launch {
-                                    browserHandle.onBrowser("fillCredentials") {
-                                        it.fillCredentials(
-                                            username = secret.username,
-                                            password = secret.password,
-                                            fillBoth = true
-                                        )
-                                    }
-                                }
-                            }
+                            onClick = { onFillCredential(secret) }
                         ))
                     }
                 } else {
@@ -4285,7 +4564,8 @@ private fun SecretSelectionDialog(
     browserHandle: BrowserHandle?,
     coroutineScope: CoroutineScope,
     onDismiss: () -> Unit,
-    onAddNewSecret: (websitePrefill: String) -> Unit
+    onAddNewSecret: (websitePrefill: String) -> Unit,
+    onFillResult: (CredentialFill.Result) -> Unit = {}
 ) {
     var searchQuery by remember { mutableStateOf("") }
 
@@ -4461,19 +4741,15 @@ private fun SecretSelectionDialog(
                         items(filteredSecrets) { secret ->
                             SecretListItem(
                                 secret = secret,
+                                // The same predicate the list and the menu use. This was a
+                                // hand-inlined copy of the old substring rule.
                                 isMatched = currentDomain != null &&
-                                    (secret.website.lowercase().contains(currentDomain.lowercase()) ||
-                                     currentDomain.lowercase().contains(extractMainDomain(secret.website)?.lowercase() ?: "")),
+                                    secretMatchesDomain(currentDomain, secret),
                                 onClick = {
                                     coroutineScope.launch {
-                                        browserHandle.onBrowser("fillCredentials") {
-                                            it.fillCredentials(
-                                                username = secret.username,
-                                                password = secret.password,
-                                                fillBoth = true
-                                            )
-                                        }
+                                        val result = browserHandle.fillCredential(secret)
                                         onDismiss()
+                                        onFillResult(result)
                                     }
                                 }
                             )
