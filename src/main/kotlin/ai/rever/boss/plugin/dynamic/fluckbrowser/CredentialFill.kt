@@ -9,13 +9,13 @@ import kotlinx.serialization.json.Json
  * `BrowserHandle.fillCredentials` exists and is where this used to go, but it takes only
  * `(username, password, fillBoth)`. It has **no parameter for which field the user acted on**, so
  * it can only guess - and its guess picked Google's `display: none` `hiddenPassword` decoy while
- * leaving the visible email box empty. BossConsole#215 fixes the guess, but two things stay true
- * after it ships:
+ * leaving the visible email box empty.
  *
- * 1. This plugin knows something the host API cannot express. The right-click menu knows the
- *    clicked field, and the suggestion list is anchored to a specific box. Filling *that* field is
- *    better information than any heuristic, so it belongs on this side of the boundary.
- * 2. A fix that needs a host release does not reach the person who reported this today.
+ * Fixing that guess was the first attempt. It is being deleted instead, because the guess is the
+ * design error: this plugin knows something the API cannot express. The right-click menu was raised
+ * on a specific field and the suggestion list is anchored to a specific box, so filling *that* box
+ * is better information than any heuristic can reconstruct - which puts credential filling on the
+ * caller's side of the boundary, not the host's.
  *
  * There is no fallback to it. Both paths go through `mainFrame().executeJavaScript`, so every
  * condition that stops this one - a torn-down handle, no main frame, a throwing call - stops the
