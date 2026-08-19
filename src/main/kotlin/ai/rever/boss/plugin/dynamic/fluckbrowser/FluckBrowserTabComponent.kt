@@ -1219,45 +1219,25 @@ internal inline fun <T> BrowserHandle?.onBrowser(
  * [targetIndex] is the field's position in the eligible-login-field list when the caller knows it
  * (the suggestion list does; the right-click menu does not and relies on `document.activeElement`).
  *
- * The host call remains the fallback for a page that cannot be scripted at all. It is tried only
- * when the script produced no answer whatsoever, never to second-guess an answer it did give: a
- * script reporting "no password box on this page" is correct about a two-step sign-in, and
- * retrying through the old guess is exactly how the password reached a hidden field.
+ * There is deliberately **no fallback to `fillCredentials`**. An earlier version had one, for a
+ * page that could not be scripted at all - but it could never help: both paths go through
+ * `mainFrame().executeJavaScript`, so every condition that makes this return null (a torn-down
+ * handle, no main frame, a throwing call) fails the host's injector for the same reason. A
+ * fallback that cannot succeed where the primary failed is not a safety net, it is a second way to
+ * write a password somewhere nobody asked for. `fillCredentials` is being removed from the api
+ * outright, so this is the only credential-fill path there is.
  */
 internal suspend fun BrowserHandle?.fillCredential(
     secret: SecretEntryData,
     targetIndex: Int? = null,
-): CredentialFill.Result {
-    val answer =
+): CredentialFill.Result =
+    CredentialFill.parseResult(
         onBrowser("fillCredential") {
             it.executeJavaScript(
                 CredentialFill.script(secret.username, secret.password, targetIndex)
             ) as? String
         }
-    val scripted = CredentialFill.parseResult(answer)
-    if (scripted.username != CredentialFill.FieldOutcome.UNKNOWN ||
-        scripted.password != CredentialFill.FieldOutcome.UNKNOWN
-    ) {
-        return scripted
-    }
-
-    val hostFilled =
-        onBrowser("fillCredentials") {
-            it.fillCredentials(
-                username = secret.username,
-                password = secret.password,
-                fillBoth = true
-            )
-        }
-    // The host answers a bare Boolean, so which field it managed is unknowable from here. UNKNOWN
-    // on the password side is honest rather than lazy: claiming ABSENT would suppress a notice the
-    // user may need.
-    return if (hostFilled == true) {
-        CredentialFill.Result(CredentialFill.FieldOutcome.FILLED, CredentialFill.FieldOutcome.UNKNOWN)
-    } else {
-        scripted
-    }
-}
+    )
 
 internal class FluckBrowserTabState {
     // private set, with adoptBrowserHandle/releaseBrowserHandle as the only writers. The

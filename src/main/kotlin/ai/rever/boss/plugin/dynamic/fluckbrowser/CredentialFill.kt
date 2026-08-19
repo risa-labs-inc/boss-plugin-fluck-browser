@@ -17,7 +17,12 @@ import kotlinx.serialization.json.Json
  *    better information than any heuristic, so it belongs on this side of the boundary.
  * 2. A fix that needs a host release does not reach the person who reported this today.
  *
- * `fillCredentials` remains the fallback for when the page cannot be scripted at all.
+ * There is no fallback to it. Both paths go through `mainFrame().executeJavaScript`, so every
+ * condition that stops this one - a torn-down handle, no main frame, a throwing call - stops the
+ * host's injector for the same reason. A fallback that cannot succeed where the primary failed is
+ * not a safety net, just a second way to write a password somewhere nobody asked for. The host
+ * implementation and the API method itself are being removed alongside this
+ * (BossConsole#215, boss-plugin-api).
  */
 internal object CredentialFill {
     /** What happened to one of the two fields. */

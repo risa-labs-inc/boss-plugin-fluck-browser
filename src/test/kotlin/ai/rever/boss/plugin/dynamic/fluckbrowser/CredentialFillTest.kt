@@ -120,9 +120,9 @@ class CredentialFillTest {
     }
 
     @Test
-    fun `the host fallback's one-sided success is not turned into a warning`() {
-        // fillCredential maps a successful host call to FILLED + UNKNOWN, because a bare Boolean
-        // cannot say which field it managed. That must not produce a notice.
+    fun `a half-known outcome still says nothing when something landed`() {
+        // UNKNOWN is not evidence of failure. Something demonstrably went in, and warning on the
+        // strength of the half we cannot read would fire on a fill the user can see worked.
         assertNull(CredentialFill.notice(CredentialFill.Result(FieldOutcome.FILLED, FieldOutcome.UNKNOWN)))
     }
 
