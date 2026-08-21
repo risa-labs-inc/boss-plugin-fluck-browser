@@ -1907,7 +1907,7 @@ internal fun FluckBrowserTabContent(
     // Where a pushed capture is handed from the JxBrowser thread to composition. CONFLATED because
     // only the newest submission matters, and because the sink must never block the page's own
     // event dispatch - trySend on a conflated channel cannot.
-    val captureChannel = remember { Channel<String>(Channel.CONFLATED) }
+    val captureChannel = remember { Channel<CapturedEvent>(Channel.CONFLATED) }
 
     // The generated password currently on offer, and a tick the Regenerate button advances. Keyed
     // remember rather than plain state so it is stable across recomposition: rerolling on every
@@ -2451,10 +2451,13 @@ internal fun FluckBrowserTabContent(
             return@LaunchedEffect
         }
         runCatching {
-            handle.setPageEventScript(CredentialCapture.INSTALL_JS) { json ->
+            handle.setPageEventScript(CredentialCapture.INSTALL_JS) { url, json ->
                 // JxBrowser thread, inside the page's own event dispatch. trySend and nothing else:
                 // a blocking hand-off here would stall the submit the user just performed.
-                captureChannel.trySend(json)
+                //
+                // `url` is the host's reading of the document that posted, taken at the moment of
+                // the call. Carried through rather than resolved later - see the collector.
+                captureChannel.trySend(CapturedEvent(url, json))
             }
         }.onFailure {
             // An older host has no implementation and the api default is a no-op, so this is the
@@ -2466,17 +2469,19 @@ internal fun FluckBrowserTabContent(
     // Turn a pushed capture into a pending save.
     LaunchedEffect(captureChannel, offerToSavePasswordsEnabled) {
         if (!offerToSavePasswordsEnabled) return@LaunchedEffect
-        for (raw in captureChannel) {
-            val captured = CredentialCapture.parse(raw) ?: continue
-            // The domain comes from the ENGINE's committed URL, never from the page's payload: the
-            // bridge is reachable by any script on the page, so a page-supplied origin would let a
-            // site offer a credential for a domain it does not own. Off the UI thread for the same
-            // reason the probe is - this is a call into a renderer that may be busy.
-            val committed =
-                withContext(Dispatchers.IO) {
-                    runCatching { browserHandle?.getCurrentUrl() }.getOrNull()
-                }
-            val domain = extractMainDomain(committed ?: currentUrl) ?: continue
+        for (event in captureChannel) {
+            val captured = CredentialCapture.parse(event.json) ?: continue
+            // The domain comes from the URL the HOST read off the posting document, never from the
+            // page's payload: the bridge is reachable by any script on the page, so a page-supplied
+            // origin would let a site offer a credential for a domain it does not own.
+            //
+            // It is also why this no longer calls getCurrentUrl(). That read happened after a
+            // channel hop, by which time the navigation the submit itself started could have
+            // committed - attributing the credential to the page the login LANDED on rather than the
+            // one it was typed into, which for a cross-domain sign-in means storing it against the
+            // wrong site entirely. The host reads its URL inside the page's own event dispatch,
+            // before any of that.
+            val domain = extractMainDomain(event.url) ?: continue
             if (domain in neverSaveDomains) continue
             pendingSave =
                 CredentialSavePolicy.Pending(

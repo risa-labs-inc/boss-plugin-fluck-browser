@@ -125,9 +125,13 @@ that positions the saved-logins list runs several times a second and reports onl
 has a value, never the value - a periodic read that returned page text would be a keylogger.
 
 A captured credential is held in memory, never written to disk, and is dropped after 90 seconds if
-the login never resolves. The bridge the script emits through is a property on `window`, so the
-plugin treats what arrives as untrusted: the site a credential is attributed to comes from the
-engine's own committed URL and never from the page's payload.
+the login never resolves.
+
+The bridge the script posts through is a property on `window`, which has three consequences the
+script and the plugin both have to handle. It captures the bridge at document start and removes the
+property, so no page script can replace it and receive the credential, forge an event, or detect
+BOSS by probing for it. What does arrive is treated as untrusted, and the site a credential is
+attributed to comes from the URL the host reads off the posting document, never from the payload.
 
 ## Requirements
 
