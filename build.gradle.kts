@@ -37,8 +37,8 @@ dependencies {
         // Local development: use boss-plugin-api JAR from sibling repo.
         // Also on the test classpath (compileOnly doesn't propagate there) so
         // tests can reference api types like BrowserHandle.
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.73.jar"))
-        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.73.jar"))
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.82.jar"))
+        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.82.jar"))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))

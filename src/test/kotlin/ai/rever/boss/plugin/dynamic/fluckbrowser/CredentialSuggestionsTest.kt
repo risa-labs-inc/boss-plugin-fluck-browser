@@ -3,6 +3,8 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
@@ -167,5 +169,130 @@ class CredentialSuggestionsTest {
             loginProbeDelayMs(LoginFieldProbe.NoLoginField),
             loginProbeDelayMs(parseLoginFieldProbe("{not json")),
         )
+    }
+
+    // -------------------------------------------------- the generated-password offer
+
+    /**
+     * A probe answer from BEFORE isNewPassword / maxLength / pattern existed.
+     *
+     * The plugin and the script always ship together, so this is not about a version skew - it is
+     * about the decoder. These fields are defaulted, and a strict decode would make one older-shaped
+     * answer collapse the whole thing to NoLoginField, which is a feature that silently never
+     * appears rather than an error anyone sees.
+     */
+    @Test
+    fun `a probe answer without the newer fields still parses`() {
+        val probe = parseLoginFieldProbe(focusedJson)
+        val field = assertIs<LoginFieldProbe.Focused>(probe).field
+        assertFalse(field.isNewPassword)
+        assertEquals(-1, field.maxLength)
+        assertNull(field.pattern)
+    }
+
+    @Test
+    fun `a new-password field carries what the generator needs`() {
+        val json =
+            """
+            {"key":"1|new_password|pw|password","isPassword":true,"isNewPassword":true,
+             "maxLength":16,"pattern":"[A-Za-z0-9]+",
+             "pageUrl":"https://example.com/signup","hasValue":false,
+             "left":10.0,"top":20.0,"width":200.0,"height":30.0}
+            """.trimIndent()
+        val field = assertIs<LoginFieldProbe.Focused>(parseLoginFieldProbe(json)).field
+        assertTrue(field.isNewPassword)
+        assertEquals(16, field.maxLength)
+        assertEquals("[A-Za-z0-9]+", field.pattern)
+    }
+
+    private fun newPasswordField(
+        maxLength: Int = -1,
+        hasValue: Boolean = false,
+        isNewPassword: Boolean = true,
+        isPassword: Boolean = true,
+    ) = FocusedLoginField(
+        key = "1|password|pw|password",
+        isPassword = isPassword,
+        isNewPassword = isNewPassword,
+        maxLength = maxLength,
+        pageUrl = "https://example.com/signup",
+        hasValue = hasValue,
+        left = 0.0,
+        top = 0.0,
+        width = 200.0,
+        height = 30.0,
+    )
+
+    @Test
+    fun `a generated password is offered on an empty new-password box`() {
+        assertTrue(shouldOfferGeneratedPassword(newPasswordField(), dismissedId = null, enabled = true))
+    }
+
+    @Test
+    fun `nothing is offered when the setting is off`() {
+        assertFalse(shouldOfferGeneratedPassword(newPasswordField(), dismissedId = null, enabled = false))
+    }
+
+    @Test
+    fun `an ordinary sign-in password box gets no suggestion`() {
+        // Offering to replace the password of an account that already exists is the one thing this
+        // must never do on a login form.
+        assertFalse(
+            shouldOfferGeneratedPassword(
+                newPasswordField(isNewPassword = false),
+                dismissedId = null,
+                enabled = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `a box the user has started typing in is left alone`() {
+        assertFalse(
+            shouldOfferGeneratedPassword(newPasswordField(hasValue = true), dismissedId = null, enabled = true),
+        )
+    }
+
+    @Test
+    fun `a field too short for a decent password gets no offer`() {
+        assertFalse(
+            shouldOfferGeneratedPassword(newPasswordField(maxLength = 8), dismissedId = null, enabled = true),
+        )
+    }
+
+    @Test
+    fun `a dismissal is respected, and the menu is the way back`() {
+        val f = newPasswordField()
+        assertFalse(shouldOfferGeneratedPassword(f, dismissedId = f.dismissId, enabled = true))
+        // Without the forced path, waving the card away makes that field a dead end: the automatic
+        // offer stays suppressed for exactly the box the user then wants help with.
+        assertTrue(shouldOfferGeneratedPassword(f, dismissedId = f.dismissId, enabled = true, forced = true))
+    }
+
+    @Test
+    fun `an explicit request needs no new-password heuristic, but still needs a password box`() {
+        assertTrue(
+            shouldOfferGeneratedPassword(
+                newPasswordField(isNewPassword = false),
+                dismissedId = null,
+                enabled = true,
+                forced = true,
+            ),
+        )
+        // The menu item can never put a generated password into a username field.
+        assertFalse(
+            shouldOfferGeneratedPassword(
+                newPasswordField(isPassword = false, isNewPassword = false),
+                dismissedId = null,
+                enabled = true,
+                forced = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `an explicit request still respects the setting and a filled box`() {
+        assertFalse(shouldOfferGeneratedPassword(newPasswordField(), null, enabled = false, forced = true))
+        assertFalse(shouldOfferGeneratedPassword(newPasswordField(hasValue = true), null, true, forced = true))
     }
 }

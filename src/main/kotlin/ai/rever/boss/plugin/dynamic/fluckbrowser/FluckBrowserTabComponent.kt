@@ -14,6 +14,7 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.ScreenCaptureProvider
 import ai.rever.boss.plugin.api.SecretDataProvider
 import ai.rever.boss.plugin.api.SecretEntryData
+import ai.rever.boss.plugin.api.UpdateSecretRequestData
 import ai.rever.boss.plugin.api.TabComponentWithUI
 import ai.rever.boss.plugin.api.TabInfo
 import ai.rever.boss.plugin.api.TabTypeId
@@ -108,6 +109,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -1227,6 +1229,127 @@ internal inline fun <T> BrowserHandle?.onBrowser(
  * write a password somewhere nobody asked for. `fillCredentials` is being removed from the api
  * outright, so this is the only credential-fill path there is.
  */
+/**
+ * Fill a generated [password] into the new-password box at [targetIndex] and its confirm twin.
+ *
+ * Separate from [fillCredential] because the two want opposite things from the result. That one
+ * must not compare what it wrote (a site masking or reformatting on input has still accepted the
+ * user's credential, and calling that a failure would warn about a fill that worked). This one
+ * must: the password is about to be written to Secret Manager, so what the field ended up holding
+ * is the only value worth storing.
+ */
+internal suspend fun BrowserHandle?.fillNewPassword(
+    password: String,
+    targetIndex: Int? = null,
+): CredentialFill.NewPasswordResult =
+    CredentialFill.parseNewPasswordResult(
+        onBrowser("fillNewPassword") {
+            it.executeJavaScript(CredentialFill.newPasswordScript(password, targetIndex))
+        }?.toString()
+    )
+
+/** Re-read the secret list, so a write is reflected in the suggestions immediately. */
+internal suspend fun reloadSecrets(
+    provider: SecretDataProvider?,
+    onLoaded: (List<SecretEntryData>) -> Unit,
+) {
+    val loaded = runCatching { provider?.getUserSecrets(limit = 1000) }.getOrNull()
+    onLoaded(loaded?.getOrNull()?.data ?: return)
+}
+
+/**
+ * Store a generated password, then find the row it became so Edit can correct it.
+ *
+ * Returns null when the write failed. The id lookup is a re-read because `createSecret` answers
+ * `Result<Unit>` and does not hand one back; a null id is survivable (Edit falls back to creating a
+ * second entry) but worth trying for.
+ */
+internal suspend fun saveGeneratedPassword(
+    provider: SecretDataProvider?,
+    domain: String,
+    username: String,
+    password: String,
+    onSecretsReloaded: (List<SecretEntryData>) -> Unit,
+): SavedSecretNotice? {
+    if (provider == null) return null
+    val created =
+        runCatching {
+            provider.createSecret(
+                CreateSecretRequestData(website = domain, username = username, password = password),
+            )
+        }.getOrNull() ?: return null
+    if (created.isFailure) return null
+
+    val reloaded = runCatching { provider.getUserSecrets(limit = 1000) }.getOrNull()?.getOrNull()?.data
+    if (reloaded != null) onSecretsReloaded(reloaded)
+    val id =
+        reloaded
+            ?.let { matchSecretsForDomain(domain, it) }
+            ?.firstOrNull { it.password == password && it.username == username }
+            ?.id
+    return SavedSecretNotice(domain = domain, username = username, password = password, secretId = id)
+}
+
+/**
+ * Apply a save-bar decision.
+ *
+ * **The update path passes every field of the existing secret back, and that is not defensive
+ * tidiness - it is required.** `update_secret` is a full replace: it assigns `notes` and
+ * `expiration_date` from its parameters unconditionally, deletes and re-inserts the tag rows, and
+ * (the sharp one) `DELETE`s the whole `secret_metadata` row whenever `p_twofa_enabled` is false.
+ * Omitting a field does not leave it alone, it destroys it - so an update that only meant to change
+ * a password would silently drop the user's notes, tags and recovery codes.
+ *
+ * One case is unpreservable through that API and so is refused rather than mangled: a secret whose
+ * metadata row holds a TOTP seed while 2FA is marked disabled. Passing `twofaEnabled = false` would
+ * delete the row and the seed with it, and there is no parameter to send the seed back.
+ */
+internal suspend fun storeCredential(
+    provider: SecretDataProvider?,
+    decision: CredentialSavePolicy.Decision,
+    domain: String,
+    username: String,
+    password: String,
+): Boolean {
+    if (provider == null) return false
+    if (username.isBlank() || password.isBlank()) return false
+    val result =
+        runCatching {
+            when (decision) {
+                CredentialSavePolicy.Decision.Ignore -> return false
+                is CredentialSavePolicy.Decision.Save ->
+                    provider.createSecret(
+                        CreateSecretRequestData(website = domain, username = username, password = password),
+                    )
+                is CredentialSavePolicy.Decision.Update -> {
+                    val existing = decision.secret
+                    val meta = existing.metadata
+                    if (meta != null && !meta.twofaEnabled && !meta.twofaSecret.isNullOrBlank()) {
+                        return false
+                    }
+                    provider.updateSecret(
+                        UpdateSecretRequestData(
+                            secretId = existing.id,
+                            website = existing.website,
+                            username = username,
+                            password = password,
+                            notes = existing.notes,
+                            expirationDate = existing.expirationDate,
+                            tags = existing.tags,
+                            twofaEnabled = meta?.twofaEnabled ?: false,
+                            twofaType = meta?.twofaType,
+                            recoveryCodes = meta?.recoveryCodes ?: emptyList(),
+                        ),
+                    )
+                }
+            }
+        }.getOrNull() ?: return false
+    return result.isSuccess
+}
+
+internal const val GENERATED_FILL_FAILED_NOTICE = "Could not fill the new password box on this page"
+internal const val GENERATED_SAVE_FAILED_NOTICE = "Could not save to Secret Manager"
+
 internal suspend fun BrowserHandle?.fillCredential(
     secret: SecretEntryData,
     targetIndex: Int? = null,
@@ -1746,6 +1869,57 @@ internal fun FluckBrowserTabContent(
     var focusedLoginField by remember { mutableStateOf<FocusedLoginField?>(null) }
     var dismissedSuggestionId by remember { mutableStateOf<String?>(null) }
 
+    // The probe's last full answer, and a counter that advances on every answer.
+    //
+    // focusedLoginField alone is not enough for the save prompt: it is null for both "there is no
+    // login form here" (which is what a successful sign-in looks like) and "the user is not in one
+    // right now" (which is what a FAILED sign-in looks like, with the form still on screen). The
+    // counter is what makes a capture wait for a FRESH observation - without it, the initial
+    // NoLoginField would read as "the form is gone" the instant a credential is captured, and the
+    // prompt would appear on submit rather than on success.
+    var lastProbe by remember { mutableStateOf<LoginFieldProbe>(LoginFieldProbe.NoLoginField) }
+    var probeSeq by remember { mutableStateOf(0L) }
+
+    // Settings, read on each composition rather than remembered, so flipping the toggle in the host
+    // takes effect without a restart. Absent means ON: the host publishes both defaults up front
+    // (BrowserSettings.init), and defaulting a password manager to off would leave a feature nobody
+    // finds. Compare showShareButton below, which defaults OFF and so tests for "true".
+    val suggestPasswordsEnabled = System.getProperty("boss.fluck.suggestPasswords") != "false"
+    val offerToSavePasswordsEnabled = System.getProperty("boss.fluck.offerToSavePasswords") != "false"
+
+    // A credential the user submitted, waiting to find out whether the login worked. Memory only,
+    // never persisted. See CredentialSavePolicy.
+    var pendingSave by remember { mutableStateOf<CredentialSavePolicy.Pending?>(null) }
+    var pendingSaveProbeSeq by remember { mutableStateOf(0L) }
+    var saveDecision by remember { mutableStateOf<CredentialSavePolicy.Decision?>(null) }
+    // Editable, because a two-step sign-in's second screen has no identifier in the document.
+    var saveUsernameDraft by remember { mutableStateOf("") }
+    // "Never for this site", for this tab's lifetime. Not persisted: an answer that outlived the
+    // session would leave no way to be asked again short of editing a file.
+    var neverSaveDomains by remember { mutableStateOf(setOf<String>()) }
+
+    // Where a pushed capture is handed from the JxBrowser thread to composition. CONFLATED because
+    // only the newest submission matters, and because the sink must never block the page's own
+    // event dispatch - trySend on a conflated channel cannot.
+    val captureChannel = remember { Channel<String>(Channel.CONFLATED) }
+
+    // The generated password currently on offer, and a tick the Regenerate button advances. Keyed
+    // remember rather than plain state so it is stable across recomposition: rerolling on every
+    // frame would make the card unreadable and would save something other than what was shown.
+    var regenerateTick by remember { mutableStateOf(0) }
+
+    // Confirmation that a generated password reached Secret Manager, with what is needed to open it
+    // for editing. Holds the password because Edit prefills the dialog with it.
+    var savedSecretNotice by remember { mutableStateOf<SavedSecretNotice?>(null) }
+
+    // Set by the saved-notice's Edit button. Opens the quick dialog on the secret just written.
+    var editingSavedSecret by remember { mutableStateOf<SavedSecretNotice?>(null) }
+
+    // Set by the right-click menu's "Suggest Strong Password". The automatic offer is suppressed on
+    // a field the user has waved away, which otherwise makes that field a dead end - this is the
+    // way back.
+    var forceSuggestPassword by remember { mutableStateOf(false) }
+
     // A fill that lands needs no announcement. One that does not is otherwise indistinguishable
     // from a click that never registered, which is exactly how a resolver picking the wrong field
     // went unnoticed for so long. The sequence number, not the message, keys the auto-dismiss:
@@ -2189,16 +2363,28 @@ internal fun FluckBrowserTabContent(
         }
     }
 
-    // Watch the page for a focused login box, so a saved credential can be offered beside it
-    // without the user having to discover the right-click menu first.
+    // Watch the page for a focused login box: to offer a saved credential beside it, to offer a
+    // generated one on a signup form, and to tell a successful sign-in from a failed one.
     //
-    // Four things keep the cost honest. It does not start unless this page actually has a saved
-    // credential to offer - not merely "the user owns a secret", which is true for almost everyone
-    // and would leave every tab probing every page forever. Its rate is decided by what it last
-    // found, so the quick rate only applies while the user is in a login box (see
-    // loginProbeDelayMs). An inactive tab is not composed - the host drops a background tab's
-    // Composable - so this stops on its own rather than running per open tab. And the call itself
-    // runs off the UI thread.
+    // THE GATE IS WIDER THAN IT WAS, and deliberately. It used to require this page to already
+    // have a saved credential, on the argument that "the user owns a secret" is true for almost
+    // everyone and would leave every tab probing every page forever. Two of the three jobs above
+    // cannot live with that: a signup form is by definition a page with nothing saved for it, and a
+    // credential that was just typed is one the domain has no secret for yet. So the probe now also
+    // runs when the suggestor is enabled, or while a capture is pending.
+    //
+    // What that actually costs, since the original argument deserves an answer rather than a
+    // shrug: a page with no login field is probed every 4s (loginProbeDelayMs), and an inactive tab
+    // is not composed at all - the host drops a background tab's Composable - so this is one
+    // round-trip per 4s per VISIBLE tab, not per open tab. The tab hibernation busy-check already
+    // makes a comparable call every 30s. The rate only becomes quick while the user is literally
+    // inside a login box.
+    //
+    // Worth knowing for later: a push channel now exists (setPageEventScript, see
+    // CredentialCapture), so this poll could be replaced by focus and geometry events. That is a
+    // rewrite of a shipped feature rather than part of this one, and it is not attempted here.
+    //
+    // The call itself runs off the UI thread.
     //
     // That last one is not optional. executeJavaScript blocks until the renderer answers, and a
     // renderer in a long task - heavy JS, a modal beforeunload, a devtools breakpoint - would park
@@ -2213,8 +2399,9 @@ internal fun FluckBrowserTabContent(
         remember(probeDomain, allSecrets) {
             probeDomain != null && matchSecretsForDomain(probeDomain, allSecrets).isNotEmpty()
         }
-    LaunchedEffect(browserHandle, hasCredentialsForPage) {
-        if (!hasCredentialsForPage) {
+    val probeWanted = hasCredentialsForPage || suggestPasswordsEnabled || pendingSave != null
+    LaunchedEffect(browserHandle, probeWanted) {
+        if (!probeWanted) {
             focusedLoginField = null
             return@LaunchedEffect
         }
@@ -2234,7 +2421,102 @@ internal fun FluckBrowserTabContent(
                     }
                 )
             focusedLoginField = (probe as? LoginFieldProbe.Focused)?.field
+            // Published together, and the counter last: an observer keyed on probeSeq must never
+            // read a stale lastProbe.
+            lastProbe = probe
+            probeSeq++
             delay(loginProbeDelayMs(probe))
+        }
+    }
+
+    // Install the credential-capture script, and take it back down when the setting is off.
+    //
+    // This is the only path by which a page value the user typed reaches the plugin, and it only
+    // ever fires on a submit. The periodic probe above stays value-free (hasValue: Boolean) for
+    // exactly that reason - see CredentialCapture's KDoc for the rule.
+    LaunchedEffect(browserHandle, offerToSavePasswordsEnabled) {
+        val handle = browserHandle ?: return@LaunchedEffect
+        if (!offerToSavePasswordsEnabled) {
+            // Also drops anything already captured: leaving a pending credential in memory after
+            // the feature is switched off would surface a prompt the user has just disabled.
+            pendingSave = null
+            saveDecision = null
+            runCatching { handle.setPageEventScript(null, null) }
+            return@LaunchedEffect
+        }
+        runCatching {
+            handle.setPageEventScript(CredentialCapture.INSTALL_JS) { json ->
+                // JxBrowser thread, inside the page's own event dispatch. trySend and nothing else:
+                // a blocking hand-off here would stall the submit the user just performed.
+                captureChannel.trySend(json)
+            }
+        }.onFailure {
+            // An older host has no implementation and the api default is a no-op, so this is the
+            // one place worth being explicit: no capture means no save prompt, not a broken tab.
+            println("[FluckBrowser] Page event script unavailable; no credential save prompt in this tab")
+        }
+    }
+
+    // Turn a pushed capture into a pending save.
+    LaunchedEffect(captureChannel, offerToSavePasswordsEnabled) {
+        if (!offerToSavePasswordsEnabled) return@LaunchedEffect
+        for (raw in captureChannel) {
+            val captured = CredentialCapture.parse(raw) ?: continue
+            // The domain comes from the ENGINE's committed URL, never from the page's payload: the
+            // bridge is reachable by any script on the page, so a page-supplied origin would let a
+            // site offer a credential for a domain it does not own. Off the UI thread for the same
+            // reason the probe is - this is a call into a renderer that may be busy.
+            val committed =
+                withContext(Dispatchers.IO) {
+                    runCatching { browserHandle?.getCurrentUrl() }.getOrNull()
+                }
+            val domain = extractMainDomain(committed ?: currentUrl) ?: continue
+            if (domain in neverSaveDomains) continue
+            pendingSave =
+                CredentialSavePolicy.Pending(
+                    domain = domain,
+                    username = captured.username,
+                    password = captured.password,
+                    wasFilledByBoss = captured.wasFilledByBoss,
+                    capturedAtMs = System.currentTimeMillis(),
+                )
+            // The observation the outcome has to be NEWER than. Without this the prompt would fire
+            // on submit rather than on success, because the probe's last answer still describes the
+            // page as it was before the credential went in.
+            pendingSaveProbeSeq = probeSeq
+            saveDecision = null
+        }
+    }
+
+    // Decide whether the login worked, and what to offer if it did.
+    LaunchedEffect(pendingSave, probeSeq) {
+        val pending = pendingSave ?: return@LaunchedEffect
+        // Already answered and showing; nothing to re-decide.
+        if (saveDecision != null) return@LaunchedEffect
+        // Wait for an observation taken after the capture.
+        if (probeSeq <= pendingSaveProbeSeq) return@LaunchedEffect
+        when (CredentialSavePolicy.outcome(pending, lastProbe, System.currentTimeMillis())) {
+            CredentialSavePolicy.Outcome.WAITING -> Unit
+            CredentialSavePolicy.Outcome.EXPIRED -> {
+                pendingSave = null
+                saveDecision = null
+            }
+            CredentialSavePolicy.Outcome.SUCCEEDED -> {
+                when (val decision = CredentialSavePolicy.decide(pending, allSecrets)) {
+                    CredentialSavePolicy.Decision.Ignore -> {
+                        // Already stored, or filled by us and unchanged. Say nothing at all.
+                        pendingSave = null
+                    }
+                    is CredentialSavePolicy.Decision.Save -> {
+                        saveUsernameDraft = decision.username
+                        saveDecision = decision
+                    }
+                    is CredentialSavePolicy.Decision.Update -> {
+                        saveUsernameDraft = decision.secret.username
+                        saveDecision = decision
+                    }
+                }
+            }
         }
     }
 
@@ -2753,6 +3035,14 @@ internal fun FluckBrowserTabContent(
                                     showFillNotice(browserHandle.fillCredential(secret))
                                 }
                             },
+                            canSuggestPassword = suggestPasswordsEnabled,
+                            onSuggestPassword = {
+                                // Clears the dismissal as well as forcing the offer: the request
+                                // came after the dismissal, so honouring the earlier "not this box"
+                                // would make the menu item do nothing at all.
+                                dismissedSuggestionId = null
+                                forceSuggestPassword = true
+                            },
                             isBookmarked = isBookmarked,
                             onAddBookmark = {
                                 // Add or remove bookmark using the host API
@@ -2875,6 +3165,220 @@ internal fun FluckBrowserTabContent(
                 }
             }
 
+            // A generated password, offered beside a new-password box.
+            //
+            // Anchored the same way the saved-logins list is, and drawn through BossPopup for the
+            // same reason: Chromium composites its own window over the Compose scene, so anything
+            // drawn in place over page content is invisible.
+            val generatorField = focusedLoginField
+            val generated =
+                remember(generatorField?.dismissId, generatorField?.maxLength, generatorField?.pattern, regenerateTick) {
+                    generatorField
+                        ?.takeIf { it.isNewPassword }
+                        ?.let { PasswordGenerator.generate(it.maxLength, it.pattern) }
+                        as? PasswordGenerator.Outcome.Generated
+                }
+            val generatedForced =
+                remember(generatorField?.dismissId, regenerateTick, forceSuggestPassword) {
+                    generatorField
+                        ?.takeIf { forceSuggestPassword && it.isPassword }
+                        ?.let { PasswordGenerator.generate(it.maxLength, it.pattern) }
+                        as? PasswordGenerator.Outcome.Generated
+                }
+            val offered = generated ?: generatedForced
+            if (generatorField != null &&
+                offered != null &&
+                shouldOfferGeneratedPassword(
+                    generatorField,
+                    dismissedSuggestionId,
+                    suggestPasswordsEnabled,
+                    forced = forceSuggestPassword,
+                )
+            ) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .offset(
+                            x = (generatorField.left * zoomLevel).dp,
+                            y = ((generatorField.top + generatorField.height) * zoomLevel).dp,
+                        ),
+                ) {
+                    BossPopup(
+                        onDismissRequest = { dismissedSuggestionId = generatorField.dismissId },
+                        focusable = false,
+                        anchoring = BossPopupAnchoring.AnchorBounds,
+                    ) {
+                        PasswordSuggestionCard(
+                            password = offered.password,
+                            alphanumericOnly = offered.alphanumericOnly,
+                            onUse = {
+                                forceSuggestPassword = false
+                                // Dismissed first, for the same reason the credential list is: the
+                                // fill suspends, and a card left over a box being filled reads as
+                                // the click having done nothing.
+                                dismissedSuggestionId = generatorField.dismissId
+                                coroutineScope.launch {
+                                    val result =
+                                        browserHandle.fillNewPassword(
+                                            offered.password,
+                                            targetIndex = generatorField.index,
+                                        )
+                                    // Save what LANDED, never what was generated. A field with
+                                    // maxlength=12 truncates silently, and storing the untruncated
+                                    // original would put a password in Secret Manager that has
+                                    // never worked on the account.
+                                    val landed = result.landed
+                                    if (!result.filled || landed.isNullOrEmpty()) {
+                                        fillNotice = GENERATED_FILL_FAILED_NOTICE
+                                        fillNoticeSeq++
+                                        return@launch
+                                    }
+                                    val domain =
+                                        extractMainDomain(generatorField.pageUrl)
+                                            ?: extractMainDomain(currentUrl)
+                                            ?: return@launch
+                                    savedSecretNotice =
+                                        saveGeneratedPassword(
+                                            provider = secretDataProvider,
+                                            domain = domain,
+                                            username = result.username.orEmpty(),
+                                            password = landed,
+                                            onSecretsReloaded = { allSecrets = it },
+                                        ) ?: run {
+                                            fillNotice = GENERATED_SAVE_FAILED_NOTICE
+                                            fillNoticeSeq++
+                                            null
+                                        }
+                                }
+                            },
+                            onRegenerate = { regenerateTick++ },
+                            onCopy = { copyToClipboard(offered.password) },
+                            onDismiss = {
+                                // Clearing the forced flag matters: left set, the card would follow
+                                // the caret onto every other password box on the page.
+                                forceSuggestPassword = false
+                                dismissedSuggestionId = generatorField.dismissId
+                            },
+                        )
+                    }
+                }
+            }
+
+            // Offer to store a credential the user just signed in with.
+            //
+            // Anchored under the toolbar rather than to a field: by the time this shows, the login
+            // form is gone from the page, so there is nothing left to point at.
+            saveDecision?.let { decision ->
+                val isUpdate = decision is CredentialSavePolicy.Decision.Update
+                val domain =
+                    when (decision) {
+                        is CredentialSavePolicy.Decision.Update -> getDisplayName(decision.secret.website)
+                        is CredentialSavePolicy.Decision.Save -> decision.domain
+                        CredentialSavePolicy.Decision.Ignore -> ""
+                    }
+                Box(modifier = Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 12.dp)) {
+                    BossPopup(
+                        onDismissRequest = {
+                            saveDecision = null
+                            pendingSave = null
+                        },
+                        focusable = true,
+                        anchoring = BossPopupAnchoring.AnchorBounds,
+                    ) {
+                        SaveCredentialBar(
+                            domain = domain,
+                            username = saveUsernameDraft,
+                            isUpdate = isUpdate,
+                            onUsernameChange = { saveUsernameDraft = it },
+                            onConfirm = {
+                                val pending = pendingSave
+                                saveDecision = null
+                                pendingSave = null
+                                if (pending != null) {
+                                    coroutineScope.launch {
+                                        val ok =
+                                            storeCredential(
+                                                provider = secretDataProvider,
+                                                decision = decision,
+                                                domain = pending.domain,
+                                                username = saveUsernameDraft,
+                                                password = pending.password,
+                                            )
+                                        if (ok) {
+                                            reloadSecrets(secretDataProvider) { allSecrets = it }
+                                        } else {
+                                            fillNotice = GENERATED_SAVE_FAILED_NOTICE
+                                            fillNoticeSeq++
+                                        }
+                                    }
+                                }
+                            },
+                            onNever = {
+                                val pending = pendingSave
+                                if (pending != null) neverSaveDomains = neverSaveDomains + pending.domain
+                                saveDecision = null
+                                pendingSave = null
+                            },
+                            onDismiss = {
+                                saveDecision = null
+                                pendingSave = null
+                            },
+                        )
+                    }
+                }
+            }
+
+            // Confirmation that a generated password was stored, with a way to correct it. The
+            // password is saved before this appears, deliberately: a signup that succeeds while the
+            // user ignores a prompt must not leave the only copy of a generated password on a page
+            // that is about to navigate away.
+            savedSecretNotice?.let { notice ->
+                LaunchedEffect(notice) {
+                    delay(SAVED_NOTICE_DURATION_MS)
+                    savedSecretNotice = null
+                }
+                Box(modifier = Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 12.dp)) {
+                    BossPopup(
+                        onDismissRequest = { savedSecretNotice = null },
+                        focusable = false,
+                        anchoring = BossPopupAnchoring.AnchorBounds,
+                    ) {
+                        Surface(
+                            color = BossThemeColors.SurfaceColor,
+                            shape = RoundedCornerShape(6.dp),
+                            elevation = 6.dp,
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    Icons.Default.Check,
+                                    contentDescription = null,
+                                    tint = BossThemeColors.SuccessColor,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    "Saved for ${notice.domain}",
+                                    color = BossThemeColors.TextPrimary,
+                                    fontSize = 12.sp,
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                TextButton(
+                                    onClick = {
+                                        editingSavedSecret = notice
+                                        savedSecretNotice = null
+                                    },
+                                ) {
+                                    Text("Edit", color = MaterialTheme.colors.primary, fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Why a fill did nothing. Only failures are announced - a fill that worked is visible
             // in the page itself, and a toast for it would be noise on every login.
             fillNotice?.let { notice ->
@@ -2926,6 +3430,26 @@ internal fun FluckBrowserTabContent(
                         showQuickCreateDialog = true
                     },
                     onFillResult = showFillNotice
+                )
+            }
+
+            // Edit the secret the suggestor just wrote.
+            editingSavedSecret?.let { editing ->
+                QuickCreateSecretDialog(
+                    websitePrefill = editing.domain,
+                    usernamePrefill = editing.username,
+                    passwordPrefill = editing.password,
+                    // Resolved from the reload that followed the create. Null means the row could
+                    // not be found, and the dialog falls back to creating - a duplicate is a worse
+                    // outcome than an update, but a better one than an Edit button that lies.
+                    existing = editing.secretId?.let { id -> allSecrets.firstOrNull { it.id == id } },
+                    secretDataProvider = secretDataProvider,
+                    coroutineScope = coroutineScope,
+                    onDismiss = { editingSavedSecret = null },
+                    onSecretCreated = {
+                        editingSavedSecret = null
+                        coroutineScope.launch { reloadSecrets(secretDataProvider) { allSecrets = it } }
+                    },
                 )
             }
 
@@ -3304,7 +3828,10 @@ internal fun buildContextMenuItems(
     // The fill itself belongs to the caller: it owns the page-scripting path and the notice a
     // fill that lands nowhere has to produce. Building a menu and performing a fill are separate
     // jobs, and the second one needs a suspend context this builder does not have.
-    onFillCredential: (SecretEntryData) -> Unit = {}
+    onFillCredential: (SecretEntryData) -> Unit = {},
+    // Offered only on a password box, and only when the suggestor is switched on.
+    canSuggestPassword: Boolean = false,
+    onSuggestPassword: () -> Unit = {}
 ): List<ContextMenuItem> = buildList {
     // Check if form field is focused (editable element)
     if (info?.isEditable == true) {
@@ -3374,6 +3901,15 @@ internal fun buildContextMenuItems(
             }
 
             add(ContextMenuItem(isDivider = true))
+
+            // Only on a password box: the item generates a password, and putting one into a
+            // username field is not a thing to offer even by accident.
+            if (canSuggestPassword && formFieldInfo.isPasswordField()) {
+                add(ContextMenuItem(
+                    text = "Suggest Strong Password",
+                    onClick = onSuggestPassword
+                ))
+            }
 
             // "Show All Secrets" option
             add(ContextMenuItem(
@@ -4940,17 +5476,27 @@ private fun SecretListItem(
 /**
  * Quick create secret dialog for browser integration.
  */
+/**
+ * Create a secret, or correct the one just written by the password suggestor.
+ *
+ * [existing] is what makes it the second thing. Without it, Edit on the "Saved for github.com"
+ * confirmation would create a SECOND entry for the same account, which is worse than not offering
+ * Edit at all - the user would be left to work out which of two rows is real.
+ */
 @Composable
 private fun QuickCreateSecretDialog(
     websitePrefill: String,
     secretDataProvider: SecretDataProvider?,
     coroutineScope: CoroutineScope,
     onDismiss: () -> Unit,
-    onSecretCreated: () -> Unit
+    onSecretCreated: () -> Unit,
+    usernamePrefill: String = "",
+    passwordPrefill: String = "",
+    existing: SecretEntryData? = null,
 ) {
     var website by remember { mutableStateOf(websitePrefill) }
-    var username by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
+    var username by remember { mutableStateOf(usernamePrefill) }
+    var password by remember { mutableStateOf(passwordPrefill) }
     var showPassword by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -4963,7 +5509,7 @@ private fun QuickCreateSecretDialog(
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
-                    "Save Credentials",
+                    if (existing != null) "Edit Saved Login" else "Save Credentials",
                     color = BossThemeColors.TextPrimary,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
@@ -4972,7 +5518,11 @@ private fun QuickCreateSecretDialog(
                 Spacer(modifier = Modifier.height(4.dp))
 
                 Text(
-                    "Save login credentials for this website",
+                    if (existing != null) {
+                        "Correct the login that was just saved"
+                    } else {
+                        "Save login credentials for this website"
+                    },
                     color = BossDarkTextSecondary,
                     fontSize = 12.sp
                 )
@@ -5037,12 +5587,38 @@ private fun QuickCreateSecretDialog(
                                 errorMessage = null
                                 coroutineScope.launch {
                                     try {
-                                        val request = CreateSecretRequestData(
-                                            website = website,
-                                            username = username,
-                                            password = password
-                                        )
-                                        val result = secretDataProvider.createSecret(request)
+                                        // Every field of `existing` is passed back, because
+                                        // update_secret is a full replace: it assigns notes and
+                                        // expiration_date from its parameters unconditionally,
+                                        // re-inserts the tag rows, and DELETEs the whole
+                                        // secret_metadata row when twofaEnabled is false. Omitting
+                                        // a field destroys it rather than leaving it alone.
+                                        val result =
+                                            if (existing != null) {
+                                                val meta = existing.metadata
+                                                secretDataProvider.updateSecret(
+                                                    UpdateSecretRequestData(
+                                                        secretId = existing.id,
+                                                        website = website,
+                                                        username = username,
+                                                        password = password,
+                                                        notes = existing.notes,
+                                                        expirationDate = existing.expirationDate,
+                                                        tags = existing.tags,
+                                                        twofaEnabled = meta?.twofaEnabled ?: false,
+                                                        twofaType = meta?.twofaType,
+                                                        recoveryCodes = meta?.recoveryCodes ?: emptyList(),
+                                                    )
+                                                )
+                                            } else {
+                                                secretDataProvider.createSecret(
+                                                    CreateSecretRequestData(
+                                                        website = website,
+                                                        username = username,
+                                                        password = password
+                                                    )
+                                                )
+                                            }
                                         result.fold(
                                             onSuccess = {
                                                 isLoading = false
