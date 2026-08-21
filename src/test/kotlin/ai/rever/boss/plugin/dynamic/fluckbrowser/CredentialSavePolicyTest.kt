@@ -44,7 +44,7 @@ class CredentialSavePolicyTest {
         // than WAITING here would prompt to save a credential that just failed.
         assertEquals(
             CredentialSavePolicy.Outcome.WAITING,
-            CredentialSavePolicy.outcome(pending(), LoginFieldProbe.Idle, nowMs = 2_000L),
+            CredentialSavePolicy.outcome(pending(), LoginFieldProbe.Idle, 2_000L, "github.com"),
         )
     }
 
@@ -63,7 +63,7 @@ class CredentialSavePolicyTest {
             )
         assertEquals(
             CredentialSavePolicy.Outcome.WAITING,
-            CredentialSavePolicy.outcome(pending(), LoginFieldProbe.Focused(field), nowMs = 2_000L),
+            CredentialSavePolicy.outcome(pending(), LoginFieldProbe.Focused(field), 2_000L, "github.com"),
         )
     }
 
@@ -74,7 +74,7 @@ class CredentialSavePolicyTest {
         // It also never fires at all for a single-page login, which this reading handles correctly.
         assertEquals(
             CredentialSavePolicy.Outcome.SUCCEEDED,
-            CredentialSavePolicy.outcome(pending(), LoginFieldProbe.NoLoginField, nowMs = 2_000L),
+            CredentialSavePolicy.outcome(pending(), LoginFieldProbe.NoLoginField, 2_000L, "github.com"),
         )
     }
 
@@ -85,7 +85,8 @@ class CredentialSavePolicyTest {
             CredentialSavePolicy.outcome(
                 pending(capturedAtMs = 0L),
                 LoginFieldProbe.Idle,
-                nowMs = CredentialSavePolicy.PENDING_WINDOW_MS,
+                CredentialSavePolicy.PENDING_WINDOW_MS,
+                "github.com",
             ),
         )
     }
@@ -97,7 +98,8 @@ class CredentialSavePolicyTest {
             CredentialSavePolicy.outcome(
                 pending(capturedAtMs = 0L),
                 LoginFieldProbe.NoLoginField,
-                nowMs = CredentialSavePolicy.PENDING_WINDOW_MS + 1,
+                CredentialSavePolicy.PENDING_WINDOW_MS + 1,
+                "github.com",
             ),
         )
     }
@@ -275,5 +277,43 @@ class CredentialSavePolicyTest {
                 listOf(unnamed),
             )
         assertIs<CredentialSavePolicy.Decision.Save>(decision)
+    }
+
+    @Test
+    fun `a capture is dropped once the tab is on another site`() {
+        // Otherwise: submit on site A, wander to site B inside the 90s window, and the bar offers
+        // A's credential while the user is looking at B. It would be attributed correctly - the
+        // domain is stamped at capture - so it is a confusing prompt rather than a wrong write, but
+        // a bar that asks about a site you have left is how people learn to dismiss it unread.
+        assertEquals(
+            CredentialSavePolicy.Outcome.EXPIRED,
+            CredentialSavePolicy.outcome(pending(), LoginFieldProbe.NoLoginField, 2_000L, "example.com"),
+        )
+    }
+
+    @Test
+    fun `an unknown current domain does not drop the capture`() {
+        // extractMainDomain answers null for about:blank and for a URL bar mid-edit. Reading that as
+        // "a different site" would drop the capture during exactly the navigation being waited on.
+        assertEquals(
+            CredentialSavePolicy.Outcome.SUCCEEDED,
+            CredentialSavePolicy.outcome(pending(), LoginFieldProbe.NoLoginField, 2_000L, null),
+        )
+    }
+
+    @Test
+    fun `a subdomain hop within the same site keeps the capture`() {
+        // accounts.google.com -> mail.google.com is one site as far as this is concerned, because
+        // the caller reduces to a registrable domain first. A login that lands on a different
+        // subdomain is the common case, not an edge one.
+        assertEquals(
+            CredentialSavePolicy.Outcome.SUCCEEDED,
+            CredentialSavePolicy.outcome(
+                pending(domain = "google.com"),
+                LoginFieldProbe.NoLoginField,
+                2_000L,
+                "google.com",
+            ),
+        )
     }
 }

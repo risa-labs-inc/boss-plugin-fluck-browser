@@ -133,6 +133,52 @@ class PasswordGeneratorTest {
         assertFalse(outcome.alphanumericOnly)
     }
 
+    @Test
+    fun `a backtracking pattern stays bounded`() {
+        // `pattern` is attacker-controlled - it comes straight off the page - and java.util.regex
+        // cannot be asked to time out, so this is worth pinning.
+        //
+        // THE PATTERN MATTERS, and the obvious choice is worthless here. The textbook `(a+)+b` costs
+        // 2ms against a generated password, because backtracking needs input the pattern can
+        // partially match and a random 20-char string starts failing at character one. Measured on
+        // this alphabet, the expensive shape is one whose inner class matches everything:
+        //
+        //   (a+)+b               0.9 ms      <- proves nothing
+        //   (.*.*.*.*.*)*X      28   ms
+        //   (([A-Za-z0-9]+)+)+X 56   ms      <- the worst found, and what is used below
+        //
+        // So the cost is bounded by the CANDIDATE length, which the generator caps at 20 - not by
+        // anything the page controls. 12 matches x ~56ms is the realistic worst case, and the
+        // ceiling here is set above that rather than at a benchmark. For scale, the same pattern
+        // against a 64-character candidate takes 1,010ms per match, so if the generated length ever
+        // grows this bound is the thing that stops holding.
+        val expensive = "(([A-Za-z0-9]+)+)+X"
+        val elapsed =
+            kotlin.system.measureTimeMillis {
+                assertIs<PasswordGenerator.Outcome.Generated>(PasswordGenerator.generate(pattern = expensive))
+            }
+        assertTrue(elapsed < 3_000, "generate() took ${elapsed}ms against $expensive")
+    }
+
+    @Test
+    fun `an over-long pattern is ignored rather than compiled`() {
+        // The room to build a pathological case, removed. No real HTML pattern is anywhere near
+        // this long - sites ship a character class and a length assertion.
+        val huge = "(a+)+" + "x".repeat(PasswordGenerator.MAX_PATTERN_CHARS)
+        val outcome = generated(pattern = huge)
+        // Ignored means treated as "no pattern": full alphabet, default length.
+        assertEquals(PasswordGenerator.DEFAULT_LENGTH, outcome.password.length)
+        assertFalse(outcome.alphanumericOnly)
+    }
+
+    @Test
+    fun `a pattern at the length limit is still honoured`() {
+        // The cap must not quietly disable the feature for a long-but-legitimate pattern.
+        val atLimit = "[A-Za-z0-9]{12,20}".padEnd(PasswordGenerator.MAX_PATTERN_CHARS, ' ').trim()
+        val outcome = generated(pattern = atLimit)
+        assertTrue(outcome.password.isNotEmpty())
+    }
+
     // ------------------------------------------------------------------------- alphabet
 
     @Test

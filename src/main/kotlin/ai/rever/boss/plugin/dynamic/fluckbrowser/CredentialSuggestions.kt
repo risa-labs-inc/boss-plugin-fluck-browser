@@ -241,6 +241,21 @@ $FIELD_ELIGIBILITY_JS
         // would still be drawn - over the URL bar's own autocomplete, or after the user alt-tabbed
         // away entirely. Also drops an unfocused tab to the slowest poll rate.
         if (!document.hasFocus()) return 'IDLE';
+        // A document that is still parsing has not told us anything yet.
+        //
+        // This is the difference between "no login form here" and "no login form YET", and the save
+        // prompt turns on it: a form POST destroys the old document and the new one parses
+        // incrementally, so the first probe after a submit very often lands before the new page's
+        // inputs exist. Answering NONE there reads as "the login form is gone", which is the signal
+        // CredentialSavePolicy treats as success - so mistyping a password and being bounced back to
+        // the same form would offer to save the wrong one. IDLE is the honest answer: no verdict yet.
+        if (document.readyState === 'loading') return 'IDLE';
+        // Nor has a document with no origin. `about:blank` between two commits reports readyState
+        // 'complete' with no inputs, so the check above does not catch it - and it sits exactly in
+        // the gap a form POST opens. Deliberately not solved by demanding two consecutive answers
+        // instead: at the no-login-field poll rate that would delay every genuine prompt by four
+        // seconds to fix a case this line fixes for nothing.
+        if (!location.host) return 'IDLE';
         var all = document.querySelectorAll('input');
         var fields = [];
         for (var i = 0; i < all.length; i++) {

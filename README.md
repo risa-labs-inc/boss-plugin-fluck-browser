@@ -101,7 +101,12 @@ worse than no suggestion at all:
 
 A box too short to hold a decent password (under 12 characters) gets no offer rather than a weak
 one. If you wave the card away and want it back, right-click the field and choose **Suggest Strong
-Password**.
+Password**. Taking a suggestion on a site where you already have a saved login for that account
+updates it rather than adding a second entry.
+
+**Copy does not expire.** The card's Copy button puts the password on the system clipboard and
+nothing clears it afterwards, unlike most password managers, which drop it after some seconds. Use
+it knowing that.
 
 ### Saving a password you typed
 

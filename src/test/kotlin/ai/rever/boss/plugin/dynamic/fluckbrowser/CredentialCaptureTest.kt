@@ -151,6 +151,26 @@ class CredentialCaptureTest {
     }
 
     @Test
+    fun `the injected script carries no control characters`() {
+        // A literal NUL byte lived in this script for four commits, in the de-dup separator, and
+        // nothing failed: a raw U+0000 is legal inside a JS string literal, so V8 accepted it.
+        //
+        // What it broke was everything around the code. Git classified the whole file as BINARY, so
+        // the most security-sensitive file in the change had no reviewable diff at all - "0
+        // insertions, 0 deletions" for 190 new lines - and `git grep`, blame and every future diff
+        // on it were degraded too. The runtime risk is worse than the cosmetic one: this string is
+        // handed plugin -> host -> JxBrowser -> renderer, and anywhere it meets a NUL-terminated
+        // native string it truncates, which here would drop the three addEventListener calls that
+        // follow and leave a feature that silently never fires.
+        val offenders =
+            CredentialCapture.INSTALL_JS
+                .withIndex()
+                .filter { (_, c) -> c.isISOControl() && c != '\n' && c != '\r' && c != '\t' }
+                .map { (i, c) -> "index $i: U+%04X".format(c.code) }
+        assertEquals(emptyList(), offenders, "control characters in the injected script: $offenders")
+    }
+
+    @Test
     fun `installation is idempotent`() {
         // The host injects at document start and also into the already-loaded page when the script
         // is first installed, so a document can legitimately see it twice. Without the guard that

@@ -176,7 +176,7 @@ internal object CredentialCapture {
                     password: pw.value,
                     filled: pw.getAttribute('data-boss-filled') === 'true'
                 };
-                var key = payload.username + ' ' + payload.password;
+                var key = payload.username + ' ' + payload.password;
                 if (key === lastKey) return;
                 lastKey = key;
                 // The host-supplied bridge, straight from this script's scope.

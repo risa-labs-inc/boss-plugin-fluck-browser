@@ -96,6 +96,21 @@ internal object PasswordGenerator {
     /**
      * Generate a password that fits [maxLength] and, where possible, [pattern].
      *
+     * **Do not call this on the composition thread.** [pattern] is attacker-controlled - it comes
+     * straight off the page - and `java.util.regex` cannot be asked to time out.
+     *
+     * Measured rather than assumed, because the size of the problem decides the fix. Backtracking is
+     * exponential in the CANDIDATE length, and the candidate here is capped at 20 characters, so the
+     * worst pattern found costs about 56ms per match (`(([A-Za-z0-9]+)+)+X`; the textbook `(a+)+b`
+     * costs 0.9ms, since a random password stops matching at character one). That is a few hundred
+     * milliseconds across the retries - a repeatable UI stall on every focus and every regenerate,
+     * not the indefinite hang it first looked like.
+     *
+     * So it is bounded, but by an accident of the candidate length rather than by anything here: the
+     * same pattern against a 64-character candidate takes 1,010ms per match. If [DEFAULT_LENGTH] or
+     * a field's `maxlength` ever raises what gets generated, this stops being cheap. Hence all
+     * three: off the UI thread, [MAX_PATTERN_CHARS] on the input, and few [PATTERN_ATTEMPTS].
+     *
      * @param maxLength the field's `maxlength`, or null when it declares none.
      * @param pattern the field's `pattern` attribute, or null. Applied as a full match, which is
      *   what the HTML spec says the browser does.
@@ -175,8 +190,28 @@ internal object PasswordGenerator {
      */
     private fun compilePattern(pattern: String?): Regex? {
         val raw = pattern?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        // Length-bounded, because this string comes off the page and `java.util.regex` has no
+        // timeout. A nested-quantifier pattern whose inner class matches the whole alphabet costs
+        // ~56ms per match against a generated candidate (see [generate] for the measurements), and
+        // a longer pattern is more room to build worse. Not a fix on its own - the thread is the
+        // fix - but the same spirit as CredentialCapture.MAX_FIELD_LENGTH bounding its inputs.
+        //
+        // 200 characters is far past any real HTML `pattern`; the ones sites ship are a character
+        // class and a length assertion.
+        if (raw.length > MAX_PATTERN_CHARS) return null
         return runCatching { Regex("^(?:$raw)$") }.getOrNull()
     }
 
-    private const val PATTERN_ATTEMPTS = 24
+    /** Longer than any pattern a site legitimately ships. See [compilePattern]. */
+    internal const val MAX_PATTERN_CHARS = 200
+
+    /**
+     * Re-rolls allowed per alphabet before giving up on the site's pattern.
+     *
+     * Lowered from 24. A pattern that a random 20-character string satisfies at all is satisfied
+     * within a handful of draws ("must contain a digit" succeeds ~90% of the time), so the tail was
+     * only ever spent on patterns that were never going to match - which is exactly the case where
+     * each attempt is most expensive.
+     */
+    private const val PATTERN_ATTEMPTS = 6
 }

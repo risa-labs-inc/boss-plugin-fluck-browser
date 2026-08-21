@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -254,15 +255,21 @@ internal fun SaveCredentialBar(
                         textStyle = MaterialTheme.typography.body2.copy(color = BossThemeColors.TextPrimary),
                         cursorBrush = SolidColor(MaterialTheme.colors.primary),
                         modifier = Modifier.fillMaxWidth(),
+                        // Box, not two siblings. Emitted bare into the enclosing Row they lay out
+                        // side by side, so the placeholder sat next to the caret and the field
+                        // jumped sideways on the first keystroke. The repo's other text fields use
+                        // this shape for the same reason.
                         decorationBox = { inner ->
-                            if (username.isEmpty()) {
-                                Text(
-                                    "Username for this login",
-                                    color = BossThemeColors.TextSecondary,
-                                    fontSize = 12.sp,
-                                )
+                            Box {
+                                if (username.isEmpty()) {
+                                    Text(
+                                        "Username for this login",
+                                        color = BossThemeColors.TextSecondary,
+                                        fontSize = 12.sp,
+                                    )
+                                }
+                                inner()
                             }
-                            inner()
                         },
                     )
                 }

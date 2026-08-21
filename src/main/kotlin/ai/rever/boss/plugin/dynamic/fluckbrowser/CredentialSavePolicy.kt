@@ -85,14 +85,37 @@ internal object CredentialSavePolicy {
      * is affordable in this direction: the cost is one prompt naming a site and a username, which
      * the user can dismiss, and the alternative reading would mean a garbage answer suppresses
      * every save on that page.
+     *
+     * **What is NOT affordable, and is handled in the probe rather than here:** a document that is
+     * merely *between* pages. A form POST destroys the old document and the new one parses
+     * incrementally, so the first observation after a submit often lands on a page with no inputs
+     * yet, or on `about:blank` between commits. Read as "the form is gone" that produces a save
+     * prompt for a password that just FAILED - the exact outcome this design exists to avoid, and on
+     * the critical path of every submit rather than in some rare corner. [LOGIN_FIELD_PROBE_JS]
+     * therefore answers `IDLE` while `document.readyState` is `loading` and for a document with no
+     * origin, so those never reach this function as a verdict.
+     *
+     * [currentDomain] is what the tab is on now, and a mismatch against [Pending.domain] ends the
+     * wait: see the branch for why that is a drop rather than a prompt.
      */
     fun outcome(
         pending: Pending,
         probe: LoginFieldProbe,
         nowMs: Long,
+        currentDomain: String?,
     ): Outcome =
         when {
             nowMs - pending.capturedAtMs >= PENDING_WINDOW_MS -> Outcome.EXPIRED
+            // The tab has moved to a different site. Dropped rather than carried, because a bar
+            // offering site A's credential while the user is looking at site B is the kind of prompt
+            // that teaches people to dismiss the bar unread - and the whole design leans on the bar
+            // being trustworthy.
+            //
+            // The cost is real and accepted: a federated sign-in where the password is typed on an
+            // identity provider and the flow ends on a different registrable domain loses its save.
+            // That credential is usually already stored, and the alternative - prompting about a
+            // site the user has left - is worse on every login that is not federated.
+            currentDomain != null && currentDomain != pending.domain -> Outcome.EXPIRED
             probe == LoginFieldProbe.NoLoginField -> Outcome.SUCCEEDED
             // Idle or Focused: a login field is still on the page, so this attempt has not
             // resolved. That is the wrong-password case as well as the still-loading one.

@@ -1269,16 +1269,33 @@ internal suspend fun saveGeneratedPassword(
     domain: String,
     username: String,
     password: String,
+    knownSecrets: List<SecretEntryData>,
     onSecretsReloaded: (List<SecretEntryData>) -> Unit,
 ): SavedSecretNotice? {
     if (provider == null) return null
-    val created =
+    // An existing row for this account is UPDATED, not duplicated. The change-password form is the
+    // case that makes this necessary and it is one the card explicitly targets: the user already has
+    // a secret for that site and account, so creating a second leaves two rows for one login - one
+    // holding the dead password - and the fill list then offers both with nothing to tell them
+    // apart.
+    val existing =
+        username
+            .takeIf { it.isNotBlank() }
+            ?.let { name ->
+                matchSecretsForDomain(domain, knownSecrets)
+                    .firstOrNull { it.username.equals(name, ignoreCase = true) }
+            }
+    val written =
         runCatching {
-            provider.createSecret(
-                CreateSecretRequestData(website = domain, username = username, password = password),
-            )
+            if (existing != null) {
+                updateSecretPreservingFields(provider, existing, username, password)
+            } else {
+                provider.createSecret(
+                    CreateSecretRequestData(website = domain, username = username, password = password),
+                )
+            }
         }.getOrNull() ?: return null
-    if (created.isFailure) return null
+    if (written.isFailure) return null
 
     val reloaded = runCatching { provider.getUserSecrets(limit = 1000) }.getOrNull()?.getOrNull()?.data
     if (reloaded != null) onSecretsReloaded(reloaded)
@@ -1323,32 +1340,69 @@ internal suspend fun storeCredential(
                     )
                 is CredentialSavePolicy.Decision.Update -> {
                     val existing = decision.secret
-                    val meta = existing.metadata
-                    if (meta != null && !meta.twofaEnabled && !meta.twofaSecret.isNullOrBlank()) {
-                        return false
-                    }
-                    provider.updateSecret(
-                        UpdateSecretRequestData(
-                            secretId = existing.id,
-                            website = existing.website,
-                            username = username,
-                            password = password,
-                            notes = existing.notes,
-                            expirationDate = existing.expirationDate,
-                            tags = existing.tags,
-                            twofaEnabled = meta?.twofaEnabled ?: false,
-                            twofaType = meta?.twofaType,
-                            recoveryCodes = meta?.recoveryCodes ?: emptyList(),
-                        ),
-                    )
+                    // One predicate, shared with the caller that has to explain the refusal.
+                    if (refusesTotpUpdate(existing)) return false
+                    updateSecretPreservingFields(provider, existing, username, password)
                 }
             }
         }.getOrNull() ?: return false
     return result.isSuccess
 }
 
+/**
+ * Change a secret's password without destroying the rest of it.
+ *
+ * **Every field of [existing] is passed back, and that is required rather than tidy.**
+ * `update_secret` is a full replace: it assigns `notes` and `expiration_date` from its parameters
+ * unconditionally, deletes and re-inserts the tag rows, and `DELETE`s the whole `secret_metadata`
+ * row whenever `p_twofa_enabled` is false. Omitting a field does not leave it alone, it destroys it -
+ * so an update meaning only to change a password would silently drop the user's notes, tags and
+ * recovery codes.
+ *
+ * Extracted because three call sites need exactly this and a partial copy in any of them is a silent
+ * data loss rather than a compile error.
+ */
+internal suspend fun updateSecretPreservingFields(
+    provider: SecretDataProvider,
+    existing: SecretEntryData,
+    username: String,
+    password: String,
+): Result<Unit> {
+    val meta = existing.metadata
+    return provider.updateSecret(
+        UpdateSecretRequestData(
+            secretId = existing.id,
+            website = existing.website,
+            username = username,
+            password = password,
+            notes = existing.notes,
+            expirationDate = existing.expirationDate,
+            tags = existing.tags,
+            twofaEnabled = meta?.twofaEnabled ?: false,
+            twofaType = meta?.twofaType,
+            recoveryCodes = meta?.recoveryCodes ?: emptyList(),
+        ),
+    )
+}
+
 internal const val GENERATED_FILL_FAILED_NOTICE = "Could not fill the new password box on this page"
 internal const val GENERATED_SAVE_FAILED_NOTICE = "Could not save to Secret Manager"
+
+/**
+ * Why an update was refused rather than attempted, for the one case that cannot be retried.
+ *
+ * `update_secret` deletes the whole metadata row when 2FA reads as disabled, and has no parameter
+ * to send a TOTP seed back - so a secret holding a stranded seed cannot have its password changed
+ * through this API without losing it. Telling the user "could not save" would send them to retry
+ * something that can never work.
+ */
+internal const val TOTP_UPDATE_REFUSED_NOTICE = "Change this password in Secret Manager - it has 2FA details to keep"
+
+/** The [storeCredential] refusal, exposed so the caller can explain it rather than guess. */
+internal fun refusesTotpUpdate(secret: SecretEntryData): Boolean {
+    val meta = secret.metadata ?: return false
+    return !meta.twofaEnabled && !meta.twofaSecret.isNullOrBlank()
+}
 
 internal suspend fun BrowserHandle?.fillCredential(
     secret: SecretEntryData,
@@ -2447,22 +2501,39 @@ internal fun FluckBrowserTabContent(
             // the feature is switched off would surface a prompt the user has just disabled.
             pendingSave = null
             saveDecision = null
-            runCatching { handle.setPageEventScript(null, null) }
+            withContext(Dispatchers.IO) { runCatching { handle.setPageEventScript(null, null) } }
             return@LaunchedEffect
         }
-        runCatching {
-            handle.setPageEventScript(CredentialCapture.INSTALL_JS) { url, json ->
-                // JxBrowser thread, inside the page's own event dispatch. trySend and nothing else:
-                // a blocking hand-off here would stall the submit the user just performed.
-                //
-                // `url` is the host's reading of the document that posted, taken at the moment of
-                // the call. Carried through rather than resolved later - see the collector.
-                captureChannel.trySend(CapturedEvent(url, json))
-            }
-        }.onFailure {
+        // Off the UI thread, like the probe and for the same reason: installing reaches into the
+        // engine (a window property write plus an evaluation into the live document), and a renderer
+        // in a long task would otherwise park the thread drawing the UI.
+        withContext(Dispatchers.IO) {
+            runCatching {
+                handle.setPageEventScript(CredentialCapture.INSTALL_JS) { url, json ->
+                    // JxBrowser thread, inside the page's own event dispatch. trySend and nothing
+                    // else: a blocking hand-off would stall the submit the user just performed.
+                    //
+                    // `url` is the host's reading of the document that posted, taken at the moment
+                    // of the call. Carried through rather than resolved later - see the collector.
+                    captureChannel.trySend(CapturedEvent(url, json))
+                }
+            }.onFailure {
             // An older host has no implementation and the api default is a no-op, so this is the
             // one place worth being explicit: no capture means no save prompt, not a broken tab.
-            println("[FluckBrowser] Page event script unavailable; no credential save prompt in this tab")
+                println(
+                    "[FluckBrowser] Page event script unavailable; no credential save prompt in this tab",
+                )
+            }
+        }
+    }
+
+    // Uninstall on the way out. Recomposition replaces the script and the channel anyway, so this
+    // is a small leak rather than a bug - but what stays installed is a submit listener holding a
+    // channel nobody reads, and given what that listener reads off the page it is worth retracting
+    // deliberately rather than by side effect.
+    DisposableEffect(browserHandle) {
+        onDispose {
+            runCatching { browserHandle?.setPageEventScript(null, null) }
         }
     }
 
@@ -2506,7 +2577,8 @@ internal fun FluckBrowserTabContent(
         if (saveDecision != null) return@LaunchedEffect
         // Wait for an observation taken after the capture.
         if (probeSeq <= pendingSaveProbeSeq) return@LaunchedEffect
-        when (CredentialSavePolicy.outcome(pending, lastProbe, System.currentTimeMillis())) {
+        val onDomain = extractMainDomain(currentUrl)
+        when (CredentialSavePolicy.outcome(pending, lastProbe, System.currentTimeMillis(), onDomain)) {
             CredentialSavePolicy.Outcome.WAITING -> Unit
             CredentialSavePolicy.Outcome.EXPIRED -> {
                 pendingSave = null
@@ -3126,7 +3198,22 @@ internal fun FluckBrowserTabContent(
                         ?.let { matchSecretsForDomain(it, allSecrets) }
                         .orEmpty()
                 }
-            if (shouldOfferSuggestions(suggestionField, dismissedSuggestionId, suggestionMatches.size) &&
+            // The generator takes precedence on a new-password box, and the two would otherwise
+            // both fire: a change-password form on a site with a saved secret satisfies
+            // shouldOfferSuggestions AND shouldOfferGeneratedPassword for the same focused box, so
+            // two BossPopups would draw at identical coordinates. Precedence rather than an
+            // arbitrary z-order, because offering to fill an EXISTING password into a box that is
+            // choosing a new one is the wrong offer regardless of which one is on top.
+            val generatorHasThisBox =
+                suggestionField != null &&
+                    shouldOfferGeneratedPassword(
+                        suggestionField,
+                        dismissedSuggestionId,
+                        suggestPasswordsEnabled,
+                        forced = forceSuggestPassword,
+                    )
+            if (!generatorHasThisBox &&
+                shouldOfferSuggestions(suggestionField, dismissedSuggestionId, suggestionMatches.size) &&
                 suggestionField != null
             ) {
                 Box(
@@ -3182,23 +3269,41 @@ internal fun FluckBrowserTabContent(
             // same reason: Chromium composites its own window over the Compose scene, so anything
             // drawn in place over page content is invisible.
             val generatorField = focusedLoginField
-            val generated =
-                remember(generatorField?.dismissId, generatorField?.maxLength, generatorField?.pattern, regenerateTick) {
-                    generatorField
-                        ?.takeIf { it.isNewPassword }
-                        ?.let { PasswordGenerator.generate(it.maxLength, it.pattern) }
-                        as? PasswordGenerator.Outcome.Generated
-                }
-            val generatedForced =
-                remember(generatorField?.dismissId, regenerateTick, forceSuggestPassword) {
-                    generatorField
-                        ?.takeIf { forceSuggestPassword && it.isPassword }
-                        ?.let { PasswordGenerator.generate(it.maxLength, it.pattern) }
-                        as? PasswordGenerator.Outcome.Generated
-                }
-            val offered = generated ?: generatedForced
+            // Generated OFF the composition thread, and this is not a micro-optimisation.
+            //
+            // `pattern` is attacker-controlled: it comes straight off the page, and matching it is
+            // work java.util.regex cannot be asked to time out. Measured, the worst pattern found
+            // costs ~56ms per match against a 20-character candidate, so a few hundred milliseconds
+            // across the generator's retries - inside `remember { }` that was a repeatable stall on
+            // the thread drawing the UI, on a feature that is on by default and fires when the user
+            // clicks a password box. Bounded, but not somewhere it belongs.
+            //
+            // PasswordGenerator bounds the pattern length and the retry count as well; see its KDoc
+            // for the numbers and for why the bound depends on the candidate length.
+            val wantsSuggestion =
+                generatorField != null &&
+                    (generatorField.isNewPassword || (forceSuggestPassword && generatorField.isPassword))
+            val offered by produceState<PasswordGenerator.Outcome.Generated?>(
+                initialValue = null,
+                generatorField?.dismissId,
+                generatorField?.maxLength,
+                generatorField?.pattern,
+                wantsSuggestion,
+                regenerateTick,
+            ) {
+                value =
+                    if (!wantsSuggestion || generatorField == null) {
+                        null
+                    } else {
+                        withContext(Dispatchers.Default) {
+                            PasswordGenerator.generate(generatorField.maxLength, generatorField.pattern)
+                                as? PasswordGenerator.Outcome.Generated
+                        }
+                    }
+            }
+            val offeredNow = offered
             if (generatorField != null &&
-                offered != null &&
+                offeredNow != null &&
                 shouldOfferGeneratedPassword(
                     generatorField,
                     dismissedSuggestionId,
@@ -3220,8 +3325,8 @@ internal fun FluckBrowserTabContent(
                         anchoring = BossPopupAnchoring.AnchorBounds,
                     ) {
                         PasswordSuggestionCard(
-                            password = offered.password,
-                            alphanumericOnly = offered.alphanumericOnly,
+                            password = offeredNow.password,
+                            alphanumericOnly = offeredNow.alphanumericOnly,
                             onUse = {
                                 forceSuggestPassword = false
                                 // Dismissed first, for the same reason the credential list is: the
@@ -3231,7 +3336,7 @@ internal fun FluckBrowserTabContent(
                                 coroutineScope.launch {
                                     val result =
                                         browserHandle.fillNewPassword(
-                                            offered.password,
+                                            offeredNow.password,
                                             targetIndex = generatorField.index,
                                         )
                                     // Save what LANDED, never what was generated. A field with
@@ -3254,6 +3359,7 @@ internal fun FluckBrowserTabContent(
                                             domain = domain,
                                             username = result.username.orEmpty(),
                                             password = landed,
+                                            knownSecrets = allSecrets,
                                             onSecretsReloaded = { allSecrets = it },
                                         ) ?: run {
                                             fillNotice = GENERATED_SAVE_FAILED_NOTICE
@@ -3263,7 +3369,7 @@ internal fun FluckBrowserTabContent(
                                 }
                             },
                             onRegenerate = { regenerateTick++ },
-                            onCopy = { copyToClipboard(offered.password) },
+                            onCopy = { copyToClipboard(offeredNow.password) },
                             onDismiss = {
                                 // Clearing the forced flag matters: left set, the card would follow
                                 // the caret onto every other password box on the page.
@@ -3318,7 +3424,17 @@ internal fun FluckBrowserTabContent(
                                         if (ok) {
                                             reloadSecrets(secretDataProvider) { allSecrets = it }
                                         } else {
-                                            fillNotice = GENERATED_SAVE_FAILED_NOTICE
+                                            // A refusal and a failure are different things to be
+                                            // told. The 2FA case can never succeed by retrying, so
+                                            // "could not save" would send the user to try forever.
+                                            fillNotice =
+                                                if (decision is CredentialSavePolicy.Decision.Update &&
+                                                    refusesTotpUpdate(decision.secret)
+                                                ) {
+                                                    TOTP_UPDATE_REFUSED_NOTICE
+                                                } else {
+                                                    GENERATED_SAVE_FAILED_NOTICE
+                                                }
                                             fillNoticeSeq++
                                         }
                                     }
