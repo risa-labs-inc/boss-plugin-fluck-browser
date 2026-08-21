@@ -2501,7 +2501,15 @@ internal fun FluckBrowserTabContent(
             // the feature is switched off would surface a prompt the user has just disabled.
             pendingSave = null
             saveDecision = null
-            withContext(Dispatchers.IO) { runCatching { handle.setPageEventScript(null, null) } }
+            withContext(Dispatchers.IO) { runCatching { handle.clearPageEventScript() } }
+            return@LaunchedEffect
+        }
+        // An older host carries the api's no-op default, where installing SUCCEEDS and delivers
+        // nothing. supportsPageEventScript (api 1.0.83) is what separates that from "installed, and
+        // the user has not submitted anything yet" - without it the feature is indistinguishable
+        // from silence, which is the case worth one log line now rather than an investigation later.
+        if (!handle.supportsPageEventScript) {
+            println("[FluckBrowser] Host has no page event channel; no credential save prompt")
             return@LaunchedEffect
         }
         // Off the UI thread, like the probe and for the same reason: installing reaches into the
@@ -2518,10 +2526,8 @@ internal fun FluckBrowserTabContent(
                     captureChannel.trySend(CapturedEvent(url, json))
                 }
             }.onFailure {
-            // An older host has no implementation and the api default is a no-op, so this is the
-            // one place worth being explicit: no capture means no save prompt, not a broken tab.
                 println(
-                    "[FluckBrowser] Page event script unavailable; no credential save prompt in this tab",
+                    "[FluckBrowser] Page event script install threw; no credential save prompt here",
                 )
             }
         }
@@ -2533,7 +2539,7 @@ internal fun FluckBrowserTabContent(
     // deliberately rather than by side effect.
     DisposableEffect(browserHandle) {
         onDispose {
-            runCatching { browserHandle?.setPageEventScript(null, null) }
+            runCatching { browserHandle?.clearPageEventScript() }
         }
     }
 

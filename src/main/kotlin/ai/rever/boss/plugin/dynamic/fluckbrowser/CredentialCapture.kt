@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.browser.PAGE_EVENT_BRIDGE
+import ai.rever.boss.plugin.browser.PAGE_EVENT_EMIT
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -196,7 +197,9 @@ internal object CredentialCapture {
                 lastKey = key;
                 // The host-supplied bridge, straight from this script's scope.
                 if (typeof $PAGE_EVENT_BRIDGE !== 'undefined' && $PAGE_EVENT_BRIDGE) {
-                    $PAGE_EVENT_BRIDGE.emit(JSON.stringify(payload));
+                    // Both names come from api constants, so a rename on either side is one edit
+                    // rather than a channel that silently posts into nothing.
+                    $PAGE_EVENT_BRIDGE.$PAGE_EVENT_EMIT(JSON.stringify(payload));
                 }
             } catch (e) {
                 // A page that throws from a getter must not break its own submit.
