@@ -133,44 +133,20 @@ class CredentialCaptureTest {
     }
 
     @Test
-    fun `the bridge is captured at document start, never read at post time`() {
-        // The exfiltration hole this closes: window.__bossPageEvent is a public property, so a page
-        // that replaces it between document start and the submit receives the credential itself.
-        // Reading it once, before any page script runs, is the only version of this that is safe -
-        // and the document-start guarantee is precisely what makes that possible.
+    fun `the script never touches window to post`() {
+        // The bridge is a PARAMETER the host passes in (api 1.0.83), not a window property. That is
+        // the whole defence for what this script posts: a documented global would let any page
+        // script replace it and receive the credential, forge a submission, or detect BOSS by
+        // probing for the name. Reading it off window here - which an earlier version did, inside
+        // the submit listener - reopens all three.
         val text = code().replace(Regex("\\s+"), " ")
-        assertTrue(
-            text.contains("var post = window.__bossPageEvent"),
-            "the bridge is not captured into a local at document start",
+        assertFalse(
+            text.contains("window.__bossPageEvent"),
+            "the script reaches for the bridge on window instead of using the injected parameter",
         )
-        // The post must go through the captured local. Any `window.__bossPageEvent` inside a
-        // listener is the bug coming back.
-        val postSites = Regex("""(\w+)\.emit\(""").findAll(text).map { it.groupValues[1] }.toList()
-        assertEquals(
-            listOf("post"),
-            postSites,
-            "something other than the captured reference posts to the bridge: $postSites",
-        )
-    }
-
-    @Test
-    fun `the property is removed from window, and before the install guard`() {
-        // Deleting it closes forgery (no page script can post) and fingerprinting (no page can
-        // detect BOSS by probing for it).
-        //
-        // Before the guard, not after, and that ordering is the load-bearing part: the host injects
-        // at document start AND into the already-loaded document when the script is first installed,
-        // so one document can see this script twice. The second pass returns early at the guard - if
-        // the delete sat after it, that pass would leave a freshly re-added property on window for
-        // the page to find.
-        val text = code().replace(Regex("\\s+"), " ")
-        val deleteAt = text.indexOf("delete window.__bossPageEvent")
-        val guardAt = text.indexOf("if (window.__bossCredCaptureInstalled) return")
-        assertTrue(deleteAt >= 0, "the script never removes the bridge property")
-        assertTrue(guardAt >= 0, "the install guard is gone")
         assertTrue(
-            deleteAt < guardAt,
-            "the delete happens after the install guard, so a second injection leaves the property behind",
+            text.contains("__bossPageEvent.emit("),
+            "the script does not post through the injected bridge",
         )
     }
 

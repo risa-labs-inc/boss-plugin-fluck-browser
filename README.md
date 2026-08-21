@@ -127,11 +127,10 @@ has a value, never the value - a periodic read that returned page text would be 
 A captured credential is held in memory, never written to disk, and is dropped after 90 seconds if
 the login never resolves.
 
-The bridge the script posts through is a property on `window`, which has three consequences the
-script and the plugin both have to handle. It captures the bridge at document start and removes the
-property, so no page script can replace it and receive the credential, forge an event, or detect
-BOSS by probing for it. What does arrive is treated as untrusted, and the site a credential is
-attributed to comes from the URL the host reads off the posting document, never from the payload.
+The bridge the script posts through is handed to it as a parameter and never left on `window`, so
+no page script can replace it and receive the credential, forge a submission, or detect BOSS by
+probing for it. What does arrive is treated as untrusted, and the site a credential is attributed to
+comes from the URL the host reads off the posting document, never from the payload.
 
 ## Requirements
 

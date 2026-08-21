@@ -91,6 +91,17 @@ internal object CredentialCapture {
      * password input (`accounts.google.com` ships one) must not be read as the field the user
      * typed into, or the "saved" password is whatever a decoy held.
      *
+     * The bridge arrives as a parameter named [PAGE_EVENT_BRIDGE], not as a `window` property, so
+     * the script never touches `window` to post. That is the api's shape and the reason for it is
+     * this script's payload: a documented global would let any page script replace it and receive
+     * the credential, forge a submission, or fingerprint BOSS.
+     *
+     * The install guard is still needed, and for a reason the parameter does not address: the host
+     * injects at document start *and* into the document already loaded when the script is first
+     * installed, and replacing a script does not retract the previous generation from a live
+     * document. Without the guard one document ends up with two sets of listeners and posts twice
+     * per submit.
+     *
      * Three listeners rather than one, all in the capture phase so a page that calls
      * `stopPropagation` on its own form cannot hide the submit:
      *
@@ -104,25 +115,11 @@ internal object CredentialCapture {
     val INSTALL_JS: String =
         """
         (function() {
-        // FIRST, before anything else: take the bridge and take it off window.
-        //
-        // Resolving window.$PAGE_EVENT_BRIDGE at post time - which is what this did - lets a page
-        // replace the property between document start and the submit and receive the credential
-        // itself. Document-start injection only protects a script that captures the reference while
-        // it is still the host's. Deleting it afterwards closes two more holes for free: no page
-        // script can forge an event, and `typeof window.$PAGE_EVENT_BRIDGE` no longer fingerprints
-        // BOSS to every site visited.
-        //
-        // Outside the install guard on purpose. The host injects at document start AND into the
-        // document already loaded when the script is first installed, so a second evaluation in one
-        // document is reachable - and it re-adds the property. Deleting before the guard means that
-        // second pass strips it again instead of leaving it on window for the page to find.
-        var post = window.$PAGE_EVENT_BRIDGE;
-        try {
-            delete window.$PAGE_EVENT_BRIDGE;
-        } catch (e) {
-            window.$PAGE_EVENT_BRIDGE = undefined;
-        }
+        // $PAGE_EVENT_BRIDGE is a PARAMETER the host passes in, not a window property, so there is
+        // nothing here to capture or clean up. That shape exists because of what this script posts:
+        // a documented global would let any page script replace it and receive the credential,
+        // forge a submission, or detect BOSS by probing for the name. A binding in this script's own
+        // scope has none of those.
         if (window.__bossCredCaptureInstalled) return;
         window.__bossCredCaptureInstalled = true;
         $FIELD_ELIGIBILITY_JS
@@ -182,8 +179,10 @@ internal object CredentialCapture {
                 var key = payload.username + ' ' + payload.password;
                 if (key === lastKey) return;
                 lastKey = key;
-                // The captured reference, never window.<name> - see the top of this script.
-                if (post && typeof post.emit === 'function') post.emit(JSON.stringify(payload));
+                // The host-supplied bridge, straight from this script's scope.
+                if (typeof $PAGE_EVENT_BRIDGE !== 'undefined' && $PAGE_EVENT_BRIDGE) {
+                    $PAGE_EVENT_BRIDGE.emit(JSON.stringify(payload));
+                }
             } catch (e) {
                 // A page that throws from a getter must not break its own submit.
             }
