@@ -232,4 +232,48 @@ class CredentialSavePolicyTest {
         val stored = listOf(secret("gitlab.com", "dev@example.com", "the-old-one"))
         assertIs<CredentialSavePolicy.Decision.Save>(CredentialSavePolicy.decide(pending(), stored))
     }
+
+    // ------------------------------------------ the row the suggestor could not name
+
+    @Test
+    fun `submitting after a generated password names the row instead of duplicating it`() {
+        // The suggestor stores a generated password the moment it lands in the field. On a signup
+        // form where the email is typed AFTER the password, there was no username to store with it.
+        // Without the repair rule the submit that follows reads as a brand-new credential and
+        // offers a second row for the same account.
+        val unnamed = secret("example.com", "", "generated-one", id = "row-1")
+        val decision =
+            CredentialSavePolicy.decide(
+                pending(domain = "example.com", username = "dev@example.com", password = "generated-one"),
+                listOf(unnamed),
+            )
+        val update = assertIs<CredentialSavePolicy.Decision.Update>(decision)
+        assertEquals("row-1", update.secret.id)
+    }
+
+    @Test
+    fun `a real account sharing a password with another is never renamed`() {
+        // The repair is scoped to a BLANK stored username for exactly this reason. Matching on the
+        // password alone would find an account that happens to reuse a password on the same site
+        // and rewrite its username, destroying that mapping.
+        val other = secret("example.com", "first@example.com", "shared-password", id = "row-1")
+        val decision =
+            CredentialSavePolicy.decide(
+                pending(domain = "example.com", username = "second@example.com", password = "shared-password"),
+                listOf(other),
+            )
+        val save = assertIs<CredentialSavePolicy.Decision.Save>(decision)
+        assertEquals("second@example.com", save.username)
+    }
+
+    @Test
+    fun `an unnamed row with a different password is not the one to repair`() {
+        val unnamed = secret("example.com", "", "some-other-password", id = "row-1")
+        val decision =
+            CredentialSavePolicy.decide(
+                pending(domain = "example.com", username = "dev@example.com", password = "typed-password"),
+                listOf(unnamed),
+            )
+        assertIs<CredentialSavePolicy.Decision.Save>(decision)
+    }
 }

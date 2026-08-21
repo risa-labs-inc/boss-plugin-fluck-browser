@@ -129,6 +129,22 @@ internal object CredentialSavePolicy {
             return Decision.Ignore
         }
 
+        // A row holding exactly this password that never got a username. That is specifically what
+        // the suggestor leaves behind: it stores a generated password the moment it lands in the
+        // field, and on a signup form where the email is typed AFTER the password there was no
+        // username to store with it. Without this the submit that follows looks like a brand-new
+        // credential and offers to Save a second row for the same account.
+        //
+        // Scoped to a BLANK stored username on purpose. Matching on the password alone would find a
+        // real account that happens to share a password with another one on the same site, and
+        // rename it - destroying that mapping. A row with no username is not a mapping yet, so
+        // filling it in is a repair rather than an overwrite.
+        if (pending.username.isNotBlank()) {
+            matches.firstOrNull { it.password == pending.password && it.username.isBlank() }?.let {
+                return Decision.Update(it, pending.password)
+            }
+        }
+
         if (pending.username.isNotBlank()) {
             val existing = matches.firstOrNull { sameUsername(it.username, pending.username) }
             // A same-username match here necessarily holds a different password: an identical one

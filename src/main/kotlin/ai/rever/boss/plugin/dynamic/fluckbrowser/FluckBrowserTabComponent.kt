@@ -1401,6 +1401,13 @@ internal class FluckBrowserTabState {
     var navigationHistory: MutableList<Pair<String, String>> by mutableStateOf(mutableListOf())
     var historyIndex: Int by mutableStateOf(-1)
 
+    // Sites the user answered "Never for this site" to. HOISTED, not remember-scoped: the host
+    // drops an inactive tab's Composable, so a remember slot would forget the answer the next time
+    // the user switched away and back - and the bar would ask again on a site they had explicitly
+    // told it not to. Deliberately not persisted beyond this tab: an answer that outlived the
+    // session would leave no way to be asked again short of editing a file.
+    var neverSaveDomains: Set<String> by mutableStateOf(emptySet())
+
     // Written by callbacks registered once on the BrowserHandle (setContextMenuCallback,
     // setFullscreenHandler), so they MUST live here rather than in a remember slot.
     // A remember-scoped MutableState is discarded when the host drops the inactive tab's
@@ -1894,9 +1901,8 @@ internal fun FluckBrowserTabContent(
     var saveDecision by remember { mutableStateOf<CredentialSavePolicy.Decision?>(null) }
     // Editable, because a two-step sign-in's second screen has no identifier in the document.
     var saveUsernameDraft by remember { mutableStateOf("") }
-    // "Never for this site", for this tab's lifetime. Not persisted: an answer that outlived the
-    // session would leave no way to be asked again short of editing a file.
-    var neverSaveDomains by remember { mutableStateOf(setOf<String>()) }
+    // "Never for this site". Hoisted (see FluckBrowserTabState) so a tab switch does not forget it.
+    var neverSaveDomains by hoistedState::neverSaveDomains
 
     // Where a pushed capture is handed from the JxBrowser thread to composition. CONFLATED because
     // only the newest submission matters, and because the sink must never block the page's own
