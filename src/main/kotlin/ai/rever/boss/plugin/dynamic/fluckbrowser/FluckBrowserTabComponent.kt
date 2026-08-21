@@ -2511,14 +2511,19 @@ internal fun FluckBrowserTabContent(
             // the feature is switched off would surface a prompt the user has just disabled.
             pendingSave = null
             saveDecision = null
-            withContext(Dispatchers.IO) { runCatching { handle.clearPageEventScript() } }
+            withContext(Dispatchers.IO) { PageEventChannel.clear(handle) }
             return@LaunchedEffect
         }
-        // An older host carries the api's no-op default, where installing SUCCEEDS and delivers
-        // nothing. supportsPageEventScript (api 1.0.83) is what separates that from "installed, and
-        // the user has not submitted anything yet" - without it the feature is indistinguishable
-        // from silence, which is the case worth one log line now rather than an investigation later.
-        if (!handle.supportsPageEventScript) {
+        // Reached REFLECTIVELY, so this plugin loads on hosts that predate the channel. Naming the
+        // member directly is what made 1.2.22 unloadable below its floor: BrowserHandle is
+        // host-compiled and served parent-first, so a reference the host's copy lacks fails the
+        // binary-compatibility check and the whole plugin is disabled - which, for the plugin that
+        // provides the browser tab, reads as the browser disappearing. See PageEventChannel.
+        //
+        // Absent channel means no save prompt and nothing else: the suggestor half needs none of
+        // this. One log line, because "installed and the user has not submitted anything" and "this
+        // host cannot deliver it" are otherwise the same silence.
+        if (!PageEventChannel.isSupported(handle)) {
             println("[FluckBrowser] Host has no page event channel; no credential save prompt")
             return@LaunchedEffect
         }
@@ -2526,8 +2531,8 @@ internal fun FluckBrowserTabContent(
         // engine (a window property write plus an evaluation into the live document), and a renderer
         // in a long task would otherwise park the thread drawing the UI.
         withContext(Dispatchers.IO) {
-            runCatching {
-                handle.setPageEventScript(CredentialCapture.INSTALL_JS) { url, json ->
+            val installed =
+                PageEventChannel.install(handle, CredentialCapture.INSTALL_JS) { url, json ->
                     // JxBrowser thread, inside the page's own event dispatch. trySend and nothing
                     // else: a blocking hand-off would stall the submit the user just performed.
                     //
@@ -2535,10 +2540,8 @@ internal fun FluckBrowserTabContent(
                     // of the call. Carried through rather than resolved later - see the collector.
                     captureChannel.trySend(CapturedEvent(url, json))
                 }
-            }.onFailure {
-                println(
-                    "[FluckBrowser] Page event script install threw; no credential save prompt here",
-                )
+            if (!installed) {
+                println("[FluckBrowser] Page event script would not install; no credential save prompt")
             }
         }
     }
@@ -2558,7 +2561,7 @@ internal fun FluckBrowserTabContent(
         // UI thread.
         val handleAtInstall = browserHandle
         onDispose {
-            runCatching { handleAtInstall?.clearPageEventScript() }
+            handleAtInstall?.let { PageEventChannel.clear(it) }
         }
     }
 
