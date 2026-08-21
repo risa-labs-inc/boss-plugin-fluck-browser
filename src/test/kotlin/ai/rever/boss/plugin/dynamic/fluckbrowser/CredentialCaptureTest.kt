@@ -133,17 +133,33 @@ class CredentialCaptureTest {
     }
 
     @Test
-    fun `the script never touches window to post`() {
-        // The bridge is a PARAMETER the host passes in (api 1.0.83), not a window property. That is
-        // the whole defence for what this script posts: a documented global would let any page
-        // script replace it and receive the credential, forge a submission, or detect BOSS by
-        // probing for the name. Reading it off window here - which an earlier version did, inside
-        // the submit listener - reopens all three.
+    fun `the script touches window for nothing at all`() {
+        // Two separate mistakes, both gone, and each was page-visible.
+        //
+        // The bridge is a PARAMETER the host passes in (api 1.0.83). A documented global would let
+        // any page script replace it and receive the credential, forge a submission, or detect BOSS
+        // by probing for the name - and an earlier version of this script read it off window inside
+        // the submit listener, which reopened all three.
+        //
+        // The install guard was `window.__bossCredCaptureInstalled`: the same mistake in the other
+        // direction. A marker any page could read to identify BOSS, and worse, one any page could
+        // PRE-SET to switch credential capture off for itself. The host now guarantees one
+        // evaluation per document, which is what let it be removed rather than relocated somewhere
+        // less obvious.
         val text = code().replace(Regex("\\s+"), " ")
-        assertFalse(
-            text.contains("window.__bossPageEvent"),
-            "the script reaches for the bridge on window instead of using the injected parameter",
-        )
+        // Standard DOM reads are fine and expected - the shared eligibility rules use
+        // window.innerWidth and window.getComputedStyle. What must not exist is a BOSS-specific
+        // global, in either direction.
+        val ours =
+            Regex("""window\.[A-Za-z_$][\w$]*""")
+                .findAll(text)
+                .map { it.value }
+                .filter { it.contains("boss", ignoreCase = true) }
+                .toSet()
+        assertEquals(emptySet(), ours, "the script names a BOSS global on window: $ours")
+        // And no assignment to window at all: creating any global is what a page can then read.
+        val writes = Regex("""window\.[A-Za-z_$][\w$]* *=""").findAll(text).map { it.value }.toSet()
+        assertEquals(emptySet(), writes, "the script writes to window: $writes")
         assertTrue(
             text.contains("__bossPageEvent.emit("),
             "the script does not post through the injected bridge",
@@ -168,14 +184,6 @@ class CredentialCaptureTest {
                 .filter { (_, c) -> c.isISOControl() && c != '\n' && c != '\r' && c != '\t' }
                 .map { (i, c) -> "index $i: U+%04X".format(c.code) }
         assertEquals(emptyList(), offenders, "control characters in the injected script: $offenders")
-    }
-
-    @Test
-    fun `installation is idempotent`() {
-        // The host injects at document start and also into the already-loaded page when the script
-        // is first installed, so a document can legitimately see it twice. Without the guard that
-        // means two sets of listeners and two emits per submit.
-        assertTrue(code().contains("__bossCredCaptureInstalled"), "no install guard")
     }
 
     @Test

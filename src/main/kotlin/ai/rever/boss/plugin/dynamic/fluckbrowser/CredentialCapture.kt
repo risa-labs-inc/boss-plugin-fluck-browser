@@ -96,11 +96,12 @@ internal object CredentialCapture {
      * this script's payload: a documented global would let any page script replace it and receive
      * the credential, forge a submission, or fingerprint BOSS.
      *
-     * The install guard is still needed, and for a reason the parameter does not address: the host
-     * injects at document start *and* into the document already loaded when the script is first
-     * installed, and replacing a script does not retract the previous generation from a live
-     * document. Without the guard one document ends up with two sets of listeners and posts twice
-     * per submit.
+     * There is no install guard, because the host guarantees one evaluation per document (api
+     * 1.0.83). Worth recording what the guard was, since it looked harmless: a
+     * `window.__bossCredCaptureInstalled` flag - which any page could read to identify BOSS, and any
+     * page could PRE-SET to switch credential capture off for itself. A guard cannot live in the
+     * script's own scope (each evaluation gets a fresh one), so the choice was window or nothing;
+     * the host counting documents is what made nothing possible.
      *
      * Three listeners rather than one, all in the capture phase so a page that calls
      * `stopPropagation` on its own form cannot hide the submit:
@@ -115,13 +116,18 @@ internal object CredentialCapture {
     val INSTALL_JS: String =
         """
         (function() {
-        // $PAGE_EVENT_BRIDGE is a PARAMETER the host passes in, not a window property, so there is
-        // nothing here to capture or clean up. That shape exists because of what this script posts:
-        // a documented global would let any page script replace it and receive the credential,
-        // forge a submission, or detect BOSS by probing for the name. A binding in this script's own
-        // scope has none of those.
-        if (window.__bossCredCaptureInstalled) return;
-        window.__bossCredCaptureInstalled = true;
+        // Nothing on window at all, in either direction.
+        //
+        // $PAGE_EVENT_BRIDGE is a PARAMETER the host passes in, because a documented global would
+        // let any page script replace it and receive the credential, forge a submission, or detect
+        // BOSS by probing for the name.
+        //
+        // And there is no install guard here any more. It used to be
+        // `window.__bossCredCaptureInstalled`, which was the same mistake in the other direction: a
+        // marker any page could read to identify BOSS, and worse, one any page could PRE-SET to
+        // suppress credential capture on itself entirely. The host now guarantees one evaluation per
+        // document (api 1.0.83), so the guard has nowhere left to be needed - which is the only
+        // reason it could be removed rather than hidden somewhere less obvious.
         $FIELD_ELIGIBILITY_JS
 
         function isPassword(el) {
