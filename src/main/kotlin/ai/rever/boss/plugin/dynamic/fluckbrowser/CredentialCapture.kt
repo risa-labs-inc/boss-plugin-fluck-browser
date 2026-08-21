@@ -96,12 +96,21 @@ internal object CredentialCapture {
      * this script's payload: a documented global would let any page script replace it and receive
      * the credential, forge a submission, or fingerprint BOSS.
      *
-     * There is no install guard, because the host guarantees one evaluation per document (api
-     * 1.0.83). Worth recording what the guard was, since it looked harmless: a
-     * `window.__bossCredCaptureInstalled` flag - which any page could read to identify BOSS, and any
-     * page could PRE-SET to switch credential capture off for itself. A guard cannot live in the
-     * script's own scope (each evaluation gets a fresh one), so the choice was window or nothing;
-     * the host counting documents is what made nothing possible.
+     * **There is no install guard, and a duplicate evaluation is tolerated rather than prevented.**
+     *
+     * What the guard was, since it looked harmless: a `window.__bossCredCaptureInstalled` flag -
+     * which any page could read to identify BOSS, and any page could PRE-SET to switch credential
+     * capture off for itself. It could not move somewhere quieter either, because a guard in this
+     * script's own scope is invisible to a second evaluation (the host wraps the script, so each run
+     * gets a fresh scope) - the choice was a window property or nothing.
+     *
+     * Nothing wins because a duplicate costs nothing HERE, which is worth spelling out rather than
+     * assuming. Reinstalling while a login page is open evaluates this twice, so a submit fires two
+     * sets of listeners and posts twice. Both posts carry identical values, the channel that
+     * receives them is CONFLATED, and the policy holds one pending capture - so two identical posts
+     * and one produce the same single prompt. The host was briefly documented as deduping for us;
+     * that guarantee turned out to be unimplementable on its side, and this consumer never needed
+     * it.
      *
      * Three listeners rather than one, all in the capture phase so a page that calls
      * `stopPropagation` on its own form cannot hide the submit:

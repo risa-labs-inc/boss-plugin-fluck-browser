@@ -136,7 +136,8 @@ The bridge the script posts through is handed to it as a parameter and never lef
 no page script can replace it and receive the credential, forge a submission, or detect BOSS by
 probing for it. The script writes nothing to `window` either: it used to set an
 already-installed flag there, which any site could read to identify BOSS and, worse, could set
-itself to turn credential capture off for that site. What does arrive is treated as untrusted, and the site a credential is attributed to
+itself to turn credential capture off for that site. Nothing replaced it, because a duplicate
+evaluation is harmless here - two identical events reach a conflated channel and produce one prompt. What does arrive is treated as untrusted, and the site a credential is attributed to
 comes from the URL the host reads off the posting document, never from the payload.
 
 ## Requirements
