@@ -120,7 +120,7 @@ never produces a prompt.
 ### What crosses the boundary, and when
 
 A password reaches the plugin **only** on a submit you performed, through a page-event script the
-host installs at document start (`BrowserHandle.setPageEventScript`, api 1.0.82). The separate poll
+host installs at document start (`BrowserHandle.setPageEventScript`, api 1.0.83). The separate poll
 that positions the saved-logins list runs several times a second and reports only *whether* a field
 has a value, never the value - a periodic read that returned page text would be a keylogger.
 
@@ -132,7 +132,7 @@ engine's own committed URL and never from the page's payload.
 ## Requirements
 
 - BOSS Console 9.4.23 or later (the password manager needs the host's page-event channel)
-- Plugin API 1.0.82 or later
+- Plugin API 1.0.83 or later
 
 ## License
 
