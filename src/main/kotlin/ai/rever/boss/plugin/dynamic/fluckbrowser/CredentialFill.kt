@@ -267,6 +267,159 @@ internal object CredentialFill {
         })();
         """.trimIndent()
 
+    /**
+     * What happened to a generated password, and - crucially - what the field actually holds now.
+     *
+     * [landed] is the value read back out of the box after filling. For a *user's* credential the
+     * fill deliberately does not compare (a site that masks or reformats on input has still
+     * accepted it, and calling that a failure would warn about a fill that worked). Here the
+     * comparison is the whole point: we chose this password, so we know what should be there, and
+     * what gets written to Secret Manager has to be what the account will actually have. A site
+     * with `maxlength=12` truncates silently, and saving the untruncated original would store a
+     * password that has never worked.
+     */
+    data class NewPasswordResult(
+        val target: FieldOutcome,
+        /** The confirm-password twin, [FieldOutcome.ABSENT] on a form that has none. */
+        val confirm: FieldOutcome,
+        val landed: String?,
+        /**
+         * What the signup form's username box holds, so the secret can be stored against an
+         * account rather than against a blank.
+         *
+         * Read in the SAME round trip as the fill, not by a second script: this is a value from the
+         * page, and every such read has to be attributable to something the user did. One click
+         * that fills and reports is one action; a follow-up read of page content is a second one
+         * with no user gesture behind it.
+         */
+        val username: String?,
+    ) {
+        val filled: Boolean get() = target == FieldOutcome.FILLED && !landed.isNullOrEmpty()
+    }
+
+    @Serializable
+    private data class RawNewPassword(
+        val target: String = "unknown",
+        val confirm: String = "absent",
+        val landed: String? = null,
+        val username: String? = null,
+    )
+
+    fun parseNewPasswordResult(raw: String?): NewPasswordResult {
+        val parsed =
+            raw?.takeIf { it.isNotBlank() }?.let { text ->
+                runCatching { json.decodeFromString<RawNewPassword>(text) }.getOrNull()
+            } ?: return NewPasswordResult(FieldOutcome.UNKNOWN, FieldOutcome.UNKNOWN, null, null)
+        return NewPasswordResult(
+            outcome(parsed.target),
+            outcome(parsed.confirm),
+            parsed.landed,
+            parsed.username,
+        )
+    }
+
+    /**
+     * Fill a generated [password] into the new-password box at [targetIndex], and into its confirm
+     * twin if the form has one.
+     *
+     * Filling the twin is not a convenience. A signup form that requires confirmation and gets only
+     * one box filled shows a mismatch error, and the user's repair is to retype both by hand -
+     * which loses the generated password unless they read it off the card first. Filling both means
+     * the form is submittable as it stands.
+     *
+     * The twin is "another password box that is not the target and is not `current-password`", which
+     * deliberately declines to guess between two remaining boxes: a form with three password
+     * fields is a change-password form whose third box the target's own `new-password` grouping
+     * cannot distinguish, so nothing beyond the first candidate is touched.
+     */
+    fun newPasswordScript(
+        password: String,
+        targetIndex: Int? = null,
+    ): String =
+        """
+        (function() {
+        $FIELD_ELIGIBILITY_JS
+        var VALUE = ${jsLiteral(password)};
+        var TARGET = ${targetIndex ?: -1};
+
+        function fill(el, value) {
+            try {
+                if (document.activeElement !== el) el.focus();
+                el.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
+                var setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                // Deliberately NOT marked data-boss-filled. That marker means "this came from a
+                // saved secret", and the save policy uses it to stay quiet about a credential it
+                // filled. A generated password is the opposite case: it is being saved right now,
+                // and it must not look like something already stored.
+                return el.value.length > 0;
+            } catch (e) {
+                return false;
+            }
+        }
+        function isPassword(el) {
+            return (el.type || '').toLowerCase() === 'password';
+        }
+
+        var all = document.querySelectorAll('input');
+        var eligible = [];
+        var i;
+        for (i = 0; i < all.length; i++) {
+            if (isLoginField(all[i])) eligible.push(all[i]);
+        }
+
+        var target = null;
+        if (TARGET >= 0 && TARGET < eligible.length && isPassword(eligible[TARGET])) {
+            target = eligible[TARGET];
+        } else {
+            var active = document.activeElement;
+            for (i = 0; i < eligible.length; i++) {
+                if (eligible[i] === active && isPassword(eligible[i])) target = eligible[i];
+            }
+        }
+        if (!target) {
+            return JSON.stringify({ target: 'absent', confirm: 'absent', landed: null, username: null });
+        }
+
+        // The account this password is being chosen for: the last eligible non-password box before
+        // the target that has something in it. Same rule as the fill's pickUsername and the capture
+        // script's usernameFor, because "the first text input in the enclosing form" cannot work on
+        // a page with no form element - which is most large signup pages.
+        var username = null;
+        for (i = 0; i < eligible.length; i++) {
+            var cand = eligible[i];
+            if (isPassword(cand) || !cand.value) continue;
+            if (hasToken(cand, 'username') || hasToken(cand, 'email')) { username = cand.value; continue; }
+            var precedes = cand.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING;
+            if (precedes) username = cand.value;
+        }
+
+        var confirm = null;
+        for (i = 0; i < eligible.length; i++) {
+            var el = eligible[i];
+            if (el === target || !isPassword(el)) continue;
+            if (hasToken(el, 'current-password')) continue;
+            confirm = el;
+            break;
+        }
+
+        var report = {
+            target: fill(target, VALUE) ? 'filled' : 'failed',
+            confirm: confirm ? (fill(confirm, VALUE) ? 'filled' : 'failed') : 'absent',
+            // Read back from the TARGET after both fills. This is what the account will have, and
+            // it is what gets saved - not VALUE.
+            landed: target.value,
+            username: username
+        };
+        try { target.focus(); } catch (e) { /* detached node */ }
+        return JSON.stringify(report);
+        })();
+        """.trimIndent()
+
     internal const val NO_FIELD_NOTICE = "No login box on this page could be filled"
     internal const val FAILED_NOTICE = "Could not fill the login box on this page"
     internal const val PARTIAL_NOTICE = "Only one of the two login boxes could be filled"

@@ -49,6 +49,22 @@ internal data class FocusedLoginField(
     val key: String,
     /** True for `type="password"`, false for the username/email side. */
     val isPassword: Boolean,
+    /**
+     * True when this is a password being *chosen* rather than recalled - a signup form, or the new
+     * half of a change-password form. What decides whether to offer a generated password.
+     *
+     * Defaulted, like the two below, so a probe answer from before these existed still parses.
+     */
+    val isNewPassword: Boolean = false,
+    /**
+     * The field's `maxlength`, or -1 when it declares none.
+     *
+     * Carried because a site that caps at 12 and silently truncates a 20-character suggestion
+     * leaves Secret Manager holding a password the account does not have. See [PasswordGenerator].
+     */
+    val maxLength: Int = -1,
+    /** The field's `pattern` attribute, or null. Also for [PasswordGenerator]. */
+    val pattern: String? = null,
     /** `location.href`, read from the page rather than the URL bar, which the user may be editing. */
     val pageUrl: String,
     /** Whether the box already has something in it. The value itself never leaves the page. */
@@ -225,6 +241,21 @@ $FIELD_ELIGIBILITY_JS
         // would still be drawn - over the URL bar's own autocomplete, or after the user alt-tabbed
         // away entirely. Also drops an unfocused tab to the slowest poll rate.
         if (!document.hasFocus()) return 'IDLE';
+        // A document that is still parsing has not told us anything yet.
+        //
+        // This is the difference between "no login form here" and "no login form YET", and the save
+        // prompt turns on it: a form POST destroys the old document and the new one parses
+        // incrementally, so the first probe after a submit very often lands before the new page's
+        // inputs exist. Answering NONE there reads as "the login form is gone", which is the signal
+        // CredentialSavePolicy treats as success - so mistyping a password and being bounced back to
+        // the same form would offer to save the wrong one. IDLE is the honest answer: no verdict yet.
+        if (document.readyState === 'loading') return 'IDLE';
+        // Nor has a document with no origin. `about:blank` between two commits reports readyState
+        // 'complete' with no inputs, so the check above does not catch it - and it sits exactly in
+        // the gap a form POST opens. Deliberately not solved by demanding two consecutive answers
+        // instead: at the no-login-field poll rate that would delay every genuine prompt by four
+        // seconds to fix a case this line fixes for nothing.
+        if (!location.host) return 'IDLE';
         var all = document.querySelectorAll('input');
         var fields = [];
         for (var i = 0; i < all.length; i++) {
@@ -237,9 +268,44 @@ $FIELD_ELIGIBILITY_JS
         if (index === -1) return 'IDLE';
         var el = fields[index];
         var r = el.getBoundingClientRect();
+        var isPassword = (el.type || '').toLowerCase() === 'password';
+
+        // A password the user is CHOOSING, not one they are recalling. Three signals, in order of
+        // how much they can be trusted:
+        //
+        // 1. autocomplete says so. `current-password` is decisive in the other direction and is
+        //    checked first, because a change-password form has both and the box holding the old
+        //    password must never be offered a generated one.
+        // 2. More than one password box on the page. A sign-in form has one; a signup or
+        //    change-password form has two or three.
+        // 3. Name/id/placeholder wording. Last, because "confirm" also appears on plenty of
+        //    fields that are not passwords at all - which is why this only runs for a password box.
+        var isNewPassword = false;
+        if (isPassword && !hasToken(el, 'current-password')) {
+            if (hasToken(el, 'new-password')) {
+                isNewPassword = true;
+            } else {
+                var passwordCount = 0;
+                for (i = 0; i < fields.length; i++) {
+                    if ((fields[i].type || '').toLowerCase() === 'password') passwordCount++;
+                }
+                if (passwordCount > 1) {
+                    isNewPassword = true;
+                } else {
+                    var words = [
+                        el.name, el.id, el.placeholder, el.getAttribute('aria-label')
+                    ].join(' ').toLowerCase();
+                    isNewPassword = /new|confirm|repeat|retype|register|sign-?up|create/.test(words);
+                }
+            }
+        }
+
         return JSON.stringify({
             key: index + '|' + (el.name || '') + '|' + (el.id || '') + '|' + (el.type || ''),
-            isPassword: (el.type || '').toLowerCase() === 'password',
+            isPassword: isPassword,
+            isNewPassword: isNewPassword,
+            maxLength: (typeof el.maxLength === 'number' ? el.maxLength : -1),
+            pattern: el.getAttribute('pattern'),
             pageUrl: location.href,
             hasValue: !!(el.value && el.value.length > 0),
             left: r.left,
@@ -383,7 +449,43 @@ internal const val LOGIN_PROBE_TIMEOUT_MS = 2_000L
  * Pure and separate because it is policy over three inputs, and inline in a composable it had no
  * coverage at all - the same reason `shouldClearContextMenuTarget` and
  * `browserMouseNavigationForButton` live outside their call sites in this plugin.
+ *
+ * (The generated-password predicate below was inserted between this doc and the function it
+ * describes, which detached it. Kotlin gives a doc comment to whatever declaration follows it, so
+ * inserting a declaration silently reassigns the one above.)
  */
+/**
+ * Whether to offer a generated password beside [field].
+ *
+ * @param forced the user asked for one from the right-click menu. It bypasses the new-password
+ *   heuristic, and it is the only way back after the card has been dismissed - without it, waving
+ *   the card away on a signup form is a dead end for that field, since the automatic offer is
+ *   suppressed for exactly the box the user then wants help with. An explicit request needs no
+ *   heuristic: the user has said what this box is for. It still requires a *password* box, so the
+ *   menu item can never put a password into a username field.
+ */
+internal fun shouldOfferGeneratedPassword(
+    field: FocusedLoginField?,
+    dismissedId: String?,
+    enabled: Boolean,
+    forced: Boolean = false,
+): Boolean {
+    if (!enabled) return false
+    if (field == null) return false
+    if (forced) {
+        // Deliberately skips the dismissal check as well: the request came after the dismissal.
+        return field.isPassword && !field.hasValue && PasswordGenerator.fits(field.maxLength)
+    }
+    if (!field.isNewPassword) return false
+    // Dismissed for this box on this page, same scoping as the saved-logins list.
+    if (field.dismissId == dismissedId) return false
+    // Something is already typed. Offering to replace a password the user has started choosing is
+    // worse than staying out of the way, and this is also what closes the card after Use.
+    if (field.hasValue) return false
+    // A field too short to hold a decent password gets no offer at all, rather than a weak one.
+    return PasswordGenerator.fits(field.maxLength)
+}
+
 internal fun shouldOfferSuggestions(
     field: FocusedLoginField?,
     dismissedId: String?,

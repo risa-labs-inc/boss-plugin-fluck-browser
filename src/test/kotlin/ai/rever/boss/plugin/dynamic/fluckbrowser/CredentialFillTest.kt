@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 import ai.rever.boss.plugin.dynamic.fluckbrowser.CredentialFill.FieldOutcome
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -185,5 +186,96 @@ class CredentialFillTest {
         val script = CredentialFill.script("a\"b", "c\\d", targetIndex = null)
         assertTrue(script.contains("var USERNAME = \"a\\\"b\";"))
         assertTrue(script.contains("var PASSWORD = \"c\\\\d\";"))
+    }
+
+    // ---------------------------------------------------- the generated-password fill
+
+    @Test
+    fun `the new-password result reports what the field ended up holding`() {
+        val result =
+            CredentialFill.parseNewPasswordResult(
+                """{"target":"filled","confirm":"filled","landed":"abc123","username":"dev@example.com"}""",
+            )
+        assertEquals(CredentialFill.FieldOutcome.FILLED, result.target)
+        assertEquals(CredentialFill.FieldOutcome.FILLED, result.confirm)
+        assertEquals("abc123", result.landed)
+        assertEquals("dev@example.com", result.username)
+        assertTrue(result.filled)
+    }
+
+    @Test
+    fun `a truncated value is reported as landed, not as the value that was sent`() {
+        // The whole reason this result carries `landed`. A field with maxlength=6 silently keeps the
+        // first six characters, and saving the original would put a password in Secret Manager that
+        // has never worked on the account.
+        val result = CredentialFill.parseNewPasswordResult("""{"target":"filled","landed":"abc123"}""")
+        assertEquals("abc123", result.landed)
+    }
+
+    @Test
+    fun `a form with no confirm box is not a failure`() {
+        val result =
+            CredentialFill.parseNewPasswordResult("""{"target":"filled","confirm":"absent","landed":"x"}""")
+        assertEquals(CredentialFill.FieldOutcome.ABSENT, result.confirm)
+        assertTrue(result.filled)
+    }
+
+    @Test
+    fun `a fill reporting success with an empty field is not a success`() {
+        // A site that rejects the value outright can leave the box empty while the assignment threw
+        // nothing. Saving that would store an empty password.
+        val result = CredentialFill.parseNewPasswordResult("""{"target":"filled","landed":""}""")
+        assertFalse(result.filled)
+    }
+
+    @Test
+    fun `a page that could not be asked is unknown, not filled`() {
+        val result = CredentialFill.parseNewPasswordResult(null)
+        assertEquals(CredentialFill.FieldOutcome.UNKNOWN, result.target)
+        assertFalse(result.filled)
+        assertNull(result.landed)
+    }
+
+    @Test
+    fun `an unreadable answer is unknown rather than an exception`() {
+        assertEquals(
+            CredentialFill.FieldOutcome.UNKNOWN,
+            CredentialFill.parseNewPasswordResult("{not json").target,
+        )
+        assertEquals(CredentialFill.FieldOutcome.UNKNOWN, CredentialFill.parseNewPasswordResult("").target)
+    }
+
+    @Test
+    fun `a generated password is interpolated as an escaped literal`() {
+        // Same requirement as the credential fill: this is spliced into JavaScript source, and an
+        // unescaped quote or line separator is a SyntaxError that reads as "the page has no form".
+        val script = CredentialFill.newPasswordScript("a\"b\\c\u2028d")
+        assertFalse(script.contains("\"a\"b"), "raw quote survived into the script")
+        assertTrue(script.contains("\\u2028"), "U+2028 was not escaped")
+    }
+
+    /**
+     * The script with its `//` comments removed.
+     *
+     * Needed because the generated fill *explains* in a comment that it deliberately does not set
+     * the marker, so a raw text search finds the explanation and reads it as the offence. The same
+     * trap caught the host's InjectJsCallback guard.
+     */
+    private fun code(script: String): String =
+        script.lines().joinToString("\n") { it.substringBefore("//") }
+
+    @Test
+    fun `the generated fill does not mark the field as coming from a saved secret`() {
+        // data-boss-filled means "this came from Secret Manager", and the save policy uses it to
+        // stay quiet. A generated password is the opposite case: it is being stored right now, and
+        // marking it would make the very first save look like a no-op.
+        assertFalse(
+            code(CredentialFill.newPasswordScript("x")).contains("data-boss-filled"),
+            "the generated fill sets the saved-secret marker",
+        )
+        assertTrue(
+            code(CredentialFill.script("u", "p")).contains("data-boss-filled"),
+            "the credential fill stopped setting the marker the policy depends on",
+        )
     }
 }
