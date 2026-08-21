@@ -449,6 +449,10 @@ internal const val LOGIN_PROBE_TIMEOUT_MS = 2_000L
  * Pure and separate because it is policy over three inputs, and inline in a composable it had no
  * coverage at all - the same reason `shouldClearContextMenuTarget` and
  * `browserMouseNavigationForButton` live outside their call sites in this plugin.
+ *
+ * (The generated-password predicate below was inserted between this doc and the function it
+ * describes, which detached it. Kotlin gives a doc comment to whatever declaration follows it, so
+ * inserting a declaration silently reassigns the one above.)
  */
 /**
  * Whether to offer a generated password beside [field].

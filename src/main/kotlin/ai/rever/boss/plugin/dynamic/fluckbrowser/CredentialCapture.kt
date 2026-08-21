@@ -7,34 +7,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
 /**
- * Noticing that the user just submitted a credential, so it can be offered to Secret Manager.
- *
- * **Why this is a pushed event and not a poll.** The credential exists in the page for one moment.
- * A submit is followed by a navigation that destroys the JS context, so anything latched in the
- * page for the next poll to collect is racing its own teardown - and loses whenever the login is
- * fast. `BrowserHandle.setPageEventScript` (host api 1.0.82) exists for exactly this: the script
- * below is installed at document start and calls back while the document that produced the event is
- * still alive.
- *
- * **What crosses the boundary, and when.** A password. Once, on a submit the user performed.
- * Deliberately contrast this with [LOGIN_FIELD_PROBE_JS], which runs several times a second and
- * returns `hasValue: Boolean` and never a value - a probe that returned page text at that rate
- * would be a keylogger. The rule that keeps both honest: a *periodic* read never carries a value,
- * and a value only ever moves on something the user did.
- *
- * **The payload is untrusted.** The bridge is a property on `window`, so any script on the page can
- * call it with anything. Three consequences, all handled rather than assumed away:
- *
- * - The payload carries **no page URL**. Which site this is gets stamped by the plugin from its own
- *   committed URL, because a page-supplied origin would let a page offer a credential for a domain
- *   it does not own.
- * - A page can fabricate a submission for **its own** domain. The bar that results still needs a
- *   deliberate click, and at most one capture is pending at a time, so the worst case is one
- *   ignorable prompt rather than a stored credential.
- * - A page can *suppress* a prompt by claiming [CapturedCredential.wasFilledByBoss]. It could
- *   equally clear its own fields, so nothing is lost by trusting it here.
- */
-/**
  * One posted event, as it crosses from the JxBrowser thread into composition.
  *
  * [url] is the host's reading of the document that posted, not anything the page supplied. It is the
@@ -46,6 +18,31 @@ internal data class CapturedEvent(
     val json: String,
 )
 
+/**
+ * Noticing that the user just submitted a credential, so it can be offered to Secret Manager.
+ *
+ * **Why this is a pushed event and not a poll.** The credential exists in the page for one moment.
+ * A submit is followed by a navigation that destroys the JS context, so anything latched in the page
+ * for the next poll to collect is racing its own teardown - and loses whenever the login is fast.
+ * `BrowserHandle.setPageEventScript` (api 1.0.83) exists for exactly this: the script below is
+ * installed at document start and calls back while the document that produced the event is alive.
+ *
+ * **What crosses the boundary, and when.** A password. Once, on a submit the user performed.
+ * Deliberately contrast this with [LOGIN_FIELD_PROBE_JS], which runs several times a second and
+ * returns `hasValue: Boolean` and never a value - a probe that returned page text at that rate would
+ * be a keylogger. The rule that keeps both honest: a *periodic* read never carries a value, and a
+ * value only ever moves on something the user did.
+ *
+ * **The bridge is a scoped parameter, so a page cannot reach this channel.** It is not a `window`
+ * property: the host passes it into the script, which is what stops a page replacing it to receive
+ * the credential, forging a submission into the plugin's sink, or detecting BOSS by probing for a
+ * name. An earlier draft of this KDoc described the window-property design and the threat model that
+ * came with it; both are gone.
+ *
+ * Two things are still not the page's to be trusted about, so the parse stays defensive: field
+ * lengths are bounded, and the site an event is attributed to comes from the URL the HOST read off
+ * the posting document, never from the payload - which is why the payload carries no URL at all.
+ */
 internal object CredentialCapture {
     /** What one submit looked like. */
     @Serializable
@@ -135,9 +132,13 @@ internal object CredentialCapture {
         // And there is no install guard here any more. It used to be
         // `window.__bossCredCaptureInstalled`, which was the same mistake in the other direction: a
         // marker any page could read to identify BOSS, and worse, one any page could PRE-SET to
-        // suppress credential capture on itself entirely. The host now guarantees one evaluation per
-        // document (api 1.0.83), so the guard has nowhere left to be needed - which is the only
-        // reason it could be removed rather than hidden somewhere less obvious.
+        // suppress credential capture on itself entirely.
+        //
+        // Nothing replaced it, because a duplicate evaluation costs nothing here: both posts carry
+        // identical values, the channel is CONFLATED and the policy holds one pending capture, so
+        // two posts and one produce the same single prompt. (The host was briefly documented as
+        // deduping instead; that guarantee was withdrawn as unimplementable on its side. This
+        // comment used to assert it, two paragraphs after the KDoc said it was gone.)
         $FIELD_ELIGIBILITY_JS
 
         function isPassword(el) {

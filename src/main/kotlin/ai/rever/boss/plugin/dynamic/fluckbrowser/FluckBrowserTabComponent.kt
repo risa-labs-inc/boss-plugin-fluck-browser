@@ -1212,24 +1212,6 @@ internal inline fun <T> BrowserHandle?.onBrowser(
 }
 
 /**
- * Fill [secret] into the page.
- *
- * Scripted from here rather than delegated to `BrowserHandle.fillCredentials`, because that API
- * takes no "which field" argument and so can only guess - and its guess wrote the password into
- * Google's `display: none` decoy while the visible email box stayed empty. See [CredentialFill].
- *
- * [targetIndex] is the field's position in the eligible-login-field list when the caller knows it
- * (the suggestion list does; the right-click menu does not and relies on `document.activeElement`).
- *
- * There is deliberately **no fallback to `fillCredentials`**. An earlier version had one, for a
- * page that could not be scripted at all - but it could never help: both paths go through
- * `mainFrame().executeJavaScript`, so every condition that makes this return null (a torn-down
- * handle, no main frame, a throwing call) fails the host's injector for the same reason. A
- * fallback that cannot succeed where the primary failed is not a safety net, it is a second way to
- * write a password somewhere nobody asked for. `fillCredentials` is being removed from the api
- * outright, so this is the only credential-fill path there is.
- */
-/**
  * Fill a generated [password] into the new-password box at [targetIndex] and its confirm twin.
  *
  * Separate from [fillCredential] because the two want opposite things from the result. That one
@@ -1278,13 +1260,17 @@ internal suspend fun saveGeneratedPassword(
     // a secret for that site and account, so creating a second leaves two rows for one login - one
     // holding the dead password - and the fill list then offers both with nothing to tell them
     // apart.
+    val matches = matchSecretsForDomain(domain, knownSecrets)
     val existing =
-        username
-            .takeIf { it.isNotBlank() }
-            ?.let { name ->
-                matchSecretsForDomain(domain, knownSecrets)
-                    .firstOrNull { it.username.equals(name, ignoreCase = true) }
-            }
+        if (username.isNotBlank()) {
+            matches.firstOrNull { it.username.equals(username, ignoreCase = true) }
+        } else {
+            // A blank username still needs a dedupe, or every accepted suggestion on a signup form
+            // where the email box is still empty creates another unnamed row - and
+            // CredentialSavePolicy.decide's repair rule can then only ever name one of them.
+            // Reachable by clearing the field and taking a second suggestion.
+            matches.firstOrNull { it.username.isBlank() }
+        }
     val written =
         runCatching {
             if (existing != null) {
@@ -1302,7 +1288,10 @@ internal suspend fun saveGeneratedPassword(
     val id =
         reloaded
             ?.let { matchSecretsForDomain(domain, it) }
-            ?.firstOrNull { it.password == password && it.username == username }
+            // ignoreCase, matching the lookup above. They disagreed: if the backend normalises the
+            // username, the id resolved to null and Edit silently fell back to creating a duplicate
+            // of the row it was meant to correct.
+            ?.firstOrNull { it.password == password && it.username.equals(username, ignoreCase = true) }
             ?.id
     return SavedSecretNotice(domain = domain, username = username, password = password, secretId = id)
 }
@@ -1404,6 +1393,24 @@ internal fun refusesTotpUpdate(secret: SecretEntryData): Boolean {
     return !meta.twofaEnabled && !meta.twofaSecret.isNullOrBlank()
 }
 
+/**
+ * Fill [secret] into the page.
+ *
+ * Scripted from here rather than delegated to `BrowserHandle.fillCredentials`, because that API
+ * takes no "which field" argument and so can only guess - and its guess wrote the password into
+ * Google's `display: none` decoy while the visible email box stayed empty. See [CredentialFill].
+ *
+ * [targetIndex] is the field's position in the eligible-login-field list when the caller knows it
+ * (the suggestion list does; the right-click menu does not and relies on `document.activeElement`).
+ *
+ * There is deliberately **no fallback to `fillCredentials`**. An earlier version had one, for a
+ * page that could not be scripted at all - but it could never help: both paths go through
+ * `mainFrame().executeJavaScript`, so every condition that makes this return null (a torn-down
+ * handle, no main frame, a throwing call) fails the host's injector for the same reason. A
+ * fallback that cannot succeed where the primary failed is not a safety net, it is a second way to
+ * write a password somewhere nobody asked for. `fillCredentials` is being removed from the api
+ * outright, so this is the only credential-fill path there is.
+ */
 internal suspend fun BrowserHandle?.fillCredential(
     secret: SecretEntryData,
     targetIndex: Int? = null,
@@ -1979,6 +1986,9 @@ internal fun FluckBrowserTabContent(
     // a field the user has waved away, which otherwise makes that field a dead end - this is the
     // way back.
     var forceSuggestPassword by remember { mutableStateOf(false) }
+    // ...and it is scoped to the box it was requested for. Left set, it followed the caret onto
+    // every other password field on the page, which is an offer nobody asked for.
+    LaunchedEffect(focusedLoginField?.dismissId) { forceSuggestPassword = false }
 
     // A fill that lands needs no announcement. One that does not is otherwise indistinguishable
     // from a click that never registered, which is exactly how a resolver picking the wrong field
@@ -2538,8 +2548,17 @@ internal fun FluckBrowserTabContent(
     // channel nobody reads, and given what that listener reads off the page it is worth retracting
     // deliberately rather than by side effect.
     DisposableEffect(browserHandle) {
+        // Captured in a local. `browserHandle` is `by hoistedState::browserHandle`, a delegated
+        // property, so reading it inside onDispose reads whatever it holds AT DISPOSE TIME - on a
+        // handle swap that clears the new handle and leaves the old one's script installed, which
+        // is the opposite of what this effect reads like it does.
+        //
+        // No IO dispatch, deliberately, unlike the install: clearPageEventScript only nulls two
+        // fields host-side and never reaches the engine, so there is nothing here that can park the
+        // UI thread.
+        val handleAtInstall = browserHandle
         onDispose {
-            runCatching { browserHandle?.clearPageEventScript() }
+            runCatching { handleAtInstall?.clearPageEventScript() }
         }
     }
 
@@ -3326,7 +3345,14 @@ internal fun FluckBrowserTabContent(
                         ),
                 ) {
                     BossPopup(
-                        onDismissRequest = { dismissedSuggestionId = generatorField.dismissId },
+                        onDismissRequest = {
+                            // Clearing the forced flag as well as recording the dismissal. Forced
+                            // deliberately bypasses the dismissal check, so recording it alone left
+                            // an outside click doing nothing at all and the card re-rendering - only
+                            // the X could close a card raised from the context menu.
+                            forceSuggestPassword = false
+                            dismissedSuggestionId = generatorField.dismissId
+                        },
                         focusable = false,
                         anchoring = BossPopupAnchoring.AnchorBounds,
                     ) {
@@ -3412,6 +3438,13 @@ internal fun FluckBrowserTabContent(
                             domain = domain,
                             username = saveUsernameDraft,
                             isUpdate = isUpdate,
+                            // Decided from the DECISION, once, not from the draft the field edits.
+                            // Deriving it from the draft made the editor disappear on the first
+                            // keystroke. The bar asks for a username exactly when the policy could
+                            // not supply one - a Save with nothing to fill in.
+                            usernameEditable =
+                                decision is CredentialSavePolicy.Decision.Save &&
+                                    decision.username.isBlank(),
                             onUsernameChange = { saveUsernameDraft = it },
                             onConfirm = {
                                 val pending = pendingSave
@@ -3458,6 +3491,23 @@ internal fun FluckBrowserTabContent(
                             },
                         )
                     }
+                }
+            }
+
+            // The 90-second bound has to keep applying AFTER the bar is up. The decision effect
+            // returns early once saveDecision is set, so the EXPIRED branch could no longer fire -
+            // and a user who signs in and ignores the bar kept a plaintext password resident for as
+            // long as the tab stayed on that page. Both KDoc and README claimed 90 seconds; this is
+            // what makes that true rather than "90 seconds, unless we asked you something".
+            saveDecision?.let { _ ->
+                LaunchedEffect(saveDecision) {
+                    val pending = pendingSave ?: return@LaunchedEffect
+                    val remaining =
+                        CredentialSavePolicy.PENDING_WINDOW_MS -
+                            (System.currentTimeMillis() - pending.capturedAtMs)
+                    if (remaining > 0) delay(remaining)
+                    saveDecision = null
+                    pendingSave = null
                 }
             }
 
@@ -5607,10 +5657,8 @@ private fun SecretListItem(
 }
 
 /**
- * Quick create secret dialog for browser integration.
- */
-/**
- * Create a secret, or correct the one just written by the password suggestor.
+ * Quick create secret dialog for browser integration: create a secret, or correct the one just
+ * written by the password suggestor.
  *
  * [existing] is what makes it the second thing. Without it, Edit on the "Saved for github.com"
  * confirmation would create a SECOND entry for the same account, which is worse than not offering

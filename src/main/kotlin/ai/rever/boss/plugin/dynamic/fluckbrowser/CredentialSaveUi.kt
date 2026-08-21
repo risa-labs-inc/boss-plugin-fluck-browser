@@ -191,6 +191,17 @@ internal fun SaveCredentialBar(
     domain: String,
     username: String,
     isUpdate: Boolean,
+    /**
+     * Whether to render [username] as an editor or as a label.
+     *
+     * A parameter rather than `username.isBlank()`, which is what this used to branch on and was a
+     * one-keystroke bug: `onUsernameChange` writes the value that comes straight back in as
+     * [username], so the first character made it non-blank, the label branch won, and the editor
+     * vanished - leaving the user holding a credential about to be saved under a one-letter
+     * username with no way to correct it. The decision has to be made ONCE, from the decision that
+     * raised the bar, not re-derived per recomposition from state the field itself mutates.
+     */
+    usernameEditable: Boolean,
     onUsernameChange: (String) -> Unit,
     onConfirm: () -> Unit,
     onNever: () -> Unit,
@@ -233,7 +244,7 @@ internal fun SaveCredentialBar(
                 }
             }
 
-            if (username.isBlank()) {
+            if (usernameEditable) {
                 // No identifier came back from the page. Asked for rather than guessed: see KDoc.
                 Row(
                     modifier = Modifier

@@ -1,6 +1,9 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.api.SecretEntryData
+import ai.rever.boss.plugin.api.SecretMetadataData
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -315,5 +318,44 @@ class CredentialSavePolicyTest {
                 "google.com",
             ),
         )
+    }
+
+    // ------------------------------------------------- the one unrecoverable refusal
+
+    private fun withMetadata(
+        twofaEnabled: Boolean,
+        twofaSecret: String?,
+    ) = secret("github.com", "dev@example.com", "pw").copy(
+        metadata =
+            SecretMetadataData(
+                twofaEnabled = twofaEnabled,
+                twofaType = if (twofaEnabled) "app" else null,
+                twofaSecret = twofaSecret,
+            ),
+    )
+
+    @Test
+    fun `a stranded TOTP seed refuses the update`() {
+        // The only irreversible thing in this feature. update_secret DELETES the whole
+        // secret_metadata row when twofaEnabled is false and has no parameter to send a seed back,
+        // so an update on a row holding a seed while 2FA reads as disabled destroys it. Refusing is
+        // the only safe answer, and this guard is the whole of that refusal.
+        assertTrue(refusesTotpUpdate(withMetadata(twofaEnabled = false, twofaSecret = "JBSWY3DPEHPK3PXP")))
+    }
+
+    @Test
+    fun `an enabled 2FA secret is safe to update, because the seed is preserved`() {
+        // Passing twofaEnabled = true takes the ON CONFLICT branch, which sets twofa_enabled,
+        // twofa_type and recovery_codes_encrypted and leaves twofa_secret alone. Refusing here
+        // would block every password change on an account with 2FA - which is most of the accounts
+        // worth protecting.
+        assertFalse(refusesTotpUpdate(withMetadata(twofaEnabled = true, twofaSecret = "JBSWY3DPEHPK3PXP")))
+    }
+
+    @Test
+    fun `no metadata row and no seed are both fine`() {
+        assertFalse(refusesTotpUpdate(secret("github.com", "dev@example.com", "pw")))
+        assertFalse(refusesTotpUpdate(withMetadata(twofaEnabled = false, twofaSecret = null)))
+        assertFalse(refusesTotpUpdate(withMetadata(twofaEnabled = false, twofaSecret = "")))
     }
 }
