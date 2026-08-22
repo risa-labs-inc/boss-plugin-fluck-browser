@@ -164,8 +164,7 @@ class FluckBrowserTabComponent(
     // preserved, the navigation/loading/title listeners attached on first
     // create would keep writing into the now-dead state objects the OLD
     // composition allocated, while the NEW composition saw stale defaults
-    // (e.g. error = "Initializing browser…", urlBarText = initialUrl) and
-    // never recovered.
+    // (e.g. isInitializing = true, urlBarText = initialUrl) and never recovered.
     //
     // Disposal happens on lifecycle.onDestroy (i.e. tab close), not on
     // transient composition exit.
@@ -625,6 +624,109 @@ private fun processUrlInput(input: String): String {
 internal const val HOME_TITLE = "Home"
 
 internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:blank"
+
+/** What the starting surface says for the first stretch of a boot. */
+internal const val INITIALIZING_MESSAGE = "Initializing browser..."
+
+/**
+ * What it says once the boot has outlasted [BROWSER_CREATION_TIMEOUT_MS] and is *still running*.
+ *
+ * A cold first-install boot spawns the whole Chromium process tree, and on a fresh Windows machine
+ * that can outlast the watchdog. That used to be reported as
+ * "Browser initialization timed out. The browser engine may not be available in this environment.",
+ * which described a failure that had not happened: the creation runs on the never-cancelled
+ * browserCreationScope, and the late-adoption nudge picks its result up whenever it lands. Saying
+ * so keeps the tab honest and keeps Retry / Reset Tab on screen for a boot that really is wedged.
+ */
+internal const val SLOW_BOOT_MESSAGE = "Still starting the browser engine - this is taking longer than usual."
+
+/** How long a single boot attempt may run before the tab starts saying it is slow. */
+internal const val BROWSER_CREATION_TIMEOUT_MS = 20_000L
+
+/**
+ * Which surface a browser tab shows, given the state it is in.
+ *
+ * Pure, and extracted for one reason: the ordering IS the bug that shipped. `error` was checked
+ * first and doubled as the "still starting" state, so a tab with a live, loading browser rendered
+ * a warning triangle over it - ahead of fullscreen, the dashboard and the browser view alike.
+ * [BrowserSurfaceTest] pins the two properties that were violated: a live handle is never
+ * [BrowserSurface.ERROR], and no handle with no error is never nothing at all.
+ */
+internal enum class BrowserSurface {
+    /** A real failure, with Retry / Reset Tab. */
+    ERROR,
+
+    /** The view lives in the host's fullscreen window; the tab shows a placeholder. */
+    FULLSCREEN,
+
+    /** No handle yet and nothing has failed: a spinner, with Retry / Reset Tab for a wedged boot. */
+    STARTING,
+
+    /** Home (blank / about:blank), rendered by the host's dashboard provider. */
+    DASHBOARD,
+
+    /** Web content. */
+    BROWSER,
+}
+
+internal fun browserSurfaceFor(
+    error: String?,
+    isInFullscreen: Boolean,
+    hasHandle: Boolean,
+    showDashboard: Boolean,
+    hasDashboardProvider: Boolean,
+): BrowserSurface =
+    when {
+        error != null -> BrowserSurface.ERROR
+        isInFullscreen -> BrowserSurface.FULLSCREEN
+        // Ahead of the dashboard deliberately: the dashboard's links navigate through the handle,
+        // so offering it before one exists would swallow the first click. It also covers the gap a
+        // hibernation wake opens - the old `when` had no branch for "no handle, no error" and
+        // rendered an empty pane until the replacement browser arrived.
+        !hasHandle -> BrowserSurface.STARTING
+        showDashboard && hasDashboardProvider -> BrowserSurface.DASHBOARD
+        else -> BrowserSurface.BROWSER
+    }
+
+/**
+ * The state a finished (or unfinished) creation attempt leaves behind.
+ *
+ * [initMessage] null means "leave whatever the starting surface already said".
+ */
+internal data class BootState(
+    val error: String?,
+    val initMessage: String?,
+    val isInitializing: Boolean,
+)
+
+/**
+ * Map a creation attempt's outcome onto tab state.
+ *
+ * @param adopted a handle came back and the tab took it.
+ * @param completed the creation finished (successfully or not) rather than still being in flight.
+ *
+ * The case worth naming is `adopted = false, completed = false`: the watchdog fired while the boot
+ * is still going. That is not a failure and must not set [BootState.error] - see [SLOW_BOOT_MESSAGE].
+ *
+ * Adoption resets [BootState.initMessage] rather than leaving it: the notices written on the way
+ * here ([SLOW_BOOT_MESSAGE], a crash recovery) are hoisted, so without the reset the *next* time
+ * this tab has no handle - a hibernation wake, say - its spinner would still be explaining a boot
+ * that finished long ago.
+ */
+internal fun bootStateFor(
+    adopted: Boolean,
+    completed: Boolean,
+): BootState =
+    when {
+        adopted -> BootState(error = null, initMessage = INITIALIZING_MESSAGE, isInitializing = false)
+        completed ->
+            BootState(
+                error = "Failed to create browser instance. The browser engine may not be available.",
+                initMessage = null,
+                isInitializing = false,
+            )
+        else -> BootState(error = null, initMessage = SLOW_BOOT_MESSAGE, isInitializing = true)
+    }
 
 /**
  * The dropdown state after forgetting [deletedUrl]: the remaining suggestions and where
@@ -1455,7 +1557,32 @@ internal class FluckBrowserTabState {
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
     var pageTitle: String by mutableStateOf("New Tab")
     var zoomLevel: Double by mutableStateOf(1.0)
-    var error: String? by mutableStateOf("Initializing browser...")
+
+    /**
+     * Set ONLY when this tab has actually failed, and null the rest of the time.
+     *
+     * It used to be seeded with "Initializing browser…" and cleared by exactly one thing: a
+     * page-load callback. So every new tab reported a failure for the whole gap between adopting
+     * its browser (which clears [isInitializing], turning the spinner into a warning triangle) and
+     * the first `NavigationFinished`. Usually the page then arrived and the screen went away by
+     * itself, which is what made it read as a flash rather than as a bug.
+     *
+     * Where it did not arrive, the tab was stuck: the host issues the initial `loadUrl` inside the
+     * handle's constructor, before `createBrowser` returns, so the loading listener attached here
+     * can be registered after that navigation has already finished - and `about:blank` may fire no
+     * navigation events at all. Nothing else ever cleared the field, and Retry could not (the init
+     * effect returns early while a handle is live), leaving Reset Tab as the only way out.
+     *
+     * "Still starting" now lives in [initMessage] instead, so a working browser can never be
+     * described as a broken one.
+     */
+    var error: String? by mutableStateOf(null)
+
+    /**
+     * What the starting surface says while there is no handle yet. Hoisted like the rest, so a tab
+     * switch mid-boot does not reset a slow-boot notice back to the first-second wording.
+     */
+    var initMessage: String by mutableStateOf(INITIALIZING_MESSAGE)
     var canGoBack: Boolean by mutableStateOf(false)
     var canGoForward: Boolean by mutableStateOf(false)
     var isBookmarked: Boolean by mutableStateOf(false)
@@ -1841,6 +1968,7 @@ internal fun FluckBrowserTabContent(
     var pageTitle by hoistedState::pageTitle
     var zoomLevel by hoistedState::zoomLevel
     var error by hoistedState::error
+    var initMessage by hoistedState::initMessage
     var canGoBack by hoistedState::canGoBack
     var canGoForward by hoistedState::canGoForward
     var isBookmarked by hoistedState::isBookmarked
@@ -2072,7 +2200,7 @@ internal fun FluckBrowserTabContent(
                         BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
                     )
                 }.also { hoistedState.browserCreation = it }
-            var handle = withTimeoutOrNull(20_000L) { creation.await() }
+            var handle = withTimeoutOrNull(BROWSER_CREATION_TIMEOUT_MS) { creation.await() }
             // Snapshot completion ONCE. The deferred completes on an IO thread, so
             // re-reading isCompleted later races the boot finishing right after the
             // watchdog fired: a stale read could clear the deferred while a live
@@ -2087,7 +2215,17 @@ internal fun FluckBrowserTabContent(
             if (completed) hoistedState.browserCreation = null
             if (handle != null) {
                 hoistedState.adoptBrowserHandle(handle)
-                isInitializing = false
+                bootStateFor(adopted = true, completed = completed).let {
+                    error = it.error
+                    it.initMessage?.let { message -> initMessage = message }
+                    isInitializing = it.isInitializing
+                }
+                // Seeded from the handle rather than waited for. The host issues the initial
+                // loadUrl inside the handle's constructor, so by the time the listener below is
+                // registered the navigation has already started and may already have finished -
+                // in which case no callback is coming and a listener-only reading of "is this tab
+                // loading" would stay wrong for the life of the tab. isLoading() answers now.
+                isLoading = handle.onBrowser("isLoading") { it.isLoading() } ?: false
 
                 // Register this tab+handle so the co-browse share server can enumerate
                 // and stream it. Re-registers under the same tabId on a recovery re-init.
@@ -2197,9 +2335,13 @@ internal fun FluckBrowserTabContent(
                 handle.addLoadingListener { loading ->
                     isLoading = loading
 
-                    // Page finished loading — browser is working, clear error/loading state
+                    // Page finished loading. Deliberately does NOT clear `error` any more: this
+                    // callback used to be the only thing that did, which made "is this tab
+                    // broken" depend on a page-load event that can precede the listener's own
+                    // registration (the initial loadUrl is issued in the handle's constructor) or
+                    // never arrive at all (about:blank fires no navigation events). Adoption owns
+                    // that now; a page load is not evidence about the browser's health.
                     if (!loading) {
-                        error = null
                         isInitializing = false
 
                         // Save history when page finishes loading (home has no history
@@ -2309,20 +2451,30 @@ internal fun FluckBrowserTabContent(
                 // late-completion recovery window, where completedBrowserOrNull
                 // maps the failure to null. The deferred was dropped above either
                 // way, so Retry starts fresh.)
-                error = "Failed to create browser instance. The browser engine may not be available."
-                isInitializing = false
+                bootStateFor(adopted = false, completed = true).let {
+                    error = it.error
+                    isInitializing = it.isInitializing
+                }
             } else {
-                // The 20s watchdog fired while the boot is still wedged in flight.
+                // The watchdog fired while the boot is still in flight.
                 // (withTimeoutOrNull returns null rather than throwing, so this is
                 // the timeout path — there is no TimeoutCancellationException to
                 // catch.) The in-flight deferred stays cached so a tab-switch
                 // re-entry keeps waiting on the same boot; an explicit Retry
                 // abandons it (see onRetry) and starts fresh.
-                println("[FluckBrowser] Browser creation timed out after 20s")
-                error = "Browser initialization timed out. The browser engine may not be available in this environment."
-                isInitializing = false
-                // If the wedged boot completes AFTER the error is shown while the
-                // tab just sits there, nudge the init effect to re-run: it awaits
+                //
+                // Reported as slow, NOT as failed: nothing has failed yet, and the nudge below
+                // adopts this very boot when it lands. A cold first-install engine boot is the
+                // ordinary way to get here, and calling that a failure is what made a first run
+                // look broken to the user watching it.
+                println("[FluckBrowser] Browser creation still running after ${BROWSER_CREATION_TIMEOUT_MS}ms")
+                bootStateFor(adopted = false, completed = false).let {
+                    error = it.error
+                    it.initMessage?.let { message -> initMessage = message }
+                    isInitializing = it.isInitializing
+                }
+                // If the slow boot completes while the tab just sits there showing the
+                // notice, nudge the init effect to re-run: it awaits
                 // the completed deferred instantly and adopts the browser in place.
                 // Without this, a late success idles unconsumed until Retry/close —
                 // and Retry would dispose it and boot a second renderer for
@@ -2388,7 +2540,11 @@ internal fun FluckBrowserTabContent(
                         hoistedState.releaseBrowserHandle()
                         disposeBrowserHandleOffThread(handle)
                         isInitializing = true
-                        error = "Browser crashed. Recovering..."
+                        // A recovery in progress belongs on the starting surface, not the error
+                        // one: the tab is about to rebuild its browser by itself, and the retry
+                        // below is what makes that true. `error` stays null so the rebuild can
+                        // render the page the moment it arrives.
+                        initMessage = "Browser crashed. Recovering..."
 
                         // Restore URL after small delay (home needs no restore)
                         delay(100)
@@ -2956,35 +3112,63 @@ internal fun FluckBrowserTabContent(
         // surface whose on-screen bounds track this composable; a fillMaxSize child can be
         // measured against the Column's full height and let that surface extend up over the
         // lightweight URL bar (the Windows overlap). Weighting bounds it to the area under the bar.
+        // Both status surfaces - a failure and a boot still running - offer the same two escapes,
+        // so the handlers are declared once here rather than duplicated into each branch.
+        val onRetryBoot: () -> Unit = {
+            // An explicit Retry abandons any cached creation - for a wedged
+            // boot, re-awaiting it would just time out forever. Its eventual
+            // result gets adopted and disposed, then a fresh boot starts.
+            hoistedState.browserCreation?.let { pending ->
+                hoistedState.browserCreation = null
+                abandonBrowserCreation(pending)
+            }
+            // Retry used to be a no-op whenever a handle was live, because the init effect opens
+            // with `if (browserHandle != null) return`. That was reachable - the old code could
+            // show an error over a working browser - and it left Reset Tab as the only way out.
+            // Dropping the handle here makes the button mean what it says in every state.
+            hoistedState.releaseBrowserHandle()?.let { disposeBrowserHandleOffThread(it) }
+            error = null
+            initMessage = INITIALIZING_MESSAGE
+            retryCount = 0
+            initNonce++
+            isInitializing = true
+        }
+        val onResetTab: () -> Unit = {
+            // Open current URL in a new tab, then close this one
+            val currentUrl = urlBarText.text.ifBlank { initialUrl }
+            onOpenInNewTab(currentUrl)
+            onCloseTab()
+        }
+
         Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
-            when {
-                error != null -> {
-                    BrowserErrorContent(
-                        error = error!!,
-                        isLoading = isInitializing,
-                        onRetry = {
-                            error = "Initializing browser..."
-                            // An explicit Retry abandons any cached creation — for a
-                            // wedged (timed-out) boot, re-awaiting it would just time
-                            // out forever. Its eventual result gets adopted and
-                            // disposed, then a fresh boot starts.
-                            hoistedState.browserCreation?.let { pending ->
-                                hoistedState.browserCreation = null
-                                abandonBrowserCreation(pending)
-                            }
-                            retryCount = 0
-                            initNonce++
-                            isInitializing = true
-                        },
-                        onResetTab = {
-                            // Open current URL in a new tab, then close this one
-                            val currentUrl = urlBarText.text.ifBlank { initialUrl }
-                            onOpenInNewTab(currentUrl)
-                            onCloseTab()
-                        }
+            when (
+                browserSurfaceFor(
+                    error = error,
+                    isInFullscreen = hoistedState.isInFullscreen,
+                    hasHandle = browserHandle != null,
+                    showDashboard = showDashboard,
+                    hasDashboardProvider = dashboardContentProvider != null,
+                )
+            ) {
+                BrowserSurface.ERROR -> {
+                    BrowserStatusContent(
+                        message = error ?: INITIALIZING_MESSAGE,
+                        isLoading = false,
+                        onRetry = onRetryBoot,
+                        onResetTab = onResetTab,
                     )
                 }
-                hoistedState.isInFullscreen -> {
+                BrowserSurface.STARTING -> {
+                    // A spinner, not a warning: nothing has gone wrong. Retry and Reset Tab stay
+                    // available for the boot that never lands.
+                    BrowserStatusContent(
+                        message = initMessage,
+                        isLoading = true,
+                        onRetry = onRetryBoot,
+                        onResetTab = onResetTab,
+                    )
+                }
+                BrowserSurface.FULLSCREEN -> {
                     // Fullscreen placeholder - browser is displayed in a separate fullscreen window
                     FullscreenPlaceholder(
                         phase = hoistedState.fullscreenExitPhase,
@@ -2992,9 +3176,11 @@ internal fun FluckBrowserTabContent(
                         onRestoreAnyway = { hoistedState.restoreTabFromFailedExit() },
                     )
                 }
-                showDashboard && dashboardContentProvider != null -> {
-                    // Show host's dashboard for about:blank pages
-                    dashboardContentProvider.DashboardContent(
+                BrowserSurface.DASHBOARD -> {
+                    // Show host's dashboard for about:blank pages. The safe call is how the
+                    // provider's presence - which browserSurfaceFor already required to pick this
+                    // branch - is expressed without a `!!` that would outlive that guarantee.
+                    dashboardContentProvider?.DashboardContent(
                         onNavigate = { url ->
                             coroutineScope.launch {
                                 browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
@@ -3002,7 +3188,7 @@ internal fun FluckBrowserTabContent(
                         }
                     )
                 }
-                browserHandle != null -> {
+                BrowserSurface.BROWSER -> {
                     // Resolve middle-click targets on press, before page-level auxclick
                     // handlers can rewrite hrefs to telemetry endpoints.
                     // Back/forward auxiliary buttons remain owned by the overlay as well.
@@ -5117,13 +5303,17 @@ internal fun BrowserToolbar(
 }
 
 /**
- * Error/loading content when browser fails to load or is initializing.
- * Shows message with Retry and Reset Tab buttons.
- * When isLoading=true, shows a spinner; otherwise shows a warning icon.
+ * The tab's status surface: a [message] with Retry and Reset Tab, over a spinner while
+ * [isLoading] and a warning icon otherwise.
+ *
+ * Named for the state rather than for the failure ([BrowserSurface.STARTING] uses it too). It was
+ * `BrowserErrorContent`, and the name was load-bearing in the wrong direction: because the only
+ * surface that existed was an error one, "still starting" was expressed by putting a message in
+ * the error field - which is exactly how a booting browser came to render a warning triangle.
  */
 @Composable
-internal fun BrowserErrorContent(
-    error: String,
+internal fun BrowserStatusContent(
+    message: String,
     isLoading: Boolean = false,
     onRetry: (() -> Unit)? = null,
     onResetTab: (() -> Unit)? = null
@@ -5154,7 +5344,7 @@ internal fun BrowserErrorContent(
             Spacer(modifier = Modifier.height(16.dp))
 
             Text(
-                text = error,
+                text = message,
                 fontSize = 14.sp,
                 color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f),
                 textAlign = TextAlign.Center
