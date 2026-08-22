@@ -164,7 +164,7 @@ class FluckBrowserTabComponent(
     // preserved, the navigation/loading/title listeners attached on first
     // create would keep writing into the now-dead state objects the OLD
     // composition allocated, while the NEW composition saw stale defaults
-    // (e.g. isInitializing = true, urlBarText = initialUrl) and never recovered.
+    // (e.g. error = a stale message, urlBarText = initialUrl) and never recovered.
     //
     // Disposal happens on lifecycle.onDestroy (i.e. tab close), not on
     // transient composition exit.
@@ -688,6 +688,31 @@ internal fun browserSurfaceFor(
         else -> BrowserSurface.BROWSER
     }
 
+/** What the status surface shows: the text, and whether it is a spinner or a warning. */
+internal data class BrowserStatus(
+    val message: String,
+    val isLoading: Boolean,
+)
+
+/**
+ * Resolve the status surface's content from the same two fields [browserSurfaceFor] reads.
+ *
+ * Together they are the whole of the separation this file needed: `error` non-null is a failure and
+ * shows a warning, `error` null is a boot still running and shows a spinner over [initMessage].
+ * Deriving the message here rather than per branch is what removes the last place the two could
+ * disagree - a `?:` in the error branch would have rendered "Initializing browser..." under a
+ * warning triangle, which is the confusion the whole change exists to remove.
+ */
+internal fun browserStatusFor(
+    error: String?,
+    initMessage: String,
+): BrowserStatus =
+    if (error != null) {
+        BrowserStatus(message = error, isLoading = false)
+    } else {
+        BrowserStatus(message = initMessage, isLoading = true)
+    }
+
 /**
  * The state a finished (or unfinished) creation attempt leaves behind.
  *
@@ -696,7 +721,6 @@ internal fun browserSurfaceFor(
 internal data class BootState(
     val error: String?,
     val initMessage: String?,
-    val isInitializing: Boolean,
 )
 
 /**
@@ -718,14 +742,13 @@ internal fun bootStateFor(
     completed: Boolean,
 ): BootState =
     when {
-        adopted -> BootState(error = null, initMessage = INITIALIZING_MESSAGE, isInitializing = false)
+        adopted -> BootState(error = null, initMessage = INITIALIZING_MESSAGE)
         completed ->
             BootState(
                 error = "Failed to create browser instance. The browser engine may not be available.",
                 initMessage = null,
-                isInitializing = false,
             )
-        else -> BootState(error = null, initMessage = SLOW_BOOT_MESSAGE, isInitializing = true)
+        else -> BootState(error = null, initMessage = SLOW_BOOT_MESSAGE)
     }
 
 /**
@@ -1552,7 +1575,6 @@ internal class FluckBrowserTabState {
     var lateAdoptNudged: Deferred<BrowserHandle?>? = null
     // Pending idle-hibernation timer (armed when the tab is backgrounded, cancelled if it returns).
     var hibernationJob: kotlinx.coroutines.Job? = null
-    var isInitializing: Boolean by mutableStateOf(true)
     var isLoading: Boolean by mutableStateOf(false)
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
     var pageTitle: String by mutableStateOf("New Tab")
@@ -1563,8 +1585,8 @@ internal class FluckBrowserTabState {
      *
      * It used to be seeded with "Initializing browser…" and cleared by exactly one thing: a
      * page-load callback. So every new tab reported a failure for the whole gap between adopting
-     * its browser (which clears [isInitializing], turning the spinner into a warning triangle) and
-     * the first `NavigationFinished`. Usually the page then arrived and the screen went away by
+     * its browser (which stopped the spinner, turning it into a warning triangle) and the first
+     * `NavigationFinished`. Usually the page then arrived and the screen went away by
      * itself, which is what made it read as a flash rather than as a bug.
      *
      * Where it did not arrive, the tab was stuck: the host issues the initial `loadUrl` inside the
@@ -1962,7 +1984,6 @@ internal fun FluckBrowserTabContent(
     // hoistedState.adoptBrowserHandle/releaseBrowserHandle so fullscreen
     // state can never outlive the handle that owns it.
     val browserHandle by hoistedState::browserHandle
-    var isInitializing by hoistedState::isInitializing
     var isLoading by hoistedState::isLoading
     var urlBarText by hoistedState::urlBarText
     var pageTitle by hoistedState::pageTitle
@@ -2218,14 +2239,7 @@ internal fun FluckBrowserTabContent(
                 bootStateFor(adopted = true, completed = completed).let {
                     error = it.error
                     it.initMessage?.let { message -> initMessage = message }
-                    isInitializing = it.isInitializing
                 }
-                // Seeded from the handle rather than waited for. The host issues the initial
-                // loadUrl inside the handle's constructor, so by the time the listener below is
-                // registered the navigation has already started and may already have finished -
-                // in which case no callback is coming and a listener-only reading of "is this tab
-                // loading" would stay wrong for the life of the tab. isLoading() answers now.
-                isLoading = handle.onBrowser("isLoading") { it.isLoading() } ?: false
 
                 // Register this tab+handle so the co-browse share server can enumerate
                 // and stream it. Re-registers under the same tabId on a recovery re-init.
@@ -2342,8 +2356,6 @@ internal fun FluckBrowserTabContent(
                     // never arrive at all (about:blank fires no navigation events). Adoption owns
                     // that now; a page load is not evidence about the browser's health.
                     if (!loading) {
-                        isInitializing = false
-
                         // Save history when page finishes loading (home has no history
                         // entry). Reads the committed URL for the same reason the title
                         // listener does: the URL bar holds what the user is typing, so
@@ -2359,6 +2371,20 @@ internal fun FluckBrowserTabContent(
                         }
                     }
                 }
+
+                // Seeded from the handle rather than waited for, and deliberately AFTER the
+                // listener above is registered. The host issues the initial loadUrl inside the
+                // handle's constructor, so that navigation may already have finished by the time
+                // this code runs, and then no callback is coming: a listener-only reading of "is
+                // this tab loading" would stay wrong for the life of the tab, leaving the toolbar
+                // showing Stop and the indicator spinning forever.
+                //
+                // The order is what makes both halves safe. Seeding first left the same race one
+                // field over - a load finishing between the read and the registration latched
+                // `true` with nothing left to clear it. With the listener already attached, a
+                // completion in that window fires it (false) and this read then sees the finished
+                // state (false); a completion after it fires the listener as usual.
+                isLoading = handle.onBrowser("isLoading") { it.isLoading() } ?: false
 
                 // Also update favicon when available
                 handle.addFaviconListener { faviconUrl ->
@@ -2451,10 +2477,7 @@ internal fun FluckBrowserTabContent(
                 // late-completion recovery window, where completedBrowserOrNull
                 // maps the failure to null. The deferred was dropped above either
                 // way, so Retry starts fresh.)
-                bootStateFor(adopted = false, completed = true).let {
-                    error = it.error
-                    isInitializing = it.isInitializing
-                }
+                error = bootStateFor(adopted = false, completed = true).error
             } else {
                 // The watchdog fired while the boot is still in flight.
                 // (withTimeoutOrNull returns null rather than throwing, so this is
@@ -2471,7 +2494,6 @@ internal fun FluckBrowserTabContent(
                 bootStateFor(adopted = false, completed = false).let {
                     error = it.error
                     it.initMessage?.let { message -> initMessage = message }
-                    isInitializing = it.isInitializing
                 }
                 // If the slow boot completes while the tab just sits there showing the
                 // notice, nudge the init effect to re-run: it awaits
@@ -2505,7 +2527,6 @@ internal fun FluckBrowserTabContent(
                 retryCount++
             } else {
                 error = e.message ?: "Unknown error"
-                isInitializing = false
             }
         }
     }
@@ -2539,7 +2560,6 @@ internal fun FluckBrowserTabContent(
                         // makes that structural rather than a line to remember here.
                         hoistedState.releaseBrowserHandle()
                         disposeBrowserHandleOffThread(handle)
-                        isInitializing = true
                         // A recovery in progress belongs on the starting surface, not the error
                         // one: the tab is about to rebuild its browser by itself, and the retry
                         // below is what makes that true. `error` stays null so the rebuild can
@@ -2559,7 +2579,6 @@ internal fun FluckBrowserTabContent(
                         error = "Browser recovery failed after $maxRecoveryAttempts attempts. Please close and reopen this tab."
                         hoistedState.releaseBrowserHandle()
                         disposeBrowserHandleOffThread(handle)
-                        isInitializing = false
                     }
                     break
                 }
@@ -2834,7 +2853,6 @@ internal fun FluckBrowserTabContent(
                     }
                     println("[FluckBrowser] Hibernating idle tab to release its renderer")
                     val handle = hoistedState.releaseBrowserHandle()
-                    isInitializing = true
                     // Off the UI thread so hibernating a background tab can't hitch
                     // the foreground UI.
                     if (handle != null) disposeBrowserHandleOffThread(handle)
@@ -3131,7 +3149,6 @@ internal fun FluckBrowserTabContent(
             initMessage = INITIALIZING_MESSAGE
             retryCount = 0
             initNonce++
-            isInitializing = true
         }
         val onResetTab: () -> Unit = {
             // Open current URL in a new tab, then close this one
@@ -3140,30 +3157,33 @@ internal fun FluckBrowserTabContent(
             onCloseTab()
         }
 
+        // Read once, so the ERROR branch below renders the value the surface was chosen from.
+        // `error` is a delegated var and will not smart-cast, and an elvis there would have
+        // rendered the *starting* message under a warning triangle - the exact confusion this
+        // whole change removes - on the one path where the two could disagree.
+        val currentError = error
+
         Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
             when (
                 browserSurfaceFor(
-                    error = error,
+                    error = currentError,
                     isInFullscreen = hoistedState.isInFullscreen,
                     hasHandle = browserHandle != null,
                     showDashboard = showDashboard,
                     hasDashboardProvider = dashboardContentProvider != null,
                 )
             ) {
-                BrowserSurface.ERROR -> {
+                BrowserSurface.ERROR, BrowserSurface.STARTING -> {
+                    // One composable, two meanings: a warning for a failure, a spinner for a boot
+                    // still running. Both keep Retry and Reset Tab, for the boot that never lands.
+                    //
+                    // Resolved from the same `error` the branch was chosen from, so there is no
+                    // path on which the surface and the message can disagree - and no fallback
+                    // that could put the *starting* message under a warning icon.
+                    val status = browserStatusFor(currentError, initMessage)
                     BrowserStatusContent(
-                        message = error ?: INITIALIZING_MESSAGE,
-                        isLoading = false,
-                        onRetry = onRetryBoot,
-                        onResetTab = onResetTab,
-                    )
-                }
-                BrowserSurface.STARTING -> {
-                    // A spinner, not a warning: nothing has gone wrong. Retry and Reset Tab stay
-                    // available for the boot that never lands.
-                    BrowserStatusContent(
-                        message = initMessage,
-                        isLoading = true,
+                        message = status.message,
+                        isLoading = status.isLoading,
                         onRetry = onRetryBoot,
                         onResetTab = onResetTab,
                     )

@@ -2,10 +2,8 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 /**
  * What a creation attempt is allowed to conclude about the tab.
@@ -25,7 +23,6 @@ class BootStateTest {
 
         assertNull(state.error, "a running boot must never be reported as an error")
         assertEquals(SLOW_BOOT_MESSAGE, state.initMessage)
-        assertTrue(state.isInitializing)
     }
 
     @Test
@@ -33,15 +30,11 @@ class BootStateTest {
         val state = bootStateFor(adopted = false, completed = true)
 
         assertNotNull(state.error)
-        assertFalse(state.isInitializing)
     }
 
     @Test
     fun `adoption clears the error rather than leaving it for a page load to clear`() {
-        val state = bootStateFor(adopted = true, completed = true)
-
-        assertNull(state.error)
-        assertFalse(state.isInitializing)
+        assertNull(bootStateFor(adopted = true, completed = true).error)
     }
 
     @Test
@@ -56,9 +49,6 @@ class BootStateTest {
     fun `adoption wins even when the deferred had not completed`() {
         // The late-adoption path: withTimeoutOrNull returned null, the snapshot said not
         // completed, and the boot finished between the two. A handle in hand outranks both.
-        val state = bootStateFor(adopted = true, completed = false)
-
-        assertNull(state.error)
-        assertFalse(state.isInitializing)
+        assertNull(bootStateFor(adopted = true, completed = false).error)
     }
 }

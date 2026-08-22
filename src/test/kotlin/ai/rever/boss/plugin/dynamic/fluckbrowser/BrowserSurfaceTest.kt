@@ -123,6 +123,36 @@ class BrowserSurfaceTest {
     }
 
     @Test
+    fun `a real failure with no handle is the error surface, not the starting one`() {
+        // The state immediately after createBrowser returns null. Both branches could claim it,
+        // and the failure has to win or the tab spins forever over a boot that already gave up.
+        assertEquals(
+            BrowserSurface.ERROR,
+            browserSurfaceFor(
+                error = "Failed to create browser instance. The browser engine may not be available.",
+                isInFullscreen = false,
+                hasHandle = false,
+                showDashboard = false,
+                hasDashboardProvider = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `the status surface says what the branch was chosen for`() {
+        // One composable serves ERROR and STARTING, and its content is derived from the same
+        // `error` that chose the branch - so a failure can never be drawn with the starting
+        // message, or a boot with a warning icon.
+        val failed = browserStatusFor(error = "Failed to create browser instance.", initMessage = INITIALIZING_MESSAGE)
+        assertEquals("Failed to create browser instance.", failed.message)
+        assertEquals(false, failed.isLoading)
+
+        val starting = browserStatusFor(error = null, initMessage = SLOW_BOOT_MESSAGE)
+        assertEquals(SLOW_BOOT_MESSAGE, starting.message)
+        assertEquals(true, starting.isLoading)
+    }
+
+    @Test
     fun `a fresh tab starts with nothing wrong`() {
         // The literal regression: this field used to hold a message from the moment the tab
         // existed, which is what put the warning triangle on screen.
