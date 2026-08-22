@@ -640,8 +640,32 @@ internal const val INITIALIZING_MESSAGE = "Initializing browser..."
  */
 internal const val SLOW_BOOT_MESSAGE = "Still starting the browser engine - this is taking longer than usual."
 
+/**
+ * What the starting surface says once a boot has outlasted [BROWSER_CREATION_GIVE_UP_MS].
+ *
+ * The counterpart to [SLOW_BOOT_MESSAGE], and the reason a slow boot is not simply waited on
+ * forever. "Taking longer than usual" is true of a cold first-install boot; it is not a useful
+ * thing to say to somebody whose install has no Chromium binaries at all, where the old
+ * "may not be available in this environment" wording was exactly right. A boot that has run this
+ * long is no longer plausibly slow, so the tab says so - while keeping the deferred cached and the
+ * late-adoption nudge armed, so a boot that does eventually land is still adopted in place.
+ */
+internal const val WEDGED_BOOT_MESSAGE =
+    "The browser engine is not responding. It may not be available in this environment."
+
+/** What the starting surface says while the tab rebuilds a browser that crashed. */
+internal const val RECOVERING_MESSAGE = "Browser crashed. Recovering..."
+
 /** How long a single boot attempt may run before the tab starts saying it is slow. */
 internal const val BROWSER_CREATION_TIMEOUT_MS = 20_000L
+
+/**
+ * How long it may run before the tab stops calling it slow and calls it broken.
+ *
+ * Generous on purpose: everything up to here is a boot that might still land, and the whole point
+ * of this change is not to accuse one of failing. Past it, a spinner is no longer informative.
+ */
+internal const val BROWSER_CREATION_GIVE_UP_MS = 120_000L
 
 /**
  * Which surface a browser tab shows, given the state it is in.
@@ -678,12 +702,19 @@ internal fun browserSurfaceFor(
 ): BrowserSurface =
     when {
         error != null -> BrowserSurface.ERROR
-        isInFullscreen -> BrowserSurface.FULLSCREEN
-        // Ahead of the dashboard deliberately: the dashboard's links navigate through the handle,
-        // so offering it before one exists would swallow the first click. It also covers the gap a
-        // hibernation wake opens - the old `when` had no branch for "no handle, no error" and
-        // rendered an empty pane until the replacement browser arrived.
+        // Ahead of BOTH the fullscreen placeholder and the dashboard, and for the same reason in
+        // each case: those surfaces act through a handle. The dashboard's links navigate through
+        // it, so offering them before one exists would swallow the first click; the fullscreen
+        // placeholder's only control asks the host to leave a fullscreen session that a handle
+        // must own. Fullscreen with no handle is unreachable today because releaseBrowserHandle
+        // clears the fullscreen state - but that is a fact about a different function, and
+        // depending on it here is what makes an "unreachable" state a bug later. A spinner that
+        // resolves into the page beats a placeholder whose button cannot do anything.
+        //
+        // It also covers the gap a hibernation wake opens: the old `when` had no branch for
+        // "no handle, no error" and rendered an empty pane until the replacement browser arrived.
         !hasHandle -> BrowserSurface.STARTING
+        isInFullscreen -> BrowserSurface.FULLSCREEN
         showDashboard && hasDashboardProvider -> BrowserSurface.DASHBOARD
         else -> BrowserSurface.BROWSER
     }
@@ -714,41 +745,53 @@ internal fun browserStatusFor(
     }
 
 /**
- * The state a finished (or unfinished) creation attempt leaves behind.
- *
- * [initMessage] null means "leave whatever the starting surface already said".
+ * The state a creation attempt leaves behind. Both fields are always set: a partial answer would
+ * mean the next reader has to know which of them this outcome participates in, and the version of
+ * this type that left [initMessage] nullable had one of its three call sites quietly ignore it.
  */
 internal data class BootState(
     val error: String?,
-    val initMessage: String?,
+    val initMessage: String,
 )
+
+/** What a creation attempt turned out to be. */
+internal enum class BootOutcome {
+    /** A handle came back and the tab took it. */
+    ADOPTED,
+
+    /** The creation finished without producing a browser. */
+    FAILED,
+
+    /** Past the first deadline and still running. Not a failure - see [SLOW_BOOT_MESSAGE]. */
+    SLOW,
+
+    /** Past the give-up deadline and still running - see [WEDGED_BOOT_MESSAGE]. */
+    WEDGED,
+}
 
 /**
  * Map a creation attempt's outcome onto tab state.
  *
- * @param adopted a handle came back and the tab took it.
- * @param completed the creation finished (successfully or not) rather than still being in flight.
+ * An enum rather than the pair of booleans this started as, because the interesting distinction is
+ * not "completed or not" but how long a not-completed boot has had. [BootOutcome.SLOW] must not set
+ * [BootState.error]; [BootOutcome.WEDGED] must, or an install with no engine at all shows a spinner
+ * forever and never says why.
  *
- * The case worth naming is `adopted = false, completed = false`: the watchdog fired while the boot
- * is still going. That is not a failure and must not set [BootState.error] - see [SLOW_BOOT_MESSAGE].
- *
- * Adoption resets [BootState.initMessage] rather than leaving it: the notices written on the way
- * here ([SLOW_BOOT_MESSAGE], a crash recovery) are hoisted, so without the reset the *next* time
- * this tab has no handle - a hibernation wake, say - its spinner would still be explaining a boot
- * that finished long ago.
+ * Every outcome except [BootOutcome.SLOW] resets [BootState.initMessage]: the notices written on
+ * the way here ([SLOW_BOOT_MESSAGE], [RECOVERING_MESSAGE]) are hoisted, so without the reset the
+ * *next* time this tab has no handle - a hibernation wake, say - its spinner would still be
+ * explaining a boot that finished long ago.
  */
-internal fun bootStateFor(
-    adopted: Boolean,
-    completed: Boolean,
-): BootState =
-    when {
-        adopted -> BootState(error = null, initMessage = INITIALIZING_MESSAGE)
-        completed ->
+internal fun bootStateFor(outcome: BootOutcome): BootState =
+    when (outcome) {
+        BootOutcome.ADOPTED -> BootState(error = null, initMessage = INITIALIZING_MESSAGE)
+        BootOutcome.FAILED ->
             BootState(
                 error = "Failed to create browser instance. The browser engine may not be available.",
-                initMessage = null,
+                initMessage = INITIALIZING_MESSAGE,
             )
-        else -> BootState(error = null, initMessage = SLOW_BOOT_MESSAGE)
+        BootOutcome.SLOW -> BootState(error = null, initMessage = SLOW_BOOT_MESSAGE)
+        BootOutcome.WEDGED -> BootState(error = WEDGED_BOOT_MESSAGE, initMessage = INITIALIZING_MESSAGE)
     }
 
 /**
@@ -1744,6 +1787,13 @@ internal class FluckBrowserTabState {
         }
         browserHandle = null
         clearFullscreenState()
+        // For the same reason fullscreen state is cleared here rather than at each call site:
+        // isLoading describes THIS handle's navigation, and the listener that would flip it goes
+        // with the handle. Left set, a tab hibernated or retried mid-load spends the whole next
+        // boot showing a Stop button and a running progress bar over a browser that no longer
+        // exists - the "the tab says it is doing something it isn't" family this file is being
+        // cleaned of. Adoption re-seeds it from the replacement.
+        isLoading = false
         return handle
     }
 
@@ -2222,6 +2272,29 @@ internal fun FluckBrowserTabContent(
                     )
                 }.also { hoistedState.browserCreation = it }
             var handle = withTimeoutOrNull(BROWSER_CREATION_TIMEOUT_MS) { creation.await() }
+            if (handle == null && !creation.isCompleted) {
+                // Past the first deadline and still running. Say so and keep waiting, rather than
+                // reporting a failure that has not happened: the creation runs on the
+                // never-cancelled browserCreationScope, and a cold first-install engine boot is
+                // the ordinary way to get here.
+                println("[FluckBrowser] Browser creation still running after ${BROWSER_CREATION_TIMEOUT_MS}ms")
+                bootStateFor(BootOutcome.SLOW).let {
+                    error = it.error
+                    initMessage = it.initMessage
+                }
+                // Armed before the second wait, not after it: this effect is cancelled by a tab
+                // switch, and the nudge is what brings a boot that landed while the tab was away
+                // back into a composition that can adopt it. One registration per deferred -
+                // lateAdoptNudged is hoisted, so it survives that switch.
+                if (hoistedState.lateAdoptNudged !== creation) {
+                    hoistedState.lateAdoptNudged = creation
+                    creation.invokeOnCompletion { hoistedState.initNonce++ }
+                }
+                handle =
+                    withTimeoutOrNull(BROWSER_CREATION_GIVE_UP_MS - BROWSER_CREATION_TIMEOUT_MS) {
+                        creation.await()
+                    }
+            }
             // Snapshot completion ONCE. The deferred completes on an IO thread, so
             // re-reading isCompleted later races the boot finishing right after the
             // watchdog fired: a stale read could clear the deferred while a live
@@ -2236,9 +2309,9 @@ internal fun FluckBrowserTabContent(
             if (completed) hoistedState.browserCreation = null
             if (handle != null) {
                 hoistedState.adoptBrowserHandle(handle)
-                bootStateFor(adopted = true, completed = completed).let {
+                bootStateFor(BootOutcome.ADOPTED).let {
                     error = it.error
-                    it.initMessage?.let { message -> initMessage = message }
+                    initMessage = it.initMessage
                 }
 
                 // Register this tab+handle so the co-browse share server can enumerate
@@ -2477,38 +2550,26 @@ internal fun FluckBrowserTabContent(
                 // late-completion recovery window, where completedBrowserOrNull
                 // maps the failure to null. The deferred was dropped above either
                 // way, so Retry starts fresh.)
-                error = bootStateFor(adopted = false, completed = true).error
-            } else {
-                // The watchdog fired while the boot is still in flight.
-                // (withTimeoutOrNull returns null rather than throwing, so this is
-                // the timeout path — there is no TimeoutCancellationException to
-                // catch.) The in-flight deferred stays cached so a tab-switch
-                // re-entry keeps waiting on the same boot; an explicit Retry
-                // abandons it (see onRetry) and starts fresh.
-                //
-                // Reported as slow, NOT as failed: nothing has failed yet, and the nudge below
-                // adopts this very boot when it lands. A cold first-install engine boot is the
-                // ordinary way to get here, and calling that a failure is what made a first run
-                // look broken to the user watching it.
-                println("[FluckBrowser] Browser creation still running after ${BROWSER_CREATION_TIMEOUT_MS}ms")
-                bootStateFor(adopted = false, completed = false).let {
+                bootStateFor(BootOutcome.FAILED).let {
                     error = it.error
-                    it.initMessage?.let { message -> initMessage = message }
+                    initMessage = it.initMessage
                 }
-                // If the slow boot completes while the tab just sits there showing the
-                // notice, nudge the init effect to re-run: it awaits
-                // the completed deferred instantly and adopts the browser in place.
-                // Without this, a late success idles unconsumed until Retry/close —
-                // and Retry would dispose it and boot a second renderer for
-                // nothing. Snapshot-state writes are thread-safe, so bumping the
-                // nonce from the completer's IO thread is fine; a stale bump
-                // (already-adopted, tab closed) hits the browserHandle != null
-                // early-return or a dead composition and is harmless. One nudge
-                // per deferred: initNonce is hoisted (survives tab switches), so
-                // repeated timeout passes don't need to re-register.
-                if (hoistedState.lateAdoptNudged !== creation) {
-                    hoistedState.lateAdoptNudged = creation
-                    creation.invokeOnCompletion { hoistedState.initNonce++ }
+            } else {
+                // Past the give-up deadline and STILL running. (withTimeoutOrNull returns null
+                // rather than throwing, so this is the timeout path - there is no
+                // TimeoutCancellationException to catch.) The in-flight deferred stays cached, so a
+                // tab-switch re-entry keeps waiting on the same boot and the nudge armed above
+                // still adopts it if it ever lands; an explicit Retry abandons it and starts fresh.
+                //
+                // Reported as broken rather than slow, which is the distinction the two deadlines
+                // exist for: everything up to here might still be a cold first-install boot, and
+                // calling that a failure is what made a first run look broken while it was working.
+                // Two minutes in, an install with no engine at all needs to be told so, and a
+                // spinner never says it.
+                println("[FluckBrowser] Browser creation still running after ${BROWSER_CREATION_GIVE_UP_MS}ms - reporting it")
+                bootStateFor(BootOutcome.WEDGED).let {
+                    error = it.error
+                    initMessage = it.initMessage
                 }
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -2564,7 +2625,7 @@ internal fun FluckBrowserTabContent(
                         // one: the tab is about to rebuild its browser by itself, and the retry
                         // below is what makes that true. `error` stays null so the rebuild can
                         // render the page the moment it arrives.
-                        initMessage = "Browser crashed. Recovering..."
+                        initMessage = RECOVERING_MESSAGE
 
                         // Restore URL after small delay (home needs no restore)
                         delay(100)
@@ -3138,6 +3199,10 @@ internal fun FluckBrowserTabContent(
             // result gets adopted and disposed, then a fresh boot starts.
             hoistedState.browserCreation?.let { pending ->
                 hoistedState.browserCreation = null
+                // The nudge goes with the deferred it was registered on. Left pointing at an
+                // abandoned boot, its invokeOnCompletion still fires and bumps initNonce, which
+                // restarts the FRESH boot's effect and silently resets its deadline once.
+                hoistedState.lateAdoptNudged = null
                 abandonBrowserCreation(pending)
             }
             // Retry used to be a no-op whenever a handle was live, because the init effect opens

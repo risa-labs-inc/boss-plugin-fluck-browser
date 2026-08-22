@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 
 /**
@@ -109,6 +110,45 @@ class BrowserSurfaceTest {
     }
 
     @Test
+    fun `fullscreen needs a handle, because its only control acts through one`() {
+        // Unreachable today only because releaseBrowserHandle clears the fullscreen state - a fact
+        // about a different function, and depending on it here is how an "unreachable" state
+        // becomes a bug later. The placeholder's exit button asks the host to leave a session a
+        // handle must own, so with no handle a spinner that resolves is the better answer.
+        assertEquals(
+            BrowserSurface.STARTING,
+            browserSurfaceFor(
+                error = null,
+                isInFullscreen = true,
+                hasHandle = false,
+                showDashboard = false,
+                hasDashboardProvider = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `a crash recovery in progress is a spinner, not a warning`() {
+        // Recovery rebuilds the browser by itself, so it belongs on the starting surface - the tab
+        // is busy, not broken, and `error` staying null is what lets the rebuilt page appear the
+        // moment it arrives.
+        val recovering = browserStatusFor(error = null, initMessage = RECOVERING_MESSAGE)
+
+        assertEquals(RECOVERING_MESSAGE, recovering.message)
+        assertEquals(true, recovering.isLoading)
+        assertEquals(
+            BrowserSurface.STARTING,
+            browserSurfaceFor(
+                error = null,
+                isInFullscreen = false,
+                hasHandle = false,
+                showDashboard = false,
+                hasDashboardProvider = true,
+            ),
+        )
+    }
+
+    @Test
     fun `fullscreen outranks the browser and the dashboard`() {
         assertEquals(
             BrowserSurface.FULLSCREEN,
@@ -150,6 +190,19 @@ class BrowserSurfaceTest {
         val starting = browserStatusFor(error = null, initMessage = SLOW_BOOT_MESSAGE)
         assertEquals(SLOW_BOOT_MESSAGE, starting.message)
         assertEquals(true, starting.isLoading)
+    }
+
+    @Test
+    fun `releasing the handle also drops the load it was describing`() {
+        // isLoading describes THAT handle's navigation, and the listener that would flip it goes
+        // with the handle. Left set, a tab hibernated or retried mid-load spends the whole next
+        // boot showing a Stop button and a running progress bar over a browser that no longer
+        // exists. Same argument as the fullscreen state this function already clears.
+        val state = FluckBrowserTabState().apply { isLoading = true }
+
+        state.releaseBrowserHandle()
+
+        assertFalse(state.isLoading, "a load cannot still be running on a handle the tab let go of")
     }
 
     @Test
