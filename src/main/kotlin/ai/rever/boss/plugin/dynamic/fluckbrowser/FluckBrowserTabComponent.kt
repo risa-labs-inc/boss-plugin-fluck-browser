@@ -3262,16 +3262,35 @@ internal fun FluckBrowserTabContent(
                     )
                 }
                 BrowserSurface.DASHBOARD -> {
-                    // Show host's dashboard for about:blank pages. The safe call is how the
-                    // provider's presence - which browserSurfaceFor already required to pick this
-                    // branch - is expressed without a `!!` that would outlive that guarantee.
-                    dashboardContentProvider?.DashboardContent(
-                        onNavigate = { url ->
-                            coroutineScope.launch {
-                                browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
+                    // Home is the one surface with no page behind it, so the host's in-page swipe
+                    // detector cannot reach it - and it is the surface a back swipe lands you on,
+                    // which made "swipe back home, then cannot swipe forward again" the gesture's
+                    // most obvious hole. With no native surface in the way Compose sees the scroll
+                    // here, so home detects it itself. See HomeSwipeSurface.
+                    HomeSwipeSurface(
+                        canGoBack = canGoBack,
+                        canGoForward = canGoForward,
+                        onNavigate = { direction ->
+                            when (direction) {
+                                HomeSwipeDirection.BACK ->
+                                    browserHandle.onBrowser("goBack") { it.goBack() }
+                                HomeSwipeDirection.FORWARD ->
+                                    browserHandle.onBrowser("goForward") { it.goForward() }
                             }
-                        }
-                    )
+                        },
+                    ) {
+                        // Show host's dashboard for about:blank pages. The safe call is how the
+                        // provider's presence - which browserSurfaceFor already required to pick
+                        // this branch - is expressed without a `!!` that would outlive that
+                        // guarantee.
+                        dashboardContentProvider?.DashboardContent(
+                            onNavigate = { url ->
+                                coroutineScope.launch {
+                                    browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
+                                }
+                            }
+                        )
+                    }
                 }
                 BrowserSurface.BROWSER -> {
                     // Resolve middle-click targets on press, before page-level auxclick
