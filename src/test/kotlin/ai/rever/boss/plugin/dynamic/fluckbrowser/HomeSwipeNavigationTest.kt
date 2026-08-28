@@ -23,14 +23,23 @@ class HomeSwipeNavigationTest {
         val atMs: Long = 0,
     )
 
+    /** What a folded stream produced: every navigation, the last step, and the one that fired. */
+    private data class Run(
+        val navigated: List<HomeSwipeDirection>,
+        val last: HomeSwipeStep,
+        /** The step that navigated. Not the last one - the affordance clears on the next event. */
+        val committing: HomeSwipeStep?,
+    )
+
     /** Fold a stream and report every navigation it produced, plus where it ended up. */
     private fun run(
         events: List<Wheel>,
         canGoBack: Boolean = true,
         canGoForward: Boolean = true,
-    ): Pair<List<HomeSwipeDirection>, HomeSwipeStep> {
+    ): Run {
         var gesture = HomeSwipeGesture()
         val navigated = mutableListOf<HomeSwipeDirection>()
+        var committing: HomeSwipeStep? = null
         var last = HomeSwipeStep(gesture)
         events.forEachIndexed { index, event ->
             last =
@@ -46,18 +55,31 @@ class HomeSwipeNavigationTest {
                     canGoForward = canGoForward,
                 )
             gesture = last.gesture
-            last.navigate?.let { navigated += it }
+            last.navigate?.let {
+                navigated += it
+                committing = last
+            }
         }
-        return navigated to last
+        return Run(navigated, last, committing)
     }
+
+    /**
+     * One event's worth of travel, as a fraction of the commit distance rather than a number.
+     *
+     * Every case below counts events, so nine of them is exactly one commit whatever
+     * [COMMIT_UNITS] is set to. Written as literals once, tuning the gesture silently turned
+     * "abandoned short of the threshold" into a swipe that commits, and the suite would have gone
+     * red for a reason that had nothing to do with the behaviour it was describing.
+     */
+    private val step = COMMIT_UNITS / 9f
 
     private fun swipe(
         count: Int,
-        dx: Float,
-        dy: Float = 0f,
+        steps: Float,
+        dySteps: Float = 0f,
         consumed: Boolean = false,
         startMs: Long = 1_000L,
-    ) = (0 until count).map { Wheel(dx, dy, consumed, startMs + it) }
+    ) = (0 until count).map { Wheel(steps * step, dySteps * step, consumed, startMs + it) }
 
     // --- gestures that navigate ---------------------------------------------------------------
 
@@ -135,13 +157,13 @@ class HomeSwipeNavigationTest {
 
     @Test
     fun `a diagonal drag`() {
-        val (navigated, _) = run(swipe(12, -1f, dy = -4f))
+        val (navigated, _) = run(swipe(12, -1f, dySteps = -4f))
         assertTrue(navigated.isEmpty())
     }
 
     @Test
     fun `a vertical scroll that curls into a horizontal one`() {
-        val vertical = swipe(5, 0f, dy = -5f, startMs = 1_000L)
+        val vertical = swipe(5, 0f, dySteps = -5f, startMs = 1_000L)
         val (navigated, _) = run(vertical + swipe(12, -1f, startMs = 1_005L))
         assertTrue(navigated.isEmpty())
     }
@@ -181,11 +203,11 @@ class HomeSwipeNavigationTest {
 
     @Test
     fun `progress ramps to one at the commit`() {
-        val (_, half) = run(swipe(5, -1f))
+        val half = run(swipe(5, -1f)).last
         assertTrue(half.progress in 0.4f..0.7f, "half way was ${half.progress}")
-        val (navigated, committing) = run(swipe(9, -1f))
-        assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
-        assertEquals(1f, committing.progress, "the committing step draws the puck filled in")
+        val full = run(swipe(10, -1f))
+        assertEquals(listOf(HomeSwipeDirection.BACK), full.navigated)
+        assertEquals(1f, full.committing?.progress, "the committing step draws the puck filled in")
     }
 
     /**

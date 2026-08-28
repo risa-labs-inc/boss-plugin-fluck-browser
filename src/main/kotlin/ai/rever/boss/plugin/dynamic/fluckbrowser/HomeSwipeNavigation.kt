@@ -31,12 +31,18 @@ internal enum class HomeSwipeDirection { BACK, FORWARD }
 /**
  * Travel that commits, in Compose wheel-rotation units.
  *
- * See the class note on units: this is 90 page-pixels, the page detector's threshold, converted
- * at the 1:10 ratio AppKit applies to the legacy delta. It is the one number here derived rather
- * than measured, so it is the first thing to adjust if the gesture feels long or short on real
- * hardware.
+ * **Tuned on hardware, not derived.** It started at 9.0f, being the page detector's 90 pixels
+ * converted at the 1:10 ratio AppKit is said to apply to the legacy delta, and on a real trackpad
+ * that was much too long a swipe. The lesson is in the class note: the conversion between what a
+ * DOM `wheel` event reports and what AWT hands Compose is not a clean ratio worth reasoning from,
+ * because Chromium scales its own deltas on the way to the page. So this number answers to how the
+ * gesture feels next to the same one on an ordinary page, and nothing else.
+ *
+ * Erring short is deliberate. A gesture that fires a little early is a visible, recoverable
+ * mistake; one that fires late reads as the feature not working at all, which is what this
+ * whole change exists to stop.
  */
-internal const val COMMIT_UNITS = 9.0f
+internal const val COMMIT_UNITS = 3.5f
 
 /** No scroll event for this long ends the gesture. Matches the page detector. */
 internal const val GESTURE_GAP_MS = 120L
@@ -58,10 +64,14 @@ internal const val VERTICAL_RATIO = 0.5f
  * Floor for the ratio test, in the same units.
  *
  * Measured against a floor rather than against the horizontal total alone, because the first few
- * events of an honest swipe carry a fraction of a unit and any vertical noise at all would
- * exceed a bare ratio of that.
+ * events of an honest swipe carry a fraction of a unit and any vertical noise at all would exceed
+ * a bare ratio of that.
+ *
+ * A fraction of [COMMIT_UNITS] rather than a number of its own, so tuning the commit distance
+ * cannot silently change how tolerant the gesture is of vertical drift. Held flat once, it turned
+ * a shortened commit distance into a floor worth more than half the gesture.
  */
-internal const val VERTICAL_FLOOR = 2.4f
+internal const val VERTICAL_FLOOR = COMMIT_UNITS * 0.27f
 
 /** One gesture in progress. Immutable; [advanceHomeSwipe] returns the next one. */
 internal data class HomeSwipeGesture(
