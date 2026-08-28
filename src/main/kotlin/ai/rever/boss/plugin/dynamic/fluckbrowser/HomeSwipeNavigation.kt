@@ -28,43 +28,37 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  */
 internal enum class HomeSwipeDirection { BACK, FORWARD }
 
-/** What the gesture does and how it looks, mirroring the host's own three-way setting. */
-internal enum class HomeSwipeStyle { OFF, CHEVRON, SLIDE }
-
 /**
- * The key the host publishes the swipe style on.
+ * The key the host publishes the gesture's on/off state on.
  *
  * A system property is the only channel the two halves of this gesture share. Home is drawn by
  * this plugin and web pages by the host, in different repos; `PluginContext.settingsProvider` only
  * opens the Settings window and reads nothing, so there is no api route for a value. The host runs
- * this plugin in its own process and republishes the property whenever the setting changes, which
- * is why this is read per gesture rather than cached - the user must not have to relaunch.
- *
- * If the host predates the setting, nothing publishes the key and [homeSwipeStyle] falls back to
- * the chevron, which is what that host's own pages do.
+ * this plugin in its own process and republishes the key whenever the setting changes, which is
+ * why it is read per gesture rather than cached - the user must not have to relaunch.
  */
-internal const val SWIPE_STYLE_KEY = "BOSS_BROWSER_SWIPE_NAV"
+internal const val SWIPE_ENABLED_KEY = "BOSS_BROWSER_SWIPE_NAV"
 
 /**
- * Read the style the host published.
+ * Whether the gesture is on, according to the host.
  *
  * The environment is consulted first for the same reason the host does it: an exported variable
  * outranks a setting everywhere else in this app, and someone debugging one session by exporting
  * it should not find home disagreeing with every page.
  *
- * Accepts the legacy boolean spellings the key shipped with, and treats anything unrecognised as
- * "no opinion" rather than as off - a typo must not silently remove the gesture.
+ * A host older than the setting publishes nothing, and the fallback is ON: that is what such a
+ * host's own pages do, and defaulting to off would silently remove a gesture. Anything
+ * unrecognised is "no opinion" for the same reason.
  */
-internal fun homeSwipeStyle(
-    env: String? = System.getenv(SWIPE_STYLE_KEY),
-    property: String? = System.getProperty(SWIPE_STYLE_KEY),
-): HomeSwipeStyle = parseHomeSwipeStyle(env) ?: parseHomeSwipeStyle(property) ?: HomeSwipeStyle.CHEVRON
+internal fun homeSwipeEnabled(
+    env: String? = System.getenv(SWIPE_ENABLED_KEY),
+    property: String? = System.getProperty(SWIPE_ENABLED_KEY),
+): Boolean = parseHomeSwipeEnabled(env) ?: parseHomeSwipeEnabled(property) ?: true
 
-internal fun parseHomeSwipeStyle(raw: String?): HomeSwipeStyle? =
+internal fun parseHomeSwipeEnabled(raw: String?): Boolean? =
     when (raw?.trim()?.lowercase()) {
-        "off", "false", "0", "no" -> HomeSwipeStyle.OFF
-        "chevron", "true", "1", "yes", "on" -> HomeSwipeStyle.CHEVRON
-        "slide" -> HomeSwipeStyle.SLIDE
+        "off", "false", "0", "no" -> false
+        "on", "true", "1", "yes", "chevron" -> true
         else -> null
     }
 

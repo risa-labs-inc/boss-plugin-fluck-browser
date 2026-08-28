@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -209,13 +210,12 @@ class HomeSwipeNavigationTest {
         assertEquals(listOf(HomeSwipeDirection.FORWARD), navigated)
     }
 
-    // --- the style the host publishes ----------------------------------------------------------
+    // --- the switch the host publishes ----------------------------------------------------------
 
     @Test
-    fun `the style comes from the property the host publishes`() {
-        assertEquals(HomeSwipeStyle.SLIDE, homeSwipeStyle(env = null, property = "slide"))
-        assertEquals(HomeSwipeStyle.OFF, homeSwipeStyle(env = null, property = "off"))
-        assertEquals(HomeSwipeStyle.CHEVRON, homeSwipeStyle(env = null, property = "chevron"))
+    fun `the gesture follows the key the host publishes`() {
+        assertTrue(homeSwipeEnabled(env = null, property = "true"))
+        assertFalse(homeSwipeEnabled(env = null, property = "false"))
     }
 
     /**
@@ -224,24 +224,17 @@ class HomeSwipeNavigationTest {
      */
     @Test
     fun `the environment wins over the property`() {
-        assertEquals(HomeSwipeStyle.OFF, homeSwipeStyle(env = "off", property = "slide"))
+        assertFalse(homeSwipeEnabled(env = "off", property = "true"))
     }
 
     /**
-     * A host older than the setting publishes nothing. Falling back to the chevron matches what
-     * that host's own pages do; falling back to off would silently remove the gesture.
+     * A host older than the setting publishes nothing. Defaulting to on matches what that host's
+     * own pages do; defaulting to off would silently remove the gesture.
      */
     @Test
-    fun `an unset key is the chevron, not off`() {
-        assertEquals(HomeSwipeStyle.CHEVRON, homeSwipeStyle(env = null, property = null))
-        assertEquals(HomeSwipeStyle.CHEVRON, homeSwipeStyle(env = null, property = "nonsense"))
-    }
-
-    /** The key shipped as a boolean before it grew a third state; someone has that exported. */
-    @Test
-    fun `legacy boolean spellings still parse`() {
-        assertEquals(HomeSwipeStyle.OFF, parseHomeSwipeStyle("false"))
-        assertEquals(HomeSwipeStyle.CHEVRON, parseHomeSwipeStyle("true"))
+    fun `an unset key leaves it on`() {
+        assertTrue(homeSwipeEnabled(env = null, property = null))
+        assertTrue(homeSwipeEnabled(env = null, property = "nonsense"))
     }
 
     /**
@@ -250,7 +243,7 @@ class HomeSwipeNavigationTest {
      */
     @Test
     fun `the key matches the one the host publishes`() {
-        assertEquals("BOSS_BROWSER_SWIPE_NAV", SWIPE_STYLE_KEY)
+        assertEquals("BOSS_BROWSER_SWIPE_NAV", SWIPE_ENABLED_KEY)
     }
 
     // --- the affordance -----------------------------------------------------------------------

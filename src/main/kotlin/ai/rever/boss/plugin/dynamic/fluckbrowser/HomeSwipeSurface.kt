@@ -1,10 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.ui.BossThemeColors
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -64,37 +61,6 @@ internal fun HomeSwipeSurface(
     var progress by remember { mutableStateOf(0f) }
     // Bumped on every scroll event so the clear below re-arms rather than accumulating.
     var lastEventTick by remember { mutableStateOf(0L) }
-    // The slide, when that style is chosen. It FOLLOWS THE FINGER while the gesture is live, so
-    // there is no animation here until the gesture ends - an animation chasing a live value is
-    // what makes a tracked gesture feel like rubber.
-    var slideDirection by remember { mutableStateOf<HomeSwipeDirection?>(null) }
-    var slideTracked by remember { mutableStateOf(0f) }
-    var slideSettlingTo by remember { mutableStateOf<Float?>(null) }
-    val settle = remember { Animatable(0f) }
-
-    LaunchedEffect(slideSettlingTo) {
-        val target = slideSettlingTo ?: return@LaunchedEffect
-        val direction = slideDirection
-        settle.snapTo(slideTracked)
-        // Proportional to the distance left, so letting go just short of the commit point does not
-        // take as long as letting go at the very start, which reads as sticky.
-        val remaining = kotlin.math.abs(target - slideTracked).coerceAtLeast(0.05f)
-        settle.animateTo(target, tween((HOME_SLIDE_MS * remaining).toInt().coerceAtLeast(60), easing = FastOutSlowInEasing))
-        if (target >= 1f && direction != null) onNavigate(direction)
-        slideDirection = null
-        slideTracked = 0f
-        slideSettlingTo = null
-        settle.snapTo(0f)
-    }
-
-    // The end-of-gesture timer also has to release an abandoned slide, or home stays pushed off to
-    // one side with no way back until the next scroll.
-    LaunchedEffect(lastEventTick) {
-        if (slideDirection != null && slideSettlingTo == null) {
-            delay(GESTURE_GAP_MS + 60)
-            if (slideDirection != null && slideSettlingTo == null) slideSettlingTo = 0f
-        }
-    }
 
     // The affordance's own end-of-gesture timer. The gap check inside advanceHomeSwipe cannot do
     // this alone: it only runs when a NEXT event arrives, so a swipe abandoned halfway would park
@@ -126,28 +92,12 @@ internal fun HomeSwipeSurface(
                         )
                     gesture = step.gesture
                     lastEventTick++
-                    // Read per gesture, not cached: the host republishes the property the moment
-                    // the setting changes, and a relaunch to pick that up would be a poor answer.
-                    val style = homeSwipeStyle()
-                    // The chevron is this style's affordance; the slide is its own.
-                    shown = step.direction.takeIf { style == HomeSwipeStyle.CHEVRON }
+                    // Read per gesture, not cached: the host republishes the key the moment the
+                    // setting changes, and a relaunch to pick that up would be a poor answer.
+                    val enabled = homeSwipeEnabled()
+                    shown = step.direction.takeIf { enabled }
                     progress = step.progress
-                    if (style == HomeSwipeStyle.SLIDE && slideSettlingTo == null) {
-                        slideDirection = step.direction
-                        slideTracked = step.progress
-                    }
-                    step.navigate?.let { direction ->
-                        when (style) {
-                            HomeSwipeStyle.OFF -> Unit
-                            HomeSwipeStyle.CHEVRON -> onNavigate(direction)
-                            // Already on screen and under the finger; it only has to run out.
-                            HomeSwipeStyle.SLIDE ->
-                                if (slideSettlingTo == null) {
-                                    slideDirection = direction
-                                    slideSettlingTo = 1f
-                                }
-                        }
-                    }
+                    if (enabled) step.navigate?.let(onNavigate)
                 }
                 // A pointer that leaves the surface ends the gesture outright. Compose does report
                 // this one, unlike the page detector's world, so it does not have to be inferred
@@ -156,30 +106,12 @@ internal fun HomeSwipeSurface(
                     gesture = HomeSwipeGesture()
                     shown = null
                     progress = 0f
-                    if (slideDirection != null && slideSettlingTo == null) slideSettlingTo = 0f
                 },
     ) {
-        Box(
-            modifier =
-                Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        // Home slides the way the finger went; the page it reveals is drawn by
-                        // the host once the navigation lands, so there is nothing to parallax
-                        // behind it here.
-                        val sign = if (slideDirection == HomeSwipeDirection.BACK) 1f else -1f
-                        val position = if (slideSettlingTo != null) settle.value else slideTracked
-                        translationX = sign * size.width * position
-                    },
-        ) {
-            content()
-        }
+        content()
         shown?.let { direction -> HomeSwipeAffordance(direction, progress) }
     }
 }
-
-/** Matches the host's own slide, so the two surfaces do not animate at visibly different speeds. */
-private const val HOME_SLIDE_MS = 220
 
 /**
  * The puck: a chevron that slides in from the edge it would navigate toward and firms up as the
