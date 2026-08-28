@@ -157,20 +157,56 @@ class HomeSwipeNavigationTest {
     }
 
     /**
-     * The case the suite was missing, and the one that broke on real hardware.
+     * The case the suite was missing, and the one that broke on real hardware: nothing pinned what
+     * must still be ACCEPTED, only what must be refused.
      *
-     * Every other drift case here asks what must be REJECTED, so nothing pinned what must still be
-     * accepted - and shortening the commit distance silently cut the drift allowed at the start of
-     * a gesture below the noise of putting two fingers down. Both halves matter: a first event that
-     * is mostly vertical (finger placement, not direction) and honest drift for the rest of it.
+     * Vertical at 60% of horizontal is an ordinary slightly-sloped swipe. The half-of-horizontal
+     * rule that used to be here refused it; Chrome takes it, and so does this now - its rule 2
+     * accepts until vertical reaches about 0.77 of horizontal.
      */
     @Test
-    fun `an honest swipe that starts noisy still commits`() {
-        // A first event that is mostly vertical, then an honest swipe with a tenth of drift.
-        val placement = listOf(Wheel(-0.2f * step, 1.5f * step, false, 1_000L))
-        val rest = swipe(12, -1f, dySteps = 0.1f, startMs = 1_001L)
-        val (navigated, _) = run(placement + rest)
+    fun `an honest swipe with slope still commits`() {
+        val (navigated, _) = run(swipe(14, -1f, dySteps = 0.6f))
         assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
+    }
+
+    /**
+     * Chrome's rule 1, and correct rather than a regression: if the first thing your fingers do is
+     * move vertically, you are scrolling. Chrome refuses this too - its `_gestureTotalY`
+     * accumulates from the moment the fingers land, placement wobble included.
+     */
+    @Test
+    fun `a gesture that starts vertically is refused`() {
+        val opening = listOf(Wheel(-0.2f * step, 1.5f * step, false, 1_000L))
+        val (navigated, _) = run(opening + swipe(12, -1f, startMs = 1_001L))
+        assertTrue(navigated.isEmpty())
+    }
+
+    /**
+     * The case only Chrome's rule 1 catches.
+     *
+     * Rule 2 needs vertical past an absolute floor before it will refuse anything, so the very
+     * first flick of a gesture - too small to reach that floor but already going the wrong way -
+     * is rule 1's alone. Without it, a gesture that opens vertically and then straightens out is
+     * taken, which is a scroll being read as a swipe.
+     */
+    @Test
+    fun `a tiny opening flick the wrong way is refused`() {
+        val flick = listOf(Wheel(-0.01f * step, 0.05f * step, false, 1_000L))
+        val (navigated, _) = run(flick + swipe(14, -1f, startMs = 1_001L))
+        assertTrue(navigated.isEmpty())
+    }
+
+    /**
+     * The path-length asymmetry, and the point of measuring vertical the way Chrome does. This
+     * wobble nets out to about zero, so a rule reading the NET vertical total would take it; as a
+     * path length it accumulates and rule 2 refuses it.
+     */
+    @Test
+    fun `vertical wobble that nets to zero is still refused`() {
+        val events = (0 until 20).map { Wheel(-1f * step, (if (it % 2 == 0) 0.8f else -0.8f) * step, false, 1_000L + it) }
+        val (navigated, _) = run(events)
+        assertTrue(navigated.isEmpty())
     }
 
     @Test

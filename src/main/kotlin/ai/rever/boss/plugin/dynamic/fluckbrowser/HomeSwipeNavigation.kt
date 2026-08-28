@@ -91,31 +91,41 @@ internal const val GESTURE_GAP_MS = 120L
  */
 internal const val MIN_EVENTS = 3
 
-/** Vertical travel this large relative to horizontal means scrolling, not swiping. */
-internal const val VERTICAL_RATIO = 0.5f
-
 /**
- * Floor for the ratio test, in the same units.
+ * Chrome's own cancellation rules, ported from `history_swiper.mm`
+ * (`shouldCancelHorizontalSwipeWithCurrentPoint`). Three tiers rather than one ratio:
  *
- * Measured against a floor rather than against the horizontal total alone, because the first
- * events of a real swipe are finger placement rather than direction: they routinely carry more
- * vertical than horizontal, and a bare ratio rejects honest swipes before they start.
+ * ```
+ * if (yDelta > 2 * xDelta)                        cancel
+ * if (yDelta * 1.3 > xDelta && yDelta > 0.01)     cancel
+ * if (yDelta > 0.24)                              cancel
+ * ```
  *
- * **Deliberately absolute, and deliberately NOT a fraction of [COMMIT_UNITS].** It was briefly
- * made proportional, on the reasoning that tuning the commit distance should not silently change
- * how tolerant the gesture is of drift. That is backwards. What this number tolerates is the
- * physical noise of putting two fingers on a trackpad, and that noise does not scale with a
- * tuning constant - so following the commit distance down from 9.0 to 3.5 cut the allowance from
- * 1.20 units to 0.47 and rejected essentially every real swipe, while every test still passed
- * because the tests scale their own deltas by [COMMIT_UNITS] too. Tie this to the commit distance
- * again and the same bug comes back, silently, the next time the gesture is tuned.
+ * The second is the binding one in practice, and it is LOOSER than the half-of-horizontal rule
+ * that used to be here: Chrome accepts a swipe until vertical reaches about 0.77 of horizontal, so
+ * gestures it would have taken were being refused.
+ *
+ * **Chrome's numbers are fractions of the trackpad**, read from `NSTouch.normalizedPosition`, which
+ * nothing in this process can see. The two ratios carry over unchanged; the two absolute limits are
+ * carried over as the same fractions of the commit distance that Chrome's are of its own - 0.01/0.08
+ * and 0.24/0.08 - which is the closest honest translation between the two spaces.
  */
-internal const val VERTICAL_FLOOR = 2.4f
+private const val CANCEL_STRONG_RATIO = 2f
+private const val CANCEL_MIXED_RATIO = 1.3f
+private val CANCEL_VERTICAL_LOW get() = COMMIT_UNITS * 0.125f
+private val CANCEL_VERTICAL_HIGH get() = COMMIT_UNITS * 3f
 
 /** One gesture in progress. Immutable; [advanceHomeSwipe] returns the next one. */
 internal data class HomeSwipeGesture(
     val accumX: Float = 0f,
-    val accumY: Float = 0f,
+    /**
+     * The vertical PATH length, the sum of every `|dy|` - not a net total.
+     *
+     * Chrome's asymmetry, and the point of it: horizontal counts net progress, so a reversal spends
+     * it, while vertical counts distance travelled, so wobble accumulates and counts against the
+     * gesture instead of cancelling itself out.
+     */
+    val verticalPath: Float = 0f,
     val events: Int = 0,
     val lastEventAtMs: Long = 0,
     /** Ruled out; stays ruled out until the fingers lift, so a rejected swipe cannot come back. */
@@ -167,13 +177,19 @@ internal fun advanceHomeSwipe(
     // Vertical travel counts from the first event of the gesture, including events with no
     // horizontal component, or a plain vertical scroll that curls sideways at the end would
     // arrive here looking like a fresh clean swipe.
-    val withY = stamped.copy(accumY = stamped.accumY + deltaY)
+    val withY = stamped.copy(verticalPath = stamped.verticalPath + kotlin.math.abs(deltaY))
     if (deltaX == 0f) return HomeSwipeStep(withY)
 
     val moved = withY.copy(accumX = withY.accumX + deltaX, events = withY.events + 1)
-    if (kotlin.math.abs(moved.accumY) > maxOf(kotlin.math.abs(moved.accumX), VERTICAL_FLOOR) * VERTICAL_RATIO) {
-        return HomeSwipeStep(moved.copy(rejected = true))
-    }
+
+    // Chrome's three tiers, in its order.
+    val yDelta = moved.verticalPath
+    val xDelta = kotlin.math.abs(moved.accumX)
+    val cancelled =
+        yDelta > CANCEL_STRONG_RATIO * xDelta ||
+            (yDelta * CANCEL_MIXED_RATIO > xDelta && yDelta > CANCEL_VERTICAL_LOW) ||
+            yDelta > CANCEL_VERTICAL_HIGH
+    if (cancelled) return HomeSwipeStep(moved.copy(rejected = true))
 
     val heading = if (moved.accumX < 0f) HomeSwipeDirection.BACK else HomeSwipeDirection.FORWARD
     val settled =
