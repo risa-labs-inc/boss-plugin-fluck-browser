@@ -209,6 +209,50 @@ class HomeSwipeNavigationTest {
         assertEquals(listOf(HomeSwipeDirection.FORWARD), navigated)
     }
 
+    // --- the style the host publishes ----------------------------------------------------------
+
+    @Test
+    fun `the style comes from the property the host publishes`() {
+        assertEquals(HomeSwipeStyle.SLIDE, homeSwipeStyle(env = null, property = "slide"))
+        assertEquals(HomeSwipeStyle.OFF, homeSwipeStyle(env = null, property = "off"))
+        assertEquals(HomeSwipeStyle.CHEVRON, homeSwipeStyle(env = null, property = "chevron"))
+    }
+
+    /**
+     * An exported variable outranks the setting everywhere else in this app, so home must not
+     * disagree with the pages beside it.
+     */
+    @Test
+    fun `the environment wins over the property`() {
+        assertEquals(HomeSwipeStyle.OFF, homeSwipeStyle(env = "off", property = "slide"))
+    }
+
+    /**
+     * A host older than the setting publishes nothing. Falling back to the chevron matches what
+     * that host's own pages do; falling back to off would silently remove the gesture.
+     */
+    @Test
+    fun `an unset key is the chevron, not off`() {
+        assertEquals(HomeSwipeStyle.CHEVRON, homeSwipeStyle(env = null, property = null))
+        assertEquals(HomeSwipeStyle.CHEVRON, homeSwipeStyle(env = null, property = "nonsense"))
+    }
+
+    /** The key shipped as a boolean before it grew a third state; someone has that exported. */
+    @Test
+    fun `legacy boolean spellings still parse`() {
+        assertEquals(HomeSwipeStyle.OFF, parseHomeSwipeStyle("false"))
+        assertEquals(HomeSwipeStyle.CHEVRON, parseHomeSwipeStyle("true"))
+    }
+
+    /**
+     * The two repos hand-match this key across a system property. A drift is silent - home simply
+     * stops agreeing with every page - so it is pinned to the literal the host publishes.
+     */
+    @Test
+    fun `the key matches the one the host publishes`() {
+        assertEquals("BOSS_BROWSER_SWIPE_NAV", SWIPE_STYLE_KEY)
+    }
+
     // --- the affordance -----------------------------------------------------------------------
 
     @Test

@@ -1,7 +1,10 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.ui.BossThemeColors
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -61,6 +64,20 @@ internal fun HomeSwipeSurface(
     var progress by remember { mutableStateOf(0f) }
     // Bumped on every scroll event so the clear below re-arms rather than accumulating.
     var lastEventTick by remember { mutableStateOf(0L) }
+    // The slide in flight, when that style is chosen. Home slides out and the navigation happens
+    // at the end, rather than at the start: navigating first flips this surface to the browser
+    // almost immediately and the animation is never seen.
+    var slidingOut by remember { mutableStateOf<HomeSwipeDirection?>(null) }
+    val slide = remember { Animatable(0f) }
+
+    LaunchedEffect(slidingOut) {
+        val direction = slidingOut ?: return@LaunchedEffect
+        slide.snapTo(0f)
+        slide.animateTo(1f, tween(HOME_SLIDE_MS, easing = FastOutSlowInEasing))
+        onNavigate(direction)
+        slidingOut = null
+        slide.snapTo(0f)
+    }
 
     // The affordance's own end-of-gesture timer. The gap check inside advanceHomeSwipe cannot do
     // this alone: it only runs when a NEXT event arrives, so a swipe abandoned halfway would park
@@ -91,10 +108,20 @@ internal fun HomeSwipeSurface(
                             canGoForward = canGoForward,
                         )
                     gesture = step.gesture
-                    shown = step.direction
-                    progress = step.progress
                     lastEventTick++
-                    step.navigate?.let(onNavigate)
+                    // Read per gesture, not cached: the host republishes the property the moment
+                    // the setting changes, and a relaunch to pick that up would be a poor answer.
+                    val style = homeSwipeStyle()
+                    // The chevron is this style's affordance; the slide is its own.
+                    shown = step.direction.takeIf { style == HomeSwipeStyle.CHEVRON }
+                    progress = step.progress
+                    step.navigate?.let { direction ->
+                        when (style) {
+                            HomeSwipeStyle.OFF -> Unit
+                            HomeSwipeStyle.CHEVRON -> onNavigate(direction)
+                            HomeSwipeStyle.SLIDE -> if (slidingOut == null) slidingOut = direction
+                        }
+                    }
                 }
                 // A pointer that leaves the surface ends the gesture outright. Compose does report
                 // this one, unlike the page detector's world, so it does not have to be inferred
@@ -105,10 +132,26 @@ internal fun HomeSwipeSurface(
                     progress = 0f
                 },
     ) {
-        content()
+        Box(
+            modifier =
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        // Home slides the way the finger went; the page it reveals is drawn by
+                        // the host once the navigation lands, so there is nothing to parallax
+                        // behind it here.
+                        val sign = if (slidingOut == HomeSwipeDirection.BACK) 1f else -1f
+                        translationX = sign * size.width * slide.value
+                    },
+        ) {
+            content()
+        }
         shown?.let { direction -> HomeSwipeAffordance(direction, progress) }
     }
 }
+
+/** Matches the host's own slide, so the two surfaces do not animate at visibly different speeds. */
+private const val HOME_SLIDE_MS = 220
 
 /**
  * The puck: a chevron that slides in from the edge it would navigate toward and firms up as the
