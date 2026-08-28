@@ -155,6 +155,23 @@ class HomeSwipeNavigationTest {
         assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
     }
 
+    /**
+     * The case the suite was missing, and the one that broke on real hardware.
+     *
+     * Every other drift case here asks what must be REJECTED, so nothing pinned what must still be
+     * accepted - and shortening the commit distance silently cut the drift allowed at the start of
+     * a gesture below the noise of putting two fingers down. Both halves matter: a first event that
+     * is mostly vertical (finger placement, not direction) and honest drift for the rest of it.
+     */
+    @Test
+    fun `an honest swipe that starts noisy still commits`() {
+        // A first event that is mostly vertical, then an honest swipe with a tenth of drift.
+        val placement = listOf(Wheel(-0.2f * step, 1.5f * step, false, 1_000L))
+        val rest = swipe(12, -1f, dySteps = 0.1f, startMs = 1_001L)
+        val (navigated, _) = run(placement + rest)
+        assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
+    }
+
     @Test
     fun `a diagonal drag`() {
         val (navigated, _) = run(swipe(12, -1f, dySteps = -4f))

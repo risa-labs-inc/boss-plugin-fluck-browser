@@ -63,15 +63,20 @@ internal const val VERTICAL_RATIO = 0.5f
 /**
  * Floor for the ratio test, in the same units.
  *
- * Measured against a floor rather than against the horizontal total alone, because the first few
- * events of an honest swipe carry a fraction of a unit and any vertical noise at all would exceed
- * a bare ratio of that.
+ * Measured against a floor rather than against the horizontal total alone, because the first
+ * events of a real swipe are finger placement rather than direction: they routinely carry more
+ * vertical than horizontal, and a bare ratio rejects honest swipes before they start.
  *
- * A fraction of [COMMIT_UNITS] rather than a number of its own, so tuning the commit distance
- * cannot silently change how tolerant the gesture is of vertical drift. Held flat once, it turned
- * a shortened commit distance into a floor worth more than half the gesture.
+ * **Deliberately absolute, and deliberately NOT a fraction of [COMMIT_UNITS].** It was briefly
+ * made proportional, on the reasoning that tuning the commit distance should not silently change
+ * how tolerant the gesture is of drift. That is backwards. What this number tolerates is the
+ * physical noise of putting two fingers on a trackpad, and that noise does not scale with a
+ * tuning constant - so following the commit distance down from 9.0 to 3.5 cut the allowance from
+ * 1.20 units to 0.47 and rejected essentially every real swipe, while every test still passed
+ * because the tests scale their own deltas by [COMMIT_UNITS] too. Tie this to the commit distance
+ * again and the same bug comes back, silently, the next time the gesture is tuned.
  */
-internal const val VERTICAL_FLOOR = COMMIT_UNITS * 0.27f
+internal const val VERTICAL_FLOOR = 2.4f
 
 /** One gesture in progress. Immutable; [advanceHomeSwipe] returns the next one. */
 internal data class HomeSwipeGesture(
