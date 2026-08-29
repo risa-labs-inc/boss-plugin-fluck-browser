@@ -993,6 +993,21 @@ internal object TabHibernation {
          * the user is actually looking at.
          */
         FULLSCREEN("tab still in fullscreen"),
+
+        /**
+         * A Picture-in-Picture window is on screen showing this tab's video.
+         *
+         * Hibernating disposes the handle, which takes the pop-out with it - and a pop-out is by
+         * definition on a backgrounded tab, so without this the idle timer arms the moment the
+         * feature does its job and kills the call it just rescued. Transient like the other two
+         * and waited out the same way.
+         *
+         * Probed rather than known locally, unlike [FULLSCREEN]: the pop-out belongs to the
+         * document (`document.pictureInPictureElement`), and this is true whether the host popped
+         * it out on a tab switch or the user asked for it from the context menu - the second case
+         * was already being cut off before any of this existed.
+         */
+        PICTURE_IN_PICTURE("tab still in picture-in-picture"),
     }
 
     /**
@@ -1133,6 +1148,7 @@ internal object TabHibernation {
      */
     internal fun busyStateFromScriptResult(result: Any?): BusyState =
         when (result?.toString()?.trim()?.trim('"')?.lowercase()) {
+            "pip" -> BusyState.PICTURE_IN_PICTURE
             "media" -> BusyState.PLAYING_MEDIA
             else -> BusyState.IDLE
         }
@@ -1158,6 +1174,10 @@ internal object TabHibernation {
 
     private const val BUSY_SCRIPT =
         "(function(){try{" +
+            // Asked first, and it outranks playback: a popped-out call is muted on the near side
+            // and its remote audio may be routed through Web Audio, so the media test below can
+            // report an idle tab while a window on screen is showing the meeting.
+            "if (document.pictureInPictureElement) return 'pip';" +
             "return Array.prototype.slice.call(document.querySelectorAll('video,audio'))" +
             ".some(function(m){" +
             "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +

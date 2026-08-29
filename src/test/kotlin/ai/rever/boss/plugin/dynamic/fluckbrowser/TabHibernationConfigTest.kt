@@ -177,6 +177,7 @@ class TabHibernationConfigTest {
     private val IDLE = TabHibernation.BusyState.IDLE
     private val MEDIA = TabHibernation.BusyState.PLAYING_MEDIA
     private val FULLSCREEN = TabHibernation.BusyState.FULLSCREEN
+    private val PIP = TabHibernation.BusyState.PICTURE_IN_PICTURE
 
     @Test
     fun `an idle tab hibernates immediately`() = runBlocking {
@@ -554,6 +555,34 @@ class TabHibernationConfigTest {
         // "input" was a state until the predicate behind it was cut; it must not linger.
         assertEquals(IDLE, TabHibernation.busyStateFromScriptResult("input"))
         assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("MEDIA"))
+        // A pop-out on screen. Hibernating disposes the handle and takes the window with it, and
+        // a pop-out only ever exists on a backgrounded tab - which is precisely the tab the idle
+        // timer is coming for.
+        assertEquals(PIP, TabHibernation.busyStateFromScriptResult("pip"))
+        assertEquals(PIP, TabHibernation.busyStateFromScriptResult("\"PIP\"  "))
+    }
+
+    /**
+     * The ordering inside the probe script, asserted here because it is the difference between a
+     * call surviving and being cut: a popped-out call is muted on the near side and its remote
+     * audio may go through Web Audio, so the media test can find nothing while a window on screen
+     * is showing the meeting. Reversing the two lines in BUSY_SCRIPT would report IDLE.
+     */
+    @Test
+    fun `a pop-out outranks playback in the probe script`() {
+        val script = TabHibernation::class.java
+            .getDeclaredField("BUSY_SCRIPT")
+            .apply { isAccessible = true }
+            .get(TabHibernation) as String
+
+        val pipAt = script.indexOf("pictureInPictureElement")
+        val mediaAt = script.indexOf("querySelectorAll")
+        assertTrue(pipAt >= 0, "the probe no longer looks for a pop-out at all:\n$script")
+        assertTrue(mediaAt >= 0, "the probe no longer looks for playback:\n$script")
+        assertTrue(
+            pipAt < mediaAt,
+            "playback is tested before the pop-out, so a muted call reports idle and gets cut",
+        )
     }
 
     @Test
