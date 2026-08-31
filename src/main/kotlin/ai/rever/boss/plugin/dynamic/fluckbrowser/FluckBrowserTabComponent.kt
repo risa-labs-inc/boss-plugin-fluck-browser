@@ -854,6 +854,9 @@ internal object TabHibernation {
 
     private val FALSY = setOf("0", "false", "no", "off")
 
+    private val hibernationLog: java.util.logging.Logger =
+        java.util.logging.Logger.getLogger("TabHibernation")
+
     internal const val DEFAULT_IDLE_MS = 10 * 60 * 1000L
 
     /**
@@ -1005,8 +1008,9 @@ internal object TabHibernation {
          *
          * Hibernating disposes the handle, which takes the pop-out with it - and a pop-out is by
          * definition on a backgrounded tab, so without this the idle timer arms the moment the
-         * feature does its job and kills the call it just rescued. Transient like the other two
-         * and waited out the same way.
+         * feature does its job and kills the call it just rescued. Waited out like the other
+         * non-idle states, though a call - unlike playback - routinely outlives [MAX_RECHECKS]
+         * and reaches the "left alone" ending rather than the "waited out" one.
          *
          * Probed rather than known locally, unlike [FULLSCREEN]: the pop-out belongs to the
          * document (`document.pictureInPictureElement`), and this is true whether the host popped
@@ -1068,8 +1072,17 @@ internal object TabHibernation {
         when {
             fullscreenBlocks -> BusyState.FULLSCREEN
             handle == null -> BusyState.IDLE
-            popOutEnabled && isPoppedOut(handle) -> BusyState.SHOWN_IN_POP_OUT
-            else -> busyState(handle)
+            popOutEnabled && withContext(Dispatchers.IO) { isPoppedOut(handle) } ->
+                BusyState.SHOWN_IN_POP_OUT
+            else ->
+                busyState(handle).let {
+                    // The probe can report SHOWN_IN_POP_OUT too, and the switch has to reach that
+                    // path as well: the stale-window argument for gating the exact signal applies
+                    // at least as strongly to the inferential one. PICTURE_IN_PICTURE is
+                    // deliberately NOT gated - a user who opened PiP from the context menu did it
+                    // by hand, and this setting is only about the automatic pop-out.
+                    if (!popOutEnabled && it == BusyState.SHOWN_IN_POP_OUT) BusyState.IDLE else it
+                }
         }
 
     /**
@@ -1085,11 +1098,8 @@ internal object TabHibernation {
      * Absent or unparseable means ON, matching the host's default: a plugin running against a host
      * too old to publish the key must not switch the guard off and start cutting calls.
      */
-    internal fun autoPipEnabled(fromHost: String? = System.getProperty("BOSS_BROWSER_AUTO_PIP")): Boolean =
-        when (fromHost?.trim()?.lowercase()) {
-            "off", "false", "0", "no" -> false
-            else -> true
-        }
+    internal fun autoPipEnabled(fromHost: String? = System.getProperty(AUTO_PIP_PROPERTY)): Boolean =
+        fromHost?.trim()?.lowercase() !in FALSY
 
     /**
      * Whether the host is showing this backgrounded tab in a floating pop-out window.
@@ -1107,16 +1117,36 @@ internal object TabHibernation {
      * call is absent while a window on screen is showing it.
      */
     internal fun isPoppedOut(handle: BrowserHandle): Boolean =
-        runCatching {
+        try {
             // `isPoppedOut`, NOT `getIsPoppedOut`: Kotlin leaves an `is`-prefixed Boolean
             // property's getter named after the property, so the JVM method is `isPoppedOut()`
-            // (verified with javap against the host class). Getting this wrong is invisible -
-            // NoSuchMethodException is swallowed here by design, so the flag would read false
-            // forever and the guard would silently protect nothing.
+            // (verified with javap against the host class).
+            //
+            // setAccessible, because getMethod resolves against the host's IMPLEMENTATION class,
+            // not the interface - the whole point being that the class carries members this
+            // plugin never compiled against. That class is public today, but a private nested
+            // impl or an `object : BrowserHandle` would throw IllegalAccessException, and a
+            // catch-all would read that as "old host" and leave the guard off forever.
             handle.javaClass
                 .getMethod("isPoppedOut")
-                .invoke(handle) as? Boolean
-        }.getOrNull() ?: false
+                .apply { isAccessible = true }
+                .invoke(handle) as? Boolean ?: false
+        } catch (e: NoSuchMethodException) {
+            // The expected, benign case: a host older than the member. Not logged per call -
+            // this runs on every hibernation probe - and distinguished from the case below only
+            // because the two mean opposite things about whether anything is wrong.
+            false
+        } catch (
+            @Suppress("TooGenericExceptionCaught") e: Exception,
+        ) {
+            // The alarming case: the member exists and the call failed, so the guard is off and
+            // nobody would otherwise know. This file's whole subject is silent wrongness.
+            // java.util.logging, matching BrowserShareManager in this plugin: a ComponentLogger
+            // held as a property is what BinaryCompatibilityValidator rejected a plugin over
+            // before, and this object has no logger of its own to borrow.
+            hibernationLog.warning("Could not read isPoppedOut from the host; the pop-out guard is off: $e")
+            false
+        }
 
     /**
      * Whether hibernating this tab right now would cut audible playback.
@@ -1175,7 +1205,7 @@ internal object TabHibernation {
      * [BusyState.IDLE] means hibernate now, anything else is the reason not to.
      *
      * Busy states are distinguished for their reason strings; every non-idle state gets the same
-     * treatment, because both are transient and both are worth waiting out:
+     * treatment, because each is worth waiting out:
      *
      *  - [BusyState.PLAYING_MEDIA] is transient, so it is worth waiting out. Rechecks back off
      *    from [MEDIA_RECHECK_MS] toward [MAX_RECHECK_MS] so a three-hour video does not cost a
@@ -1246,6 +1276,16 @@ internal object TabHibernation {
             "media" -> BusyState.PLAYING_MEDIA
             else -> BusyState.IDLE
         }
+
+    /**
+     * The host's automatic-pop-out switch, published as a system property.
+     *
+     * Named like its neighbours (`HOST_ENABLED_PROPERTY`, `HOST_IDLE_PROPERTY`) and part of the
+     * same `BOSS_BROWSER_*` family as the swipe key, so the test can assert against the constant
+     * rather than retyping the string - a rename that desyncs from the host would otherwise be
+     * silent.
+     */
+    internal const val AUTO_PIP_PROPERTY = "BOSS_BROWSER_AUTO_PIP"
 
     private const val BUSY_CHECK_TIMEOUT_MS = 2_000L
 
