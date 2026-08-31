@@ -1060,12 +1060,35 @@ internal object TabHibernation {
      * rendering it into. Extracted from the hibernation job so the selection itself is
      * testable, not just the policy it feeds.
      */
-    internal suspend fun busyStateFor(fullscreenBlocks: Boolean, handle: BrowserHandle?): BusyState =
+    internal suspend fun busyStateFor(
+        fullscreenBlocks: Boolean,
+        handle: BrowserHandle?,
+        popOutEnabled: Boolean = autoPipEnabled(),
+    ): BusyState =
         when {
             fullscreenBlocks -> BusyState.FULLSCREEN
             handle == null -> BusyState.IDLE
-            isPoppedOut(handle) -> BusyState.SHOWN_IN_POP_OUT
+            popOutEnabled && isPoppedOut(handle) -> BusyState.SHOWN_IN_POP_OUT
             else -> busyState(handle)
+        }
+
+    /**
+     * Whether the host's automatic pop-out is switched on, published as a system property.
+     *
+     * Both halves of the feature read one key: the host decides whether to pop a call out, this
+     * decides whether to keep a popped-out tab alive, and they must agree. With it off there is
+     * nothing to protect, so honouring it here keeps a stale `isPoppedOut` - a window the host has
+     * not closed yet, say - from exempting a tab the user has asked to be left alone.
+     *
+     * A system property rather than plugin-api for the reason this file already documents about
+     * the resource tier: plugins cannot read host settings, and the alternative is an api release.
+     * Absent or unparseable means ON, matching the host's default: a plugin running against a host
+     * too old to publish the key must not switch the guard off and start cutting calls.
+     */
+    internal fun autoPipEnabled(fromHost: String? = System.getProperty("BOSS_BROWSER_AUTO_PIP")): Boolean =
+        when (fromHost?.trim()?.lowercase()) {
+            "off", "false", "0", "no" -> false
+            else -> true
         }
 
     /**

@@ -621,6 +621,12 @@ class TabHibernationConfigTest {
         fun isPoppedOut(): Boolean = true
     }
 
+    private fun probeReturning(result: Any?): BrowserHandle =
+        Proxy.newProxyInstance(
+            BrowserHandle::class.java.classLoader,
+            arrayOf(BrowserHandle::class.java),
+        ) { _, _, _ -> result } as BrowserHandle
+
     private fun explodingHandle(): BrowserHandle =
         Proxy.newProxyInstance(
             BrowserHandle::class.java.classLoader,
@@ -675,6 +681,33 @@ class TabHibernationConfigTest {
                 ),
             )
         }
+
+    @Test
+    fun `the host's off switch stops the pop-out exemption`() =
+        runBlocking {
+            // Off means the host will not pop anything out, so a lingering isPoppedOut must not
+            // keep exempting a tab the user asked to be left alone. The probe still runs, and
+            // this handle answers nothing, so the tab is idle and hibernates.
+            assertEquals(
+                TabHibernation.BusyState.IDLE,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = PoppedOutHandle(probeReturning(null)),
+                    popOutEnabled = false,
+                ),
+            )
+        }
+
+    @Test
+    fun `an absent host property leaves the pop-out guard on`() {
+        // A plugin on a host too old to publish the key must not switch the guard off and start
+        // cutting calls, so anything unparseable - absent included - reads as ON.
+        assertTrue(TabHibernation.autoPipEnabled(fromHost = null))
+        assertTrue(TabHibernation.autoPipEnabled(fromHost = "maybe"))
+        assertTrue(TabHibernation.autoPipEnabled(fromHost = "true"))
+        assertFalse(TabHibernation.autoPipEnabled(fromHost = "false"))
+        assertFalse(TabHibernation.autoPipEnabled(fromHost = " OFF "))
+    }
 
     @Test
     fun `a shown result maps to the pop-out state`() {
