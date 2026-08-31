@@ -972,11 +972,17 @@ internal object TabHibernation {
      * Why a tab should not hibernate right now, if it should not.
      *
      * Separate states rather than one boolean, because the reason has to survive as far as the
-     * log line and the caller's decision. [PLAYING_MEDIA] and [FULLSCREEN] currently get the same
-     * treatment in [awaitQuiet] - both are transient and both are waited out - but they are not
-     * interchangeable: conflating busy-ness into one flag produced a genuinely worse outcome than
-     * not deferring at all, and the distinction is what lets [awaitQuiet] tell a changed reason
-     * from a continuing one.
+     * log line and the caller's decision. Every non-idle state gets the same treatment in
+     * [awaitQuiet] - all are waited out - but they are not interchangeable: conflating busy-ness
+     * into one flag produced a genuinely worse outcome than not deferring at all, and the
+     * distinction is what lets [awaitQuiet] tell a changed reason from a continuing one.
+     *
+     * They are not all transient in the same sense, and the difference matters at the bound.
+     * Playback and fullscreen end on their own within minutes. A call does not: it routinely
+     * outlives [MAX_RECHECKS], so a popped-out tab reaches the "left alone" ending rather than
+     * the "waited out" one, and keeps its process tree until the user visits it again. That is
+     * the deliberate trade already written into [MAX_RECHECKS] - a bound on polling must not
+     * become a licence to cut the call.
      */
     enum class BusyState(val skipReason: String) {
         /** Nothing in the way; hibernate. */
@@ -1006,6 +1012,10 @@ internal object TabHibernation {
          * document (`document.pictureInPictureElement`), and this is true whether the host popped
          * it out on a tab switch or the user asked for it from the context menu - the second case
          * was already being cut off before any of this existed.
+         *
+         * **Top document only**, like every other probe here: a pop-out opened from inside a
+         * cross-origin iframe is invisible to it, and that tab hibernates. Same known gap the
+         * media probe carries, and it fails toward hibernating rather than exempting.
          */
         PICTURE_IN_PICTURE("tab still in picture-in-picture"),
 
@@ -1019,16 +1029,25 @@ internal object TabHibernation {
          * [PICTURE_IN_PICTURE] probes for a window that is no longer opened, and this state is
          * what actually protects a popped-out call from the idle timer.
          *
-         * **The signal is compound on purpose.** "Backgrounded but `visibilityState` is visible"
-         * is the popped-out signature, and on its own it would be the whole check - but if
-         * Chromium ever reports a backgrounded tab as visible (an untested rendering mode, a
-         * future change), that alone would exempt EVERY tab and silently disable hibernation,
-         * which exists here to stop this app leaking process trees. Requiring a playing `<video>`
-         * as well bounds the damage: an ordinary backgrounded tab has none and still hibernates,
-         * while a call - popped out and playing, whatever its mute state - is protected.
+         * **This is now the fallback, not the primary.** [busyStateFor] asks the host first
+         * through `BrowserHandle.isPoppedOut`, which is exact; this probe only answers for a host
+         * too old to have that member.
          *
-         * Muting is deliberately not consulted, unlike [PLAYING_MEDIA]: a call's own self-view is
-         * muted by definition and its remote audio may be routed through Web Audio.
+         * The pairing with a playing `<video>` is a bound on the damage a wrong premise could do,
+         * not a description of a call. Measured on this build (2026-08-30): a backgrounded tab
+         * really does report `hidden` and an active one `visible`, both ways, so visibility alone
+         * would in fact be correct here. The pairing stays because the cost of the premise being
+         * wrong in some untested rendering mode is silently exempting every tab and disabling
+         * hibernation, which exists to stop this app leaking process trees - and note that muted
+         * autoplay `<video>` is common enough (hero videos, timelines, GIF-as-video) that the
+         * pairing is a weaker bound than it looks.
+         *
+         * Mute state is deliberately not consulted, unlike [PLAYING_MEDIA]: a call's own
+         * self-view is muted by definition and its remote audio may run through Web Audio.
+         *
+         * **Known gap this cannot close:** a call with every camera off has no playing video at
+         * all, so on an old host it is not detected here and the tab hibernates. That is exactly
+         * what the host flag exists for.
          */
         SHOWN_IN_POP_OUT("tab still on screen in a pop-out"),
     }
@@ -1045,8 +1064,36 @@ internal object TabHibernation {
         when {
             fullscreenBlocks -> BusyState.FULLSCREEN
             handle == null -> BusyState.IDLE
+            isPoppedOut(handle) -> BusyState.SHOWN_IN_POP_OUT
             else -> busyState(handle)
         }
+
+    /**
+     * Whether the host is showing this backgrounded tab in a floating pop-out window.
+     *
+     * **Reflective on purpose.** `BrowserHandle.isPoppedOut` is defaulted and recent; naming it
+     * directly would compile against a newer api than an installed host may carry, and a plugin
+     * referencing a member the host's copy lacks is rejected wholesale by
+     * BinaryCompatibilityValidator - which for this plugin reads to the user as "my browser
+     * disappeared", and has shipped once already. An older host has no such member, so this
+     * answers false and the JS probe's own pop-out checks stand in.
+     *
+     * Asked BEFORE [busyState] because it is exact where the probe is inferential, and because
+     * it is the only signal that covers a call with every camera off: no playing video, near
+     * side muted, remote audio possibly through Web Audio, so every DOM-visible trace of the
+     * call is absent while a window on screen is showing it.
+     */
+    internal fun isPoppedOut(handle: BrowserHandle): Boolean =
+        runCatching {
+            // `isPoppedOut`, NOT `getIsPoppedOut`: Kotlin leaves an `is`-prefixed Boolean
+            // property's getter named after the property, so the JVM method is `isPoppedOut()`
+            // (verified with javap against the host class). Getting this wrong is invisible -
+            // NoSuchMethodException is swallowed here by design, so the flag would read false
+            // forever and the guard would silently protect nothing.
+            handle.javaClass
+                .getMethod("isPoppedOut")
+                .invoke(handle) as? Boolean
+        }.getOrNull() ?: false
 
     /**
      * Whether hibernating this tab right now would cut audible playback.
@@ -1104,7 +1151,7 @@ internal object TabHibernation {
      * Waits for a backgrounded tab to become quiet. Returns the state it settled on:
      * [BusyState.IDLE] means hibernate now, anything else is the reason not to.
      *
-     * Busy states are distinguished for their reason strings; both non-idle states get the same
+     * Busy states are distinguished for their reason strings; every non-idle state gets the same
      * treatment, because both are transient and both are worth waiting out:
      *
      *  - [BusyState.PLAYING_MEDIA] is transient, so it is worth waiting out. Rechecks back off
@@ -1196,7 +1243,7 @@ internal object TabHibernation {
      */
     internal const val MAX_RECHECKS = 40
 
-    private const val BUSY_SCRIPT =
+    internal const val BUSY_SCRIPT =
         "(function(){try{" +
             // Asked first, and it outranks playback: a popped-out call is muted on the near side
             // and its remote audio may be routed through Web Audio, so the media test below can
@@ -1213,7 +1260,8 @@ internal object TabHibernation {
             // reports a backgrounded tab as hidden cannot exempt every tab; see SHOWN_IN_POP_OUT.
             "if (document.visibilityState === 'visible' && " +
             "Array.prototype.slice.call(document.querySelectorAll('video'))" +
-            ".some(function(v){return !v.paused && !v.ended;})) return 'shown';" +
+            ".some(function(v){return !v.paused && !v.ended && v.currentTime > 0;})) " +
+            "return 'shown';" +
             "return Array.prototype.slice.call(document.querySelectorAll('video,audio'))" +
             ".some(function(m){" +
             "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
@@ -2950,7 +2998,8 @@ internal fun FluckBrowserTabContent(
                         idleMsNow = { withContext(Dispatchers.IO) { TabHibernation.effectiveIdleMs() } },
                         sleep = { delay(it) },
                     )
-                    // Audible and fullscreen tabs are waited out rather than cut off mid-play.
+                    // A tab that is audible, fullscreen, or showing a call in a pop-out is waited
+                    // out rather than cut off mid-play.
                     val busy =
                         TabHibernation.awaitQuiet(
                             probe = {

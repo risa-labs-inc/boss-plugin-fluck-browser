@@ -570,10 +570,7 @@ class TabHibernationConfigTest {
      */
     @Test
     fun `a pop-out outranks playback in the probe script`() {
-        val script = TabHibernation::class.java
-            .getDeclaredField("BUSY_SCRIPT")
-            .apply { isAccessible = true }
-            .get(TabHibernation) as String
+        val script = TabHibernation.BUSY_SCRIPT
 
         val pipAt = script.indexOf("pictureInPictureElement")
         val mediaAt = script.indexOf("volume")
@@ -611,6 +608,73 @@ class TabHibernationConfigTest {
             "playback is tested before the pop-out, so a muted call reports idle and gets cut",
         )
     }
+
+    /**
+     * A handle whose class really declares the member, which a `Proxy` over the plugin's own
+     * (older) copy of `BrowserHandle` cannot do - the point of the reflective lookup is that the
+     * host's class carries members this plugin never compiled against.
+     */
+    private class PoppedOutHandle(
+        private val delegate: BrowserHandle,
+    ) : BrowserHandle by delegate {
+        @Suppress("unused")
+        fun isPoppedOut(): Boolean = true
+    }
+
+    private fun explodingHandle(): BrowserHandle =
+        Proxy.newProxyInstance(
+            BrowserHandle::class.java.classLoader,
+            arrayOf(BrowserHandle::class.java),
+        ) { _, method, _ -> error("the page was probed: ${'$'}{method.name}") } as BrowserHandle
+
+    @Test
+    fun `the reflective lookup uses the JVM name Kotlin actually emits`() {
+        // Kotlin names an `is`-prefixed Boolean property's getter after the property, so the host
+        // method is `isPoppedOut()`. Looking for `getIsPoppedOut` throws, the lookup swallows it,
+        // and the guard silently protects nothing - so the name is pinned rather than trusted.
+        assertTrue(TabHibernation.isPoppedOut(PoppedOutHandle(explodingHandle())))
+    }
+
+    @Test
+    fun `a popped-out handle is busy without consulting the probe`() =
+        runBlocking {
+            // The stub errors on every call, so reaching SHOWN_IN_POP_OUT proves the flag was
+            // read and the page never probed - which is the whole point for a camera-off call,
+            // where the probe has nothing to find.
+            assertEquals(
+                TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = PoppedOutHandle(explodingHandle()),
+                ),
+            )
+        }
+
+    @Test
+    fun `a host with no isPoppedOut member falls back to the probe`() =
+        runBlocking {
+            // An older host's handle has no such member at all. The lookup must answer false
+            // rather than throw, or every hibernation decision on that host fails.
+            val noMember =
+                Proxy.newProxyInstance(
+                    BrowserHandle::class.java.classLoader,
+                    arrayOf(BrowserHandle::class.java),
+                ) { _, _, _ -> null } as BrowserHandle
+
+            assertFalse(TabHibernation.isPoppedOut(noMember))
+        }
+
+    @Test
+    fun `fullscreen still outranks a popped-out handle`() =
+        runBlocking {
+            assertEquals(
+                TabHibernation.BusyState.FULLSCREEN,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = true,
+                    handle = PoppedOutHandle(explodingHandle()),
+                ),
+            )
+        }
 
     @Test
     fun `a shown result maps to the pop-out state`() {
