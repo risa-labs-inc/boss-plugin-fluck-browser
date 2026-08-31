@@ -854,9 +854,6 @@ internal object TabHibernation {
 
     private val FALSY = setOf("0", "false", "no", "off")
 
-    private val hibernationLog: java.util.logging.Logger =
-        java.util.logging.Logger.getLogger("TabHibernation")
-
     internal const val DEFAULT_IDLE_MS = 10 * 60 * 1000L
 
     /**
@@ -1071,14 +1068,22 @@ internal object TabHibernation {
     ): BusyState {
         if (fullscreenBlocks) return BusyState.FULLSCREEN
         if (handle == null) return BusyState.IDLE
-        // Bounded like busyState's own probe: this asks a host object about a window, and a host
-        // that hops to the EDT and waits would otherwise park the hibernation job indefinitely.
-        // A timeout reads as "the host did not answer", which is the null case.
+        // Dispatchers.IO is what carries the weight here: poppedOutOrNull is a blocking
+        // reflective call with no suspension point, so withTimeoutOrNull cannot abandon it - the
+        // bound is advisory, exactly as busyState documents for its own probe. What IO buys is
+        // that a host which blocks does not take the UI dispatcher down with it. The timeout
+        // still matters for the surrounding coroutine, and reads as "no answer" - the null case.
         val hostSays =
             withTimeoutOrNull(BUSY_CHECK_TIMEOUT_MS) {
                 withContext(Dispatchers.IO) { poppedOutOrNull(handle) }
             }
-        if (popOutEnabled && hostSays == true) return BusyState.SHOWN_IN_POP_OUT
+        // Unconditional, NOT gated on popOutEnabled. With the switch off the host stops opening
+        // new pop-outs, but one already on screen stays open - and hibernating then disposes the
+        // handle while the user is watching that window, killing the call in front of them. The
+        // switch exists to stop the feature acting, not to destroy what it already did. Acting on
+        // a stale flag would cost one leaked process tree until the next tab visit; acting on this
+        // one costs a visibly destroyed call, and those are not the same mistake.
+        if (hostSays == true) return BusyState.SHOWN_IN_POP_OUT
         return busyState(handle).let {
             // The 'shown' inference exists for hosts that CANNOT answer. A host that answered
             // false is exact, and the inference must not override it - otherwise any
@@ -1155,8 +1160,15 @@ internal object TabHibernation {
         val resolved =
             poppedOutMethods.computeIfAbsent(type) {
                 try {
-                    java.util.Optional.of(it.getMethod("isPoppedOut").apply { isAccessible = true })
-                } catch (e: NoSuchMethodException) {
+                    val method = it.getMethod("isPoppedOut")
+                    // Best-effort, and separately caught: an InaccessibleObjectException (a public
+                    // method on a class in a non-exported module under JPMS) or a SecurityException
+                    // would otherwise discard a Method that very likely invokes fine, cache the
+                    // miss, and disable the guard for this host class for the life of the process -
+                    // the exact outcome setAccessible is here to avoid.
+                    runCatching { method.isAccessible = true }
+                    java.util.Optional.of(method)
+                } catch (_: NoSuchMethodException) {
                     // The expected, benign case: a host older than the member. Not warned.
                     java.util.Optional.empty()
                 } catch (
@@ -1189,7 +1201,7 @@ internal object TabHibernation {
         if (!poppedOutWarned.add(type)) return
         // println, matching every other hibernation line in this file, so the field check the PR
         // asks for lands in the same sink as the rest.
-        println("[FluckBrowser] hibernation: ${'$'}what from ${'$'}{type.name}; pop-out guard off: ${'$'}error")
+        println("[FluckBrowser] hibernation: $what from ${type.name}; pop-out guard off: $error")
     }
 
     /**

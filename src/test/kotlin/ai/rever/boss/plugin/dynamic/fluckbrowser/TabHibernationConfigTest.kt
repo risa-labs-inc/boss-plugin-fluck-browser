@@ -681,6 +681,9 @@ class TabHibernationConfigTest {
                 TabHibernation.busyStateFor(
                     fullscreenBlocks = false,
                     handle = PoppedOutHandle(explodingHandle()),
+                    // Explicit: the default reads the real BOSS_BROWSER_AUTO_PIP, so a machine
+                    // with it exported would fail this for a reason unrelated to the assertion.
+                    popOutEnabled = true,
                 ),
             )
         }
@@ -696,7 +699,11 @@ class TabHibernationConfigTest {
             // And the fallback this is named for: with no host answer, the probe decides.
             assertEquals(
                 TabHibernation.BusyState.PLAYING_MEDIA,
-                TabHibernation.busyStateFor(fullscreenBlocks = false, handle = noMember),
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = noMember,
+                    popOutEnabled = true,
+                ),
             )
         }
 
@@ -708,12 +715,52 @@ class TabHibernationConfigTest {
                 TabHibernation.busyStateFor(
                     fullscreenBlocks = true,
                     handle = PoppedOutHandle(explodingHandle()),
+                    popOutEnabled = true,
                 ),
             )
         }
 
     @Test
-    fun `the host's off switch stops the pop-out exemption`() =
+    fun `the off switch never kills a window already on screen`() =
+        runBlocking {
+            // An exact "yes" from the host means a floating window is on screen right now.
+            // Hibernating would dispose the handle and kill the call the user is watching, so
+            // the switch does not reach it - it stops the feature acting, not what it already did.
+            assertEquals(
+                TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = PoppedOutHandle(explodingHandle()),
+                    popOutEnabled = false,
+                ),
+            )
+        }
+
+    @Test
+    fun `a host answering false keeps PICTURE_IN_PICTURE`() =
+        runBlocking {
+            // The asymmetry, on the current-host path: someone who opened PiP by hand is exempt
+            // whatever the host says about pop-outs and whatever the switch says.
+            assertEquals(
+                TabHibernation.BusyState.PICTURE_IN_PICTURE,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = NotPoppedOutHandle(probeReturning("pip")),
+                    popOutEnabled = false,
+                ),
+            )
+        }
+
+    @Test
+    fun `the environment beats the host property`() {
+        assertFalse(TabHibernation.autoPopOutEnabled(fromEnvironment = "false", fromHost = "true"))
+        assertTrue(TabHibernation.autoPopOutEnabled(fromEnvironment = "true", fromHost = "false"))
+        // Nothing exported: the host decides.
+        assertFalse(TabHibernation.autoPopOutEnabled(fromEnvironment = null, fromHost = "off"))
+    }
+
+    @Test
+    fun `the off switch stops the probe's inference`() =
         runBlocking {
             // The probe must be gated too, not just the host flag. This used to pass
             // probeReturning(null), so the probe answered IDLE before the interesting branch was
@@ -723,7 +770,10 @@ class TabHibernationConfigTest {
                 TabHibernation.BusyState.IDLE,
                 TabHibernation.busyStateFor(
                     fullscreenBlocks = false,
-                    handle = PoppedOutHandle(probeReturning("shown")),
+                    // An OLD host (no member), so the inference is all there is - which is
+                    // exactly what the switch gates. A PoppedOutHandle would return an exact
+                    // "yes" and be honoured regardless, which is a different rule.
+                    handle = probeReturning("shown"),
                     popOutEnabled = false,
                 ),
             )
@@ -769,7 +819,7 @@ class TabHibernationConfigTest {
                 TabHibernation.BusyState.PLAYING_MEDIA,
                 TabHibernation.busyStateFor(
                     fullscreenBlocks = false,
-                    handle = PoppedOutHandle(probeReturning("media")),
+                    handle = probeReturning("media"),
                     popOutEnabled = false,
                 ),
             )
