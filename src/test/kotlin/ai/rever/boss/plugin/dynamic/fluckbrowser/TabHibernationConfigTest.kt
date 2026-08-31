@@ -552,8 +552,11 @@ class TabHibernationConfigTest {
         // Quoted, padded and differently-cased forms all still resolve.
         assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("\"media\""))
         assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("  media  "))
-        // "input" was a state until the predicate behind it was cut; it must not linger.
-        assertEquals(IDLE, TabHibernation.busyStateFromScriptResult("input"))
+        // "input" is a state again - but not the predicate d1552be cut. That one diffed DOM
+        // values against defaults and was withdrawn three times (SPA writes and autofilled
+        // passwords both read as dirty). The state now maps a trusted-keystroke marker; see
+        // DirtyInputMarker and UserInputGuardTest.
+        assertEquals(TabHibernation.BusyState.USER_INPUT, TabHibernation.busyStateFromScriptResult("input"))
         assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("MEDIA"))
         // A pop-out on screen. Hibernating disposes the handle and takes the window with it, and
         // a pop-out only ever exists on a backgrounded tab - which is precisely the tab the idle

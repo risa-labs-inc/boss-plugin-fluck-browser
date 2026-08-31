@@ -1051,6 +1051,34 @@ internal object TabHibernation {
          * what the host flag exists for.
          */
         SHOWN_IN_POP_OUT("tab still on screen in a pop-out"),
+
+        /**
+         * The user has typed into this document since it loaded, and nothing has navigated since.
+         *
+         * This state exists because hibernation's own justification ("the cost of being wrong is
+         * a reload on return, not lost work") is false for exactly one class of tab: one where
+         * the user has typed something and not submitted it. A reload there IS lost work - a
+         * half-written order form, text typed and abandoned for twenty minutes. Every other
+         * guard in this enum protects something the user is passively consuming; this one
+         * protects something they made.
+         *
+         * Detected by [DirtyInputMarker]'s trusted-keystroke listener, NOT by inspecting the DOM.
+         * The DOM heuristic was attempted three times and withdrawn (d1552be): value-vs-default
+         * matching exempted every SPA that writes into its own fields, and `defaultValue` cannot
+         * tell an autofilled password from a typed one, which exempted login pages for ~20
+         * hours. A trusted keystroke answers "has a human typed here" directly - autofill and
+         * framework writes fire no trusted keydown, so both failure modes are structurally
+         * impossible rather than patched. The re-added mapping deliberately reverses the
+         * "'input' must not linger" pin that d1552be left behind; the predicate it buried is not
+         * the one that returned.
+         *
+         * Unlike [PLAYING_MEDIA], typing does not drain on its own, so this routinely reaches
+         * the [MAX_RECHECKS] "left alone" ending rather than the "waited out" one - the same
+         * bounded trade [SHOWN_IN_POP_OUT] makes for calls. A leaked process tree costs memory
+         * until the next visit; a discarded draft costs the user's work, and those are not the
+         * same mistake.
+         */
+        USER_INPUT("tab holds unsubmitted typing"),
     }
 
     /**
@@ -1330,6 +1358,7 @@ internal object TabHibernation {
             "pip" -> BusyState.PICTURE_IN_PICTURE
             "shown" -> BusyState.SHOWN_IN_POP_OUT
             "media" -> BusyState.PLAYING_MEDIA
+            "input" -> BusyState.USER_INPUT
             else -> BusyState.IDLE
         }
 
@@ -1389,6 +1418,18 @@ internal object TabHibernation {
             "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
             "});" +
             "if (media) return 'media';" +
+            // Unsubmitted typing, answered AFTER 'media' (the audible-first guarantee the
+            // ordering comment below leans on is untouched) but BEFORE 'shown', deliberately:
+            // busyStateFor downgrades 'shown' to IDLE when the host answers "not popped out",
+            // and a page that is both shown-inferred and dirty must report 'input' so that
+            // downgrade can never hibernate a tab holding the user's typing.
+            //
+            // This reads a marker; it does NOT inspect the DOM. The DOM heuristic was attempted
+            // three times and withdrawn (d1552be) - value-vs-default matching exempted every SPA,
+            // and defaultValue cannot tell an autofilled password from a typed one, which
+            // exempted login pages for ~20 hours. The marker is set only by a trusted keystroke;
+            // see DirtyInputMarker for what sets it and the trades.
+            "if (window.__fluckDirty === 1) return 'input';" +
             // The surface pop-out this app uses reparents the tab's real rendering surface into
             // a floating window, so neither PiP API reports it - the page is simply visible
             // while its tab is backgrounded. Paired with a playing video so a rendering mode
@@ -2569,8 +2610,17 @@ internal fun FluckBrowserTabContent(
                 // may never fire navigation events for about:blank — apply up front.
                 if (isHomeUrl(urlBarText.text)) applyHomeTabIdentity()
 
+                // The dirty-typing marker rides navigation: installed now for the document already
+                // committed, and re-installed on every navigation event below. Idempotent per
+                // document (the property doubles as the install guard), and a new document arrives
+                // with the flag naturally cleared - so submit-and-navigate resets it for free.
+                // Keystroke-based, NOT a DOM diff; see DirtyInputMarker for the three withdrawn
+                // attempts that rule the DOM approach out.
+                coroutineScope.launch { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) }
+
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
+                    coroutineScope.launch { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) }
                     // Only update URL bar if user isn't actively editing
                     // AND sufficient time has passed since last input (300ms buffer for Tab completion)
                     val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
