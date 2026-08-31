@@ -576,12 +576,52 @@ class TabHibernationConfigTest {
             .get(TabHibernation) as String
 
         val pipAt = script.indexOf("pictureInPictureElement")
-        val mediaAt = script.indexOf("querySelectorAll")
+        val mediaAt = script.indexOf("volume")
         assertTrue(pipAt >= 0, "the probe no longer looks for a pop-out at all:\n$script")
+        // Both kinds. A site-owned pop-out is a Document PiP window and leaves
+        // pictureInPictureElement null, so the element check alone misses Meet entirely.
+        assertTrue(
+            script.contains("documentPictureInPicture.window"),
+            "the probe misses a Document PiP window, which is the kind Meet opens:\n$script",
+        )
+        // The pop-out this app actually uses reparents the tab's surface, so neither PiP API
+        // reports it - the page is simply visible while its tab is backgrounded.
+        val shownAt = script.indexOf("visibilityState")
+        assertTrue(
+            shownAt >= 0,
+            "the probe misses a surface pop-out, the kind BossConsole opens:\n$script",
+        )
+        // Compound, not visibility alone: a rendering mode that never reported a backgrounded
+        // tab as hidden would otherwise exempt every tab and disable hibernation outright. The
+        // playing-video test must sit INSIDE the condition that returns, not merely somewhere
+        // after it - the media check further down also mentions `paused`, and a window-based
+        // assertion was satisfied by that while the pairing was gone.
+        val returnsShownAt = script.indexOf("return 'shown'", shownAt)
+        assertTrue(
+            returnsShownAt > shownAt,
+            "the visibility check never returns 'shown':\n$script",
+        )
+        assertTrue(
+            script.indexOf("paused", shownAt) in shownAt..returnsShownAt,
+            "the visibility check is not paired with a playing-video test:\n$script",
+        )
         assertTrue(mediaAt >= 0, "the probe no longer looks for playback:\n$script")
         assertTrue(
             pipAt < mediaAt,
             "playback is tested before the pop-out, so a muted call reports idle and gets cut",
+        )
+    }
+
+    @Test
+    fun `a shown result maps to the pop-out state`() {
+        assertEquals(
+            TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+            TabHibernation.busyStateFromScriptResult("shown"),
+        )
+        // Quoted and cased the way a marshalling change could deliver it.
+        assertEquals(
+            TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+            TabHibernation.busyStateFromScriptResult("\"SHOWN\""),
         )
     }
 

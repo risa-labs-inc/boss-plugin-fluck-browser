@@ -1008,6 +1008,29 @@ internal object TabHibernation {
          * was already being cut off before any of this existed.
          */
         PICTURE_IN_PICTURE("tab still in picture-in-picture"),
+
+        /**
+         * The host is showing this backgrounded tab somewhere - it is popped out.
+         *
+         * BossConsole's pop-out no longer uses either Picture-in-Picture API. It reparents the
+         * tab's **real rendering surface** into a floating window (BossConsole#282), because a
+         * hidden tab cannot be made to render a live call: its DOM never mounts new elements and
+         * Meet's SFU will not even forward video for tiles the client is not drawing. So
+         * [PICTURE_IN_PICTURE] probes for a window that is no longer opened, and this state is
+         * what actually protects a popped-out call from the idle timer.
+         *
+         * **The signal is compound on purpose.** "Backgrounded but `visibilityState` is visible"
+         * is the popped-out signature, and on its own it would be the whole check - but if
+         * Chromium ever reports a backgrounded tab as visible (an untested rendering mode, a
+         * future change), that alone would exempt EVERY tab and silently disable hibernation,
+         * which exists here to stop this app leaking process trees. Requiring a playing `<video>`
+         * as well bounds the damage: an ordinary backgrounded tab has none and still hibernates,
+         * while a call - popped out and playing, whatever its mute state - is protected.
+         *
+         * Muting is deliberately not consulted, unlike [PLAYING_MEDIA]: a call's own self-view is
+         * muted by definition and its remote audio may be routed through Web Audio.
+         */
+        SHOWN_IN_POP_OUT("tab still on screen in a pop-out"),
     }
 
     /**
@@ -1149,6 +1172,7 @@ internal object TabHibernation {
     internal fun busyStateFromScriptResult(result: Any?): BusyState =
         when (result?.toString()?.trim()?.trim('"')?.lowercase()) {
             "pip" -> BusyState.PICTURE_IN_PICTURE
+            "shown" -> BusyState.SHOWN_IN_POP_OUT
             "media" -> BusyState.PLAYING_MEDIA
             else -> BusyState.IDLE
         }
@@ -1178,6 +1202,18 @@ internal object TabHibernation {
             // and its remote audio may be routed through Web Audio, so the media test below can
             // report an idle tab while a window on screen is showing the meeting.
             "if (document.pictureInPictureElement) return 'pip';" +
+            // A site-owned pop-out (Google Meet's, and anything else using Document PiP) is a
+            // separate window, not an element in this document - pictureInPictureElement stays
+            // null for it. Checking only the element kind would hibernate the tab out from under
+            // the very window this state exists to protect.
+            "if (window.documentPictureInPicture && documentPictureInPicture.window) return 'pip';" +
+            // The pop-out this app actually uses is the tab's own surface in a floating window,
+            // so neither API above reports it - the page simply IS visible while its tab is
+            // backgrounded. Paired with a playing video so that a rendering mode which never
+            // reports a backgrounded tab as hidden cannot exempt every tab; see SHOWN_IN_POP_OUT.
+            "if (document.visibilityState === 'visible' && " +
+            "Array.prototype.slice.call(document.querySelectorAll('video'))" +
+            ".some(function(v){return !v.paused && !v.ended;})) return 'shown';" +
             "return Array.prototype.slice.call(document.querySelectorAll('video,audio'))" +
             ".some(function(m){" +
             "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
