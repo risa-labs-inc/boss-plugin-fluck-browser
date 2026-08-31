@@ -177,6 +177,7 @@ class TabHibernationConfigTest {
     private val IDLE = TabHibernation.BusyState.IDLE
     private val MEDIA = TabHibernation.BusyState.PLAYING_MEDIA
     private val FULLSCREEN = TabHibernation.BusyState.FULLSCREEN
+    private val PIP = TabHibernation.BusyState.PICTURE_IN_PICTURE
 
     @Test
     fun `an idle tab hibernates immediately`() = runBlocking {
@@ -554,6 +555,331 @@ class TabHibernationConfigTest {
         // "input" was a state until the predicate behind it was cut; it must not linger.
         assertEquals(IDLE, TabHibernation.busyStateFromScriptResult("input"))
         assertEquals(MEDIA, TabHibernation.busyStateFromScriptResult("MEDIA"))
+        // A pop-out on screen. Hibernating disposes the handle and takes the window with it, and
+        // a pop-out only ever exists on a backgrounded tab - which is precisely the tab the idle
+        // timer is coming for.
+        assertEquals(PIP, TabHibernation.busyStateFromScriptResult("pip"))
+        assertEquals(PIP, TabHibernation.busyStateFromScriptResult("\"PIP\"  "))
+    }
+
+    /**
+     * The ordering inside the probe script, asserted here because it is the difference between a
+     * call surviving and being cut: a popped-out call is muted on the near side and its remote
+     * audio may go through Web Audio, so the media test can find nothing while a window on screen
+     * is showing the meeting. Reversing the two lines in BUSY_SCRIPT would report IDLE.
+     */
+    @Test
+    fun `a pop-out outranks playback in the probe script`() {
+        val script = TabHibernation.BUSY_SCRIPT
+
+        // Anchored on the RETURNED VALUES, not on each predicate's internals. Those internals
+        // have had to be re-chosen twice already - querySelectorAll, then volume - and the PR
+        // records a near-miss where an assertion was satisfied by a token belonging to a branch
+        // it was not about. The returns are unique and survive rewrites of the predicates.
+        // lastIndexOf for the pop-out returns, indexOf for media. TWO branches return 'pip',
+        // so a first-occurrence anchor is satisfied while the other one sits after the media
+        // check - verified by mutation: moving the element-PiP branch below media left this
+        // assertion passing. What has to hold is that EVERY pop-out check precedes playback.
+        val pipAt = script.lastIndexOf("'pip'")
+        val mediaAt = script.indexOf("'media'")
+        val shownAt2 = script.lastIndexOf("'shown'")
+        assertTrue(pipAt >= 0, "the probe no longer looks for a pop-out at all:\n$script")
+        // Both kinds. A site-owned pop-out is a Document PiP window and leaves
+        // pictureInPictureElement null, so the element check alone misses Meet entirely.
+        assertTrue(
+            script.contains("documentPictureInPicture.window"),
+            "the probe misses a Document PiP window, which is the kind Meet opens:\n$script",
+        )
+        // The pop-out this app actually uses reparents the tab's surface, so neither PiP API
+        // reports it - the page is simply visible while its tab is backgrounded.
+        val shownAt = script.indexOf("visibilityState")
+        assertTrue(
+            shownAt >= 0,
+            "the probe misses a surface pop-out, the kind BossConsole opens:\n$script",
+        )
+        // Compound, not visibility alone: a rendering mode that never reported a backgrounded
+        // tab as hidden would otherwise exempt every tab and disable hibernation outright. The
+        // playing-video test must sit INSIDE the condition that returns, not merely somewhere
+        // after it - the media check further down also mentions `paused`, and a window-based
+        // assertion was satisfied by that while the pairing was gone.
+        val returnsShownAt = script.indexOf("return 'shown'", shownAt)
+        assertTrue(
+            returnsShownAt > shownAt,
+            "the visibility check never returns 'shown':\n$script",
+        )
+        assertTrue(
+            script.indexOf("paused", shownAt) in shownAt..returnsShownAt,
+            "the visibility check is not paired with a playing-video test:\n$script",
+        )
+        assertTrue(mediaAt >= 0, "the probe no longer looks for playback:\n$script")
+        // pip -> media -> shown, and the media/shown order is load-bearing: 'shown' is DISCARDED
+        // when the host says this tab is not popped out, so anything audible has to have reported
+        // 'media' before that point or the discard would hibernate mid-playback.
+        assertTrue(pipAt < mediaAt, "a pop-out is tested after playback, so a muted call gets cut")
+        assertTrue(
+            mediaAt < shownAt2,
+            "'shown' is answered before audible playback, so discarding it can cut audio",
+        )
+    }
+
+    /**
+     * A handle whose class really declares the member, which a `Proxy` over the plugin's own
+     * (older) copy of `BrowserHandle` cannot do - the point of the reflective lookup is that the
+     * host's class carries members this plugin never compiled against.
+     */
+    private class PoppedOutHandle(
+        private val delegate: BrowserHandle,
+    ) : BrowserHandle by delegate {
+        @Suppress("unused")
+        fun isPoppedOut(): Boolean = true
+    }
+
+    /** A current host that answers "no" - which must beat the probe's inference. */
+    private class NotPoppedOutHandle(
+        private val delegate: BrowserHandle,
+    ) : BrowserHandle by delegate {
+        @Suppress("unused")
+        fun isPoppedOut(): Boolean = false
+    }
+
+    /** A host whose member exists and fails; the guard must degrade, not propagate. */
+    private class ThrowingPoppedOutHandle(
+        private val delegate: BrowserHandle,
+    ) : BrowserHandle by delegate {
+        @Suppress("unused")
+        fun isPoppedOut(): Boolean = error("host blew up")
+    }
+
+    private fun probeReturning(result: Any?): BrowserHandle =
+        Proxy.newProxyInstance(
+            BrowserHandle::class.java.classLoader,
+            arrayOf(BrowserHandle::class.java),
+        ) { _, _, _ -> result } as BrowserHandle
+
+    private fun explodingHandle(): BrowserHandle =
+        Proxy.newProxyInstance(
+            BrowserHandle::class.java.classLoader,
+            arrayOf(BrowserHandle::class.java),
+        ) { _, method, _ -> error("the page was probed: ${'$'}{method.name}") } as BrowserHandle
+
+    @Test
+    fun `the reflective lookup uses the JVM name Kotlin actually emits`() {
+        // Kotlin names an `is`-prefixed Boolean property's getter after the property, so the host
+        // method is `isPoppedOut()`. Looking for `getIsPoppedOut` throws, the lookup swallows it,
+        // and the guard silently protects nothing - so the name is pinned rather than trusted.
+        assertEquals(true, TabHibernation.poppedOutOrNull(PoppedOutHandle(explodingHandle())))
+    }
+
+    @Test
+    fun `a popped-out handle is busy without consulting the probe`() =
+        runBlocking {
+            // The stub errors on every call, so reaching SHOWN_IN_POP_OUT proves the flag was
+            // read and the page never probed - which is the whole point for a camera-off call,
+            // where the probe has nothing to find.
+            assertEquals(
+                TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = PoppedOutHandle(explodingHandle()),
+                    // Explicit: the default reads the real BOSS_BROWSER_AUTO_PIP, so a machine
+                    // with it exported would fail this for a reason unrelated to the assertion.
+                    popOutEnabled = true,
+                ),
+            )
+        }
+
+    @Test
+    fun `a host with no isPoppedOut member falls back to the probe`() =
+        runBlocking {
+            // An older host's handle has no such member at all. The lookup must answer false
+            // rather than throw, or every hibernation decision on that host fails.
+            val noMember = probeReturning("media")
+
+            assertEquals(null, TabHibernation.poppedOutOrNull(noMember))
+            // And the fallback this is named for: with no host answer, the probe decides.
+            assertEquals(
+                TabHibernation.BusyState.PLAYING_MEDIA,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = noMember,
+                    popOutEnabled = true,
+                ),
+            )
+        }
+
+    @Test
+    fun `fullscreen still outranks a popped-out handle`() =
+        runBlocking {
+            assertEquals(
+                TabHibernation.BusyState.FULLSCREEN,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = true,
+                    handle = PoppedOutHandle(explodingHandle()),
+                    popOutEnabled = true,
+                ),
+            )
+        }
+
+    @Test
+    fun `the off switch never kills a window already on screen`() =
+        runBlocking {
+            // An exact "yes" from the host means a floating window is on screen right now.
+            // Hibernating would dispose the handle and kill the call the user is watching, so
+            // the switch does not reach it - it stops the feature acting, not what it already did.
+            assertEquals(
+                TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = PoppedOutHandle(explodingHandle()),
+                    popOutEnabled = false,
+                ),
+            )
+        }
+
+    @Test
+    fun `a host answering false keeps PICTURE_IN_PICTURE`() =
+        runBlocking {
+            // The asymmetry, on the current-host path: someone who opened PiP by hand is exempt
+            // whatever the host says about pop-outs and whatever the switch says.
+            assertEquals(
+                TabHibernation.BusyState.PICTURE_IN_PICTURE,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = NotPoppedOutHandle(probeReturning("pip")),
+                    popOutEnabled = false,
+                ),
+            )
+        }
+
+    @Test
+    fun `the environment beats the host property`() {
+        assertFalse(TabHibernation.autoPopOutEnabled(fromEnvironment = "false", fromHost = "true"))
+        assertTrue(TabHibernation.autoPopOutEnabled(fromEnvironment = "true", fromHost = "false"))
+        // Nothing exported: the host decides.
+        assertFalse(TabHibernation.autoPopOutEnabled(fromEnvironment = null, fromHost = "off"))
+    }
+
+    @Test
+    fun `the off switch stops the probe's inference`() =
+        runBlocking {
+            // The probe must be gated too, not just the host flag. This used to pass
+            // probeReturning(null), so the probe answered IDLE before the interesting branch was
+            // reached and the assertion held for a reason unrelated to its name. 'shown' is the
+            // value that actually exercises it.
+            assertEquals(
+                TabHibernation.BusyState.IDLE,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    // An OLD host (no member), so the inference is all there is - which is
+                    // exactly what the switch gates. A PoppedOutHandle would return an exact
+                    // "yes" and be honoured regardless, which is a different rule.
+                    handle = probeReturning("shown"),
+                    popOutEnabled = false,
+                ),
+            )
+        }
+
+    @Test
+    fun `a host answering false beats the probe's inference`() =
+        runBlocking {
+            // The inference is for hosts that cannot answer. A current host saying "not popped
+            // out" is exact, and letting a muted-autoplay page override it is the silent
+            // process-tree leak this file exists to prevent.
+            assertEquals(
+                TabHibernation.BusyState.IDLE,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = NotPoppedOutHandle(probeReturning("shown")),
+                    popOutEnabled = true,
+                ),
+            )
+        }
+
+    @Test
+    fun `an old host still gets the inference`() =
+        runBlocking {
+            // No such member, so null - the probe is all there is, and it must still exempt.
+            assertEquals(
+                TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = probeReturning("shown"),
+                    popOutEnabled = true,
+                ),
+            )
+        }
+
+    @Test
+    fun `audible playback is never discarded by the off switch`() =
+        runBlocking {
+            // The audio-cutting path. 'shown' is discarded when the switch is off, so anything
+            // audible must have reported 'media' first - the script's ordering guarantees it,
+            // and this pins the consequence: hibernation never cuts audio.
+            assertEquals(
+                TabHibernation.BusyState.PLAYING_MEDIA,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = probeReturning("media"),
+                    popOutEnabled = false,
+                ),
+            )
+        }
+
+    @Test
+    fun `a host whose isPoppedOut throws does not take hibernation with it`() =
+        runBlocking {
+            // The member exists and blows up. That must read as "no answer" and fall through to
+            // the probe, not propagate and kill every hibernation decision.
+            assertEquals(
+                TabHibernation.BusyState.PLAYING_MEDIA,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = ThrowingPoppedOutHandle(probeReturning("media")),
+                    popOutEnabled = true,
+                ),
+            )
+        }
+
+    @Test
+    fun `the off switch does not touch a hand-opened picture-in-picture`() =
+        runBlocking {
+            // Deliberate asymmetry: the setting is about the AUTOMATIC pop-out. Someone who
+            // opened PiP from the context menu did it by hand, and cutting that would be a
+            // different feature's decision.
+            assertEquals(
+                TabHibernation.BusyState.PICTURE_IN_PICTURE,
+                TabHibernation.busyStateFor(
+                    fullscreenBlocks = false,
+                    handle = probeReturning("pip"),
+                    popOutEnabled = false,
+                ),
+            )
+        }
+
+    @Test
+    fun `an absent host property leaves the pop-out guard on`() {
+        // A plugin on a host too old to publish the key must not switch the guard off and start
+        // cutting calls, so anything unparseable - absent included - reads as ON.
+        // Against the constant, so a rename that desyncs from the host cannot pass here.
+        assertEquals("BOSS_BROWSER_AUTO_PIP", TabHibernation.AUTO_POP_OUT_KEY)
+        assertTrue(TabHibernation.autoPopOutEnabled(fromHost = null))
+        assertTrue(TabHibernation.autoPopOutEnabled(fromHost = "maybe"))
+        assertTrue(TabHibernation.autoPopOutEnabled(fromHost = "true"))
+        assertFalse(TabHibernation.autoPopOutEnabled(fromHost = "false"))
+        assertFalse(TabHibernation.autoPopOutEnabled(fromHost = " OFF "))
+    }
+
+    @Test
+    fun `a shown result maps to the pop-out state`() {
+        assertEquals(
+            TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+            TabHibernation.busyStateFromScriptResult("shown"),
+        )
+        // Quoted and cased the way a marshalling change could deliver it.
+        assertEquals(
+            TabHibernation.BusyState.SHOWN_IN_POP_OUT,
+            TabHibernation.busyStateFromScriptResult("\"SHOWN\""),
+        )
     }
 
     @Test

@@ -972,11 +972,17 @@ internal object TabHibernation {
      * Why a tab should not hibernate right now, if it should not.
      *
      * Separate states rather than one boolean, because the reason has to survive as far as the
-     * log line and the caller's decision. [PLAYING_MEDIA] and [FULLSCREEN] currently get the same
-     * treatment in [awaitQuiet] - both are transient and both are waited out - but they are not
-     * interchangeable: conflating busy-ness into one flag produced a genuinely worse outcome than
-     * not deferring at all, and the distinction is what lets [awaitQuiet] tell a changed reason
-     * from a continuing one.
+     * log line and the caller's decision. Every non-idle state gets the same treatment in
+     * [awaitQuiet] - all are waited out - but they are not interchangeable: conflating busy-ness
+     * into one flag produced a genuinely worse outcome than not deferring at all, and the
+     * distinction is what lets [awaitQuiet] tell a changed reason from a continuing one.
+     *
+     * They are not all transient in the same sense, and the difference matters at the bound.
+     * Playback and fullscreen end on their own within minutes. A call does not: it routinely
+     * outlives [MAX_RECHECKS], so a popped-out tab reaches the "left alone" ending rather than
+     * the "waited out" one, and keeps its process tree until the user visits it again. That is
+     * the deliberate trade already written into [MAX_RECHECKS] - a bound on polling must not
+     * become a licence to cut the call.
      */
     enum class BusyState(val skipReason: String) {
         /** Nothing in the way; hibernate. */
@@ -993,6 +999,58 @@ internal object TabHibernation {
          * the user is actually looking at.
          */
         FULLSCREEN("tab still in fullscreen"),
+
+        /**
+         * A Picture-in-Picture window is on screen showing this tab's video.
+         *
+         * Hibernating disposes the handle, which takes the pop-out with it - and a pop-out is by
+         * definition on a backgrounded tab, so without this the idle timer arms the moment the
+         * feature does its job and kills the call it just rescued. Waited out like the other
+         * non-idle states, though a call - unlike playback - routinely outlives [MAX_RECHECKS]
+         * and reaches the "left alone" ending rather than the "waited out" one.
+         *
+         * Probed rather than known locally, unlike [FULLSCREEN]: the pop-out belongs to the
+         * document (`document.pictureInPictureElement`), and this is true whether the host popped
+         * it out on a tab switch or the user asked for it from the context menu - the second case
+         * was already being cut off before any of this existed.
+         *
+         * **Top document only**, like every other probe here: a pop-out opened from inside a
+         * cross-origin iframe is invisible to it, and that tab hibernates. Same known gap the
+         * media probe carries, and it fails toward hibernating rather than exempting.
+         */
+        PICTURE_IN_PICTURE("tab still in picture-in-picture"),
+
+        /**
+         * The host is showing this backgrounded tab somewhere - it is popped out.
+         *
+         * BossConsole's pop-out no longer uses either Picture-in-Picture API. It reparents the
+         * tab's **real rendering surface** into a floating window (BossConsole#282), because a
+         * hidden tab cannot be made to render a live call: its DOM never mounts new elements and
+         * Meet's SFU will not even forward video for tiles the client is not drawing. So
+         * [PICTURE_IN_PICTURE] probes for a window that is no longer opened, and this state is
+         * what actually protects a popped-out call from the idle timer.
+         *
+         * **This is now the fallback, not the primary.** [busyStateFor] asks the host first
+         * through `BrowserHandle.isPoppedOut`, which is exact; this probe only answers for a host
+         * too old to have that member.
+         *
+         * The pairing with a playing `<video>` is a bound on the damage a wrong premise could do,
+         * not a description of a call. Measured on this build (2026-08-30): a backgrounded tab
+         * really does report `hidden` and an active one `visible`, both ways, so visibility alone
+         * would in fact be correct here. The pairing stays because the cost of the premise being
+         * wrong in some untested rendering mode is silently exempting every tab and disabling
+         * hibernation, which exists to stop this app leaking process trees - and note that muted
+         * autoplay `<video>` is common enough (hero videos, timelines, GIF-as-video) that the
+         * pairing is a weaker bound than it looks.
+         *
+         * Mute state is deliberately not consulted, unlike [PLAYING_MEDIA]: a call's own
+         * self-view is muted by definition and its remote audio may run through Web Audio.
+         *
+         * **Known gap this cannot close:** a call with every camera off has no playing video at
+         * all, so on an old host it is not detected here and the tab hibernates. That is exactly
+         * what the host flag exists for.
+         */
+        SHOWN_IN_POP_OUT("tab still on screen in a pop-out"),
     }
 
     /**
@@ -1003,12 +1061,148 @@ internal object TabHibernation {
      * rendering it into. Extracted from the hibernation job so the selection itself is
      * testable, not just the policy it feeds.
      */
-    internal suspend fun busyStateFor(fullscreenBlocks: Boolean, handle: BrowserHandle?): BusyState =
-        when {
-            fullscreenBlocks -> BusyState.FULLSCREEN
-            handle == null -> BusyState.IDLE
-            else -> busyState(handle)
+    internal suspend fun busyStateFor(
+        fullscreenBlocks: Boolean,
+        handle: BrowserHandle?,
+        popOutEnabled: Boolean = autoPopOutEnabled(),
+    ): BusyState {
+        if (fullscreenBlocks) return BusyState.FULLSCREEN
+        if (handle == null) return BusyState.IDLE
+        // Dispatchers.IO is what carries the weight here: poppedOutOrNull is a blocking
+        // reflective call with no suspension point, so withTimeoutOrNull cannot abandon it - the
+        // bound is advisory, exactly as busyState documents for its own probe. What IO buys is
+        // that a host which blocks does not take the UI dispatcher down with it. The timeout
+        // still matters for the surrounding coroutine, and reads as "no answer" - the null case.
+        val hostSays =
+            withTimeoutOrNull(BUSY_CHECK_TIMEOUT_MS) {
+                withContext(Dispatchers.IO) { poppedOutOrNull(handle) }
+            }
+        // Unconditional, NOT gated on popOutEnabled. With the switch off the host stops opening
+        // new pop-outs, but one already on screen stays open - and hibernating then disposes the
+        // handle while the user is watching that window, killing the call in front of them. The
+        // switch exists to stop the feature acting, not to destroy what it already did. Acting on
+        // a stale flag would cost one leaked process tree until the next tab visit; acting on this
+        // one costs a visibly destroyed call, and those are not the same mistake.
+        if (hostSays == true) return BusyState.SHOWN_IN_POP_OUT
+        return busyState(handle).let {
+            // The 'shown' inference exists for hosts that CANNOT answer. A host that answered
+            // false is exact, and the inference must not override it - otherwise any
+            // muted-autoplay page (hero videos, timelines, GIF-as-video) on a tab reporting
+            // itself visible is exempt, which is the silent process-tree leak this file exists
+            // to prevent. Same when the feature is switched off: there is nothing to protect.
+            //
+            // Degrading to IDLE is safe ONLY because the script answers audible playback BEFORE
+            // it answers 'shown', so anything audible has already reported 'media' and never
+            // reaches this line - that is the guarantee that hibernation never cuts audio.
+            // Reordering the script without reading this would break it silently.
+            //
+            // PICTURE_IN_PICTURE is deliberately untouched: someone who opened PiP from the
+            // context menu did it by hand and did not ask this setting anything.
+            if (it == BusyState.SHOWN_IN_POP_OUT && (!popOutEnabled || hostSays == false)) {
+                BusyState.IDLE
+            } else {
+                it
+            }
         }
+    }
+
+    /**
+     * Whether the host's automatic pop-out is switched on, published as a system property.
+     *
+     * Both halves of the feature read one key: the host decides whether to pop a call out, this
+     * decides whether to keep a popped-out tab alive, and they must agree. With it off there is
+     * nothing to protect, so honouring it here keeps a stale `isPoppedOut` - a window the host has
+     * not closed yet, say - from exempting a tab the user has asked to be left alone.
+     *
+     * A system property rather than plugin-api for the reason this file already documents about
+     * the resource tier: plugins cannot read host settings, and the alternative is an api release.
+     * Absent or unparseable means ON, matching the host's default: a plugin running against a host
+     * too old to publish the key must not switch the guard off and start cutting calls.
+     */
+    internal fun autoPopOutEnabled(
+        fromEnvironment: String? = System.getenv(AUTO_POP_OUT_KEY),
+        fromHost: String? = System.getProperty(AUTO_POP_OUT_KEY),
+    ): Boolean = (fromEnvironment ?: fromHost)?.trim()?.lowercase() !in FALSY
+
+    /** Resolved once per host class; empty means the host has no such member. */
+    private val poppedOutMethods =
+        java.util.concurrent.ConcurrentHashMap<Class<*>, java.util.Optional<java.lang.reflect.Method>>()
+
+    /** Host classes already warned about, so a deterministic failure does not log per probe. */
+    private val poppedOutWarned = java.util.concurrent.ConcurrentHashMap.newKeySet<Class<*>>()
+
+    /**
+     * Whether the host is showing this tab in a pop-out: true, false, or **null** for a host
+     * with no such member.
+     *
+     * Tri-state on purpose. Collapsing "old host" and "a current host saying no" into `false`
+     * left the `'shown'` inference authoritative on current hosts too, which is not what it is
+     * for: a host that answered is exact, and a muted-autoplay page must not talk its way past
+     * it into a permanent exemption.
+     *
+     * Reflective because `BrowserHandle.isPoppedOut` is defaulted and recent: naming it directly
+     * would compile against a newer api than an installed host may carry, and a plugin
+     * referencing a member the host's copy lacks is rejected wholesale by
+     * BinaryCompatibilityValidator - which for this plugin reads as "my browser disappeared".
+     *
+     * `isPoppedOut`, NOT `getIsPoppedOut`: Kotlin leaves an `is`-prefixed Boolean property's
+     * getter named after the property (verified with javap against the host class).
+     * `setAccessible`, because the lookup resolves against the host's IMPLEMENTATION class -
+     * which is the point, it carries members this plugin never compiled against - and a
+     * non-public impl would otherwise throw IllegalAccessException into a catch that reads it as
+     * "old host" and leaves the guard off for good.
+     *
+     * The `Method` is cached per class: `Class.getMethod` copies the declared-method array on
+     * every call, and this runs on every probe.
+     */
+    internal fun poppedOutOrNull(handle: BrowserHandle): Boolean? {
+        val type = handle.javaClass
+        val resolved =
+            poppedOutMethods.computeIfAbsent(type) {
+                try {
+                    val method = it.getMethod("isPoppedOut")
+                    // Best-effort, and separately caught: an InaccessibleObjectException (a public
+                    // method on a class in a non-exported module under JPMS) or a SecurityException
+                    // would otherwise discard a Method that very likely invokes fine, cache the
+                    // miss, and disable the guard for this host class for the life of the process -
+                    // the exact outcome setAccessible is here to avoid.
+                    runCatching { method.isAccessible = true }
+                    java.util.Optional.of(method)
+                } catch (_: NoSuchMethodException) {
+                    // The expected, benign case: a host older than the member. Not warned.
+                    java.util.Optional.empty()
+                } catch (
+                    @Suppress("TooGenericExceptionCaught") e: Exception,
+                ) {
+                    warnPoppedOut(type, "could not resolve isPoppedOut", e)
+                    java.util.Optional.empty()
+                }
+            }
+        val method = resolved.orElse(null) ?: return null
+        return try {
+            method.invoke(handle) as? Boolean
+        } catch (
+            @Suppress("TooGenericExceptionCaught") e: Exception,
+        ) {
+            // The member exists and the call failed, so the guard is off and nobody would
+            // otherwise know. Null rather than false: "the host did not answer" is exactly this
+            // case, and false would be taken as an exact "not popped out".
+            warnPoppedOut(type, "could not read isPoppedOut", e)
+            null
+        }
+    }
+
+    /** Warns once per host class: awaitQuiet probes many times per cycle, per tab. */
+    private fun warnPoppedOut(
+        type: Class<*>,
+        what: String,
+        error: Throwable,
+    ) {
+        if (!poppedOutWarned.add(type)) return
+        // println, matching every other hibernation line in this file, so the field check the PR
+        // asks for lands in the same sink as the rest.
+        println("[FluckBrowser] hibernation: $what from ${type.name}; pop-out guard off: $error")
+    }
 
     /**
      * Whether hibernating this tab right now would cut audible playback.
@@ -1066,8 +1260,8 @@ internal object TabHibernation {
      * Waits for a backgrounded tab to become quiet. Returns the state it settled on:
      * [BusyState.IDLE] means hibernate now, anything else is the reason not to.
      *
-     * Busy states are distinguished for their reason strings; both non-idle states get the same
-     * treatment, because both are transient and both are worth waiting out:
+     * Busy states are distinguished for their reason strings; every non-idle state gets the same
+     * treatment, because each is worth waiting out:
      *
      *  - [BusyState.PLAYING_MEDIA] is transient, so it is worth waiting out. Rechecks back off
      *    from [MEDIA_RECHECK_MS] toward [MAX_RECHECK_MS] so a three-hour video does not cost a
@@ -1133,9 +1327,25 @@ internal object TabHibernation {
      */
     internal fun busyStateFromScriptResult(result: Any?): BusyState =
         when (result?.toString()?.trim()?.trim('"')?.lowercase()) {
+            "pip" -> BusyState.PICTURE_IN_PICTURE
+            "shown" -> BusyState.SHOWN_IN_POP_OUT
             "media" -> BusyState.PLAYING_MEDIA
             else -> BusyState.IDLE
         }
+
+    /**
+     * The host's automatic-pop-out switch, published as a system property.
+     *
+     * `BOSS_BROWSER_*`, matching the swipe key in `HomeSwipeNavigation` - NOT the `boss.browser.*`
+     * shape of `HOST_ENABLED_PROPERTY` and `HOST_IDLE_PROPERTY`, because this is the same
+     * one-key-two-repos arrangement as the swipe setting rather than a hibernation tunable.
+     * Cross-checked against `AutoPipSettingsManager.KEY` in BossConsole#282: a mismatch is silent
+     * and one-directional, leaving the guard on while the off switch simply never works.
+     *
+     * Read from the environment as well as the property, as the swipe key is: an exported
+     * variable is the operator's outer escape hatch when the host is not publishing.
+     */
+    internal const val AUTO_POP_OUT_KEY = "BOSS_BROWSER_AUTO_PIP"
 
     private const val BUSY_CHECK_TIMEOUT_MS = 2_000L
 
@@ -1156,12 +1366,40 @@ internal object TabHibernation {
      */
     internal const val MAX_RECHECKS = 40
 
-    private const val BUSY_SCRIPT =
+    /**
+     * `internal` only so the ordering test can read it - it has no other caller outside this
+     * object, and the script cannot be tested any other way without a JS engine.
+     */
+    internal const val BUSY_SCRIPT =
         "(function(){try{" +
-            "return Array.prototype.slice.call(document.querySelectorAll('video,audio'))" +
+            // Asked first: a PiP window is on screen showing this tab, and neither check below
+            // would necessarily notice it.
+            "if (document.pictureInPictureElement) return 'pip';" +
+            // A site-owned pop-out is a separate window, not an element in this document, so
+            // pictureInPictureElement stays null for it - the kind Google Meet opens.
+            "if (window.documentPictureInPicture && documentPictureInPicture.window) return 'pip';" +
+            // Audible playback is answered BEFORE the pop-out inference below, deliberately.
+            // Both exempt the tab, so the order changes no hibernation decision on its own - but
+            // it decides which REASON is reported, and that matters at the boundary: 'shown' is
+            // DISCARDED when the host says this tab is not popped out, and discarding it while
+            // it was covering audible playback would hibernate mid-play. With this order,
+            // anything audible has already returned 'media' and is never at risk.
+            "var media = Array.prototype.slice.call(document.querySelectorAll('video,audio'))" +
             ".some(function(m){" +
             "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
-            "}) ? 'media' : '';" +
+            "});" +
+            "if (media) return 'media';" +
+            // The surface pop-out this app uses reparents the tab's real rendering surface into
+            // a floating window, so neither PiP API reports it - the page is simply visible
+            // while its tab is backgrounded. Paired with a playing video so a rendering mode
+            // that never reported a backgrounded tab as hidden cannot exempt every tab. Mute is
+            // not consulted here: a call's self-view is muted by definition, and anything
+            // audible already returned above.
+            "if (document.visibilityState === 'visible' && " +
+            "Array.prototype.slice.call(document.querySelectorAll('video'))" +
+            ".some(function(v){return !v.paused && !v.ended && v.currentTime > 0;})) " +
+            "return 'shown';" +
+            "return '';" +
             "}catch(e){return '';}})()"
 
     /**
@@ -2894,7 +3132,8 @@ internal fun FluckBrowserTabContent(
                         idleMsNow = { withContext(Dispatchers.IO) { TabHibernation.effectiveIdleMs() } },
                         sleep = { delay(it) },
                     )
-                    // Audible and fullscreen tabs are waited out rather than cut off mid-play.
+                    // A tab that is audible, fullscreen, or showing a call in a pop-out is waited
+                    // out rather than cut off mid-play.
                     val busy =
                         TabHibernation.awaitQuiet(
                             probe = {
