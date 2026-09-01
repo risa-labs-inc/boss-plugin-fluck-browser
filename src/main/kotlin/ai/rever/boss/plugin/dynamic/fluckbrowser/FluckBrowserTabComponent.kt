@@ -1562,46 +1562,29 @@ private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Po
  * settled - not at `DOMContentLoaded`, which loses a race with any page that re-renders after
  * load (an SPA's own hydration undoing the very scroll this just applied).
  *
- * The one-shot re-apply after [RESTORE_REAPPLY_DELAY_MS] exists because that hydration race is
- * real but bounded: something in the page moved the scroll position shortly after first paint.
- * Applying twice, a beat apart, catches that without any MutationObserver machinery for what is,
- * in the failure case, a scroll offset - not something worth a settle-detector's complexity.
- *
- * [ScrollRestore.Position.isOrigin] is skipped outright: restoring to (0,0) is a no-op wrapped
- * in two JS round trips on every single wake, for the common case of a page that was at the top
- * anyway.
+ * A thin binding over [ScrollRestore.awaitSettleAndApply] - see that function's KDoc for why the
+ * settle signal is document height rather than `readyState` (which fires well before a JS-heavy
+ * page finishes rendering its real content), and for the loop-correctness bug this replaced.
  */
 private suspend fun restoreScrollOnSettle(
     handle: BrowserHandle,
     target: ScrollRestore.Position,
 ) {
-    if (target.isOrigin) return
-    repeat(RESTORE_SETTLE_MAX_POLLS) {
-        val ready =
-            runCatching { handle.executeJavaScript("document.readyState") }
-                .getOrNull()
-                ?.toString()
-                ?.trim('"')
-        if (ready == "complete") return@repeat
-        kotlinx.coroutines.delay(RESTORE_SETTLE_POLL_MS)
-    }
-    runCatching { handle.executeJavaScript(ScrollRestore.restoreJs(target)) }
-    kotlinx.coroutines.delay(RESTORE_REAPPLY_DELAY_MS)
-    val landed =
-        runCatching { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }
-            .getOrNull()
-            ?.let { ScrollRestore.parseCapture(it) }
-    if (landed != null && landed != target) {
-        runCatching { handle.executeJavaScript(ScrollRestore.restoreJs(target)) }
+    val settled =
+        ScrollRestore.awaitSettleAndApply(
+            target = target,
+            readHeight = { handle.executeJavaScript("document.documentElement.scrollHeight")?.toString() },
+            applyScroll = { handle.executeJavaScript(ScrollRestore.restoreJs(target)) },
+            readPosition = { handle.executeJavaScript(ScrollRestore.CAPTURE_JS)?.let { ScrollRestore.parseCapture(it) } },
+            delay = { kotlinx.coroutines.delay(it) },
+        )
+    if (!settled) {
+        // Logged for the same reason a skipped hibernation is: "the scroll position didn't
+        // restore" is otherwise indistinguishable in the field from "restore is broken" versus
+        // "this particular page never stops resizing".
+        println("[FluckBrowser] Scroll restore: page height never settled within the cap")
     }
 }
-
-/** 150ms x 20 = 3s cap on waiting for `document.readyState === 'complete'` before restoring anyway. */
-private const val RESTORE_SETTLE_MAX_POLLS = 20
-private const val RESTORE_SETTLE_POLL_MS = 150L
-
-/** Gap before the one re-apply pass, to catch an SPA's own post-load layout undoing the restore. */
-private const val RESTORE_REAPPLY_DELAY_MS = 300L
 
 /** Dispose a handle off the UI thread — dispose() ends in a blocking Chromium IPC round-trip. */
 internal fun disposeBrowserHandleOffThread(handle: BrowserHandle) {
