@@ -1545,6 +1545,64 @@ private val browserDisposeExecutor = java.util.concurrent.Executors.newCachedThr
     Thread(r, "fluck-browser-dispose").apply { isDaemon = true }
 }
 
+/**
+ * Reads [ScrollRestore.CAPTURE_JS] off a still-live handle, right before it is disposed.
+ *
+ * 1 second is generous for a synchronous DOM read and short enough that a wedged renderer
+ * cannot delay the dispose it is about to receive anyway. Any failure - timeout, thrown,
+ * malformed result - degrades to "nothing to restore", never to a stale or wrong position.
+ */
+private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Position? =
+    runCatching {
+        withTimeoutOrNull(1_000L) { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }
+    }.getOrNull()?.let { ScrollRestore.parseCapture(it) }
+
+/**
+ * Applies a captured scroll position to a freshly (re)created handle, once the document has
+ * settled - not at `DOMContentLoaded`, which loses a race with any page that re-renders after
+ * load (an SPA's own hydration undoing the very scroll this just applied).
+ *
+ * The one-shot re-apply after [RESTORE_REAPPLY_DELAY_MS] exists because that hydration race is
+ * real but bounded: something in the page moved the scroll position shortly after first paint.
+ * Applying twice, a beat apart, catches that without any MutationObserver machinery for what is,
+ * in the failure case, a scroll offset - not something worth a settle-detector's complexity.
+ *
+ * [ScrollRestore.Position.isOrigin] is skipped outright: restoring to (0,0) is a no-op wrapped
+ * in two JS round trips on every single wake, for the common case of a page that was at the top
+ * anyway.
+ */
+private suspend fun restoreScrollOnSettle(
+    handle: BrowserHandle,
+    target: ScrollRestore.Position,
+) {
+    if (target.isOrigin) return
+    repeat(RESTORE_SETTLE_MAX_POLLS) {
+        val ready =
+            runCatching { handle.executeJavaScript("document.readyState") }
+                .getOrNull()
+                ?.toString()
+                ?.trim('"')
+        if (ready == "complete") return@repeat
+        kotlinx.coroutines.delay(RESTORE_SETTLE_POLL_MS)
+    }
+    runCatching { handle.executeJavaScript(ScrollRestore.restoreJs(target)) }
+    kotlinx.coroutines.delay(RESTORE_REAPPLY_DELAY_MS)
+    val landed =
+        runCatching { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }
+            .getOrNull()
+            ?.let { ScrollRestore.parseCapture(it) }
+    if (landed != null && landed != target) {
+        runCatching { handle.executeJavaScript(ScrollRestore.restoreJs(target)) }
+    }
+}
+
+/** 150ms x 20 = 3s cap on waiting for `document.readyState === 'complete'` before restoring anyway. */
+private const val RESTORE_SETTLE_MAX_POLLS = 20
+private const val RESTORE_SETTLE_POLL_MS = 150L
+
+/** Gap before the one re-apply pass, to catch an SPA's own post-load layout undoing the restore. */
+private const val RESTORE_REAPPLY_DELAY_MS = 300L
+
 /** Dispose a handle off the UI thread — dispose() ends in a blocking Chromium IPC round-trip. */
 internal fun disposeBrowserHandleOffThread(handle: BrowserHandle) {
     browserDisposeExecutor.execute {
@@ -1897,6 +1955,14 @@ internal class FluckBrowserTabState {
     var lateAdoptNudged: Deferred<BrowserHandle?>? = null
     // Pending idle-hibernation timer (armed when the tab is backgrounded, cancelled if it returns).
     var hibernationJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Scroll position captured the instant before a hibernation dispose, consumed (set back to
+     * null) the moment it is applied on wake. Plain var, not `mutableStateOf` - like
+     * [hibernationJob], nothing in the UI reads this; it exists purely for the wake effect to
+     * hand off to itself across the dispose/recreate boundary.
+     */
+    var savedScroll: ScrollRestore.Position? = null
     var isLoading: Boolean by mutableStateOf(false)
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
     var pageTitle: String by mutableStateOf("New Tab")
@@ -2593,6 +2659,16 @@ internal fun FluckBrowserTabContent(
                     initMessage = it.initMessage
                 }
 
+                // Consumed once: a plain retry or crash-recovery on the SAME creation must not
+                // re-apply a scroll position from a previous life of this tab. Launched on
+                // coroutineScope (not this LaunchedEffect's own scope) so a tab switch away
+                // mid-restore does not cancel it - the settle-poll runs for at most
+                // RESTORE_SETTLE_MAX_POLLS * RESTORE_SETTLE_POLL_MS regardless.
+                hoistedState.savedScroll?.let { target ->
+                    hoistedState.savedScroll = null
+                    coroutineScope.launch { restoreScrollOnSettle(handle, target) }
+                }
+
                 // Register this tab+handle so the co-browse share server can enumerate
                 // and stream it. Re-registers under the same tabId on a recovery re-init.
                 if (tabId.isNotEmpty()) BrowserShareManager.registerTab(tabId, handle)
@@ -3203,9 +3279,18 @@ internal fun FluckBrowserTabContent(
                     }
                     println("[FluckBrowser] Hibernating idle tab to release its renderer")
                     val handle = hoistedState.releaseBrowserHandle()
-                    // Off the UI thread so hibernating a background tab can't hitch
-                    // the foreground UI.
-                    if (handle != null) disposeBrowserHandleOffThread(handle)
+                    if (handle != null) {
+                        // MUST complete before dispose is even posted, not run concurrently with
+                        // it - executeJavaScript against a handle that is mid-dispose is
+                        // undefined JxBrowser behaviour, the same uncatchable native-crash class
+                        // the whole ladder plan was built to stay clear of. Sequencing this
+                        // suspend call ahead of disposeBrowserHandleOffThread is what makes that
+                        // true; do not parallelise the two.
+                        hoistedState.savedScroll = captureScrollOrNull(handle)
+                        // Off the UI thread so hibernating a background tab can't hitch
+                        // the foreground UI.
+                        disposeBrowserHandleOffThread(handle)
+                    }
                 }
             }
         }
