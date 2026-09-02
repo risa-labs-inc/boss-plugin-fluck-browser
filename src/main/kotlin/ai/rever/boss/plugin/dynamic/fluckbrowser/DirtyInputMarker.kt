@@ -55,31 +55,31 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  * the property undefined, so navigation resets the flag for free - submit-and-navigate clears
  * it with no bookkeeping.
  *
- * A PR review flagged this as the single host assumption the whole feature rests on and worth
- * confirming rather than trusting the API's own KDoc ("called when the browser navigates" says
- * nothing about start-vs-commit): the host's implementation fires this listener specifically
- * from its `NavigationFinished` handler, with a comment on that exact call site noting it "fires
- * on navigation completion" - not from `NavigationStarted`. Commit semantics confirmed.
+ * This is the single host assumption the whole feature rests on, and the API's own KDoc ("called
+ * when the browser navigates") does not settle start-vs-commit on its own: confirmed against the
+ * host's implementation, which fires this listener from its `NavigationFinished` handler
+ * specifically, with a comment on that exact call site noting it "fires on navigation completion" -
+ * not from `NavigationStarted`.
  *
  * ## What it deliberately misses, so the next reader does not "fix" it
  *
  * - Mouse-only edits (a checkbox toggled, a select chosen by mouse, drag-and-drop text).
  *   Trusted `change`/`click` could catch them, but Chromium fires trusted change events for
  *   autofill too, which reopens the 20-hour login-page exemption. Redoing a click is cheap;
- *   retyping a paragraph is not. The guard protects typing. A PR review noted the one apparent
- *   exception: keyboard type-ahead on a focused `<select>` (pressing a letter to jump to a
- *   matching option) DOES mark dirty, because it is a `keydown` with a length-1 key like any
- *   other. Not actually an inconsistency - a keystroke that changed the select's value is
- *   typing by this guard's own definition; it is *mouse-driven* select changes specifically that
- *   are missed, not select changes in general.
+ *   retyping a paragraph is not. The guard protects typing. One apparent exception: keyboard
+ *   type-ahead on a focused `<select>` (pressing a letter to jump to a matching option) DOES mark
+ *   dirty, because it is a `keydown` with a length-1 key like any other. Not actually an
+ *   inconsistency - a keystroke that changed the select's value is typing by this guard's own
+ *   definition; it is *mouse-driven* select changes specifically that are missed, not select
+ *   changes in general.
  * - Typing inside frames. The listener runs in the main frame only; a cross-origin frame was
  *   never reachable, and a same-origin frame is deferred until this is worth per-frame plumbing.
  *   A shadow-DOM editor is missed for the same practical reason: a keystroke inside one retargets
  *   `e.target` to the shadow host, where `isContentEditable` is typically false.
- * - An SPA submit that never navigates leaves the flag set, so the tab is "left alone" at the
- *   recheck limit - the same bounded trade SHOWN_IN_POP_OUT makes for calls, and the safe
- *   direction: a leaked process tree costs memory until the next visit; a discarded draft costs
- *   the user's work.
+ * - A submit whose own handler throws before clearing anything else client-side still clears this
+ *   flag - the listener runs in capture phase, ahead of the page's own submit handlers, and only
+ *   checks `isTrusted`. A submit is treated as strong-enough evidence the user is done, not proof
+ *   the data reached a server; see the `clear` listener's own doc for the trade this makes.
  */
 internal object DirtyInputMarker {
     /**
@@ -112,19 +112,30 @@ internal object DirtyInputMarker {
      *
      * Capture phase, so a page that stops propagation on its own editor cannot hide typing from
      * the guard - the same reasoning CredentialCapture documents for its submit listeners.
-     * Listeners remove themselves once the flag is set: after the first real keystroke there is
-     * nothing left to learn.
+     * Listeners stay attached for the document's whole lifetime rather than removing themselves
+     * once the flag is set - see the `submit` listener below for why "nothing left to learn"
+     * stopped being true.
      *
-     * **Accepted over-triggering, a codex red-team finding on an earlier revision:** an IME
-     * session that is STARTED then cancelled (Escape, no text committed) still marks the flag,
-     * permanently, since there is no `compositionend` handling to tell a committed composition
-     * from an empty one. This is the same deliberate bias every over-triggering case in this file
-     * already carries - a false positive keeps a process alive an idle cycle longer; a false
-     * negative destroys work - so it is left as-is rather than added complexity to distinguish
-     * "composition happened" from "composition produced text". The install-timing race this
-     * shares with the keydown listener (a marker installed after the user's first input event
-     * cannot retroactively see it) is likewise pre-existing, not new here - see "Install timing"
-     * above.
+     * A trusted `submit` (capture phase) resets the flag to `0`. Without it, one keystroke into a
+     * search box exempts a long-lived SPA tab (Gmail, Slack, Jira, Linear-shaped apps) from
+     * hibernation for the rest of its document lifetime, which is exactly the class of heavy,
+     * long-lived renderer hibernation exists to reclaim. Classic forms already clear the flag for
+     * free on navigation; this covers the SPA case that `preventDefault()`s the submit and never
+     * navigates - the `submit` event still fires either way, so the listener does not need to know
+     * whether the app went on to navigate.
+     *
+     * This is a real trade in the opposite direction from every other over-triggering case in this
+     * file: a submit is evidence the work was likely saved, not certain proof - a client-side
+     * validation failure or a network error can fire `submit` and still lose the draft if
+     * hibernation lands in the narrow gap before the user notices and resumes typing. Accepted
+     * because the alternative (permanent exemption) costs more of hibernation's actual benefit
+     * than this narrow window costs in risk.
+     *
+     * **Accepted over-triggering:** an IME session that is STARTED then cancelled (Escape, no text
+     * committed) still marks the flag, since there is no `compositionend` handling to tell a
+     * committed composition from an empty one. Same bias as above - a false positive keeps a
+     * process alive an idle cycle longer, a false negative destroys work - left as-is rather than
+     * adding complexity to distinguish "composition happened" from "composition produced text".
      */
     const val INSTALL_JS: String =
         "(function(){try{" +
@@ -149,14 +160,15 @@ internal object DirtyInputMarker {
             "if (k.length !== 1 && k !== 'Backspace' && k !== 'Delete') return;" +
             "}" +
             "window.$DIRTY_FLAG_PROPERTY = 1;" +
-            "window.removeEventListener('keydown', mark, true);" +
-            "window.removeEventListener('paste', mark, true);" +
-            "window.removeEventListener('cut', mark, true);" +
-            "window.removeEventListener('compositionstart', mark, true);" +
+            "};" +
+            "var clear = function(e){" +
+            "if (!e.isTrusted) return;" +
+            "window.$DIRTY_FLAG_PROPERTY = 0;" +
             "};" +
             "window.addEventListener('keydown', mark, true);" +
             "window.addEventListener('paste', mark, true);" +
             "window.addEventListener('cut', mark, true);" +
             "window.addEventListener('compositionstart', mark, true);" +
+            "window.addEventListener('submit', clear, true);" +
             "}catch(e){}})()"
 }

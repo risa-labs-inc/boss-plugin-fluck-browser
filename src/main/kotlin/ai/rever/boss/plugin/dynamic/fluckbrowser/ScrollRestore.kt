@@ -37,13 +37,13 @@ internal object ScrollRestore {
     /**
      * A captured position, bundled with the URL of the document it was captured from.
      *
-     * The URL is not optional decoration - a PR review caught that a prior revision compared
-     * the *restoring* handle's current URL against itself (both reads happened at restore time,
-     * on the freshly created handle, so the comparison was close to tautological and did not
-     * verify anything about the ORIGINAL page). The URL that matters is the one the OLD handle
-     * was on at capture time, which is what this bundles: [captureScrollOrNull] reads it off the
-     * still-live handle in the same call that reads the position, and [awaitSettleAndApply]
-     * waits for the NEW handle to actually reach this URL before ever touching height or scroll.
+     * The URL is not optional decoration: comparing the *restoring* handle's current URL against
+     * itself (both reads at restore time, on the freshly created handle) is close to tautological
+     * and verifies nothing about the ORIGINAL page. The URL that matters is the one the OLD
+     * handle was on at capture time, which is what this bundles: [captureScrollOrNull] reads it
+     * off the still-live handle in the same call that reads the position, and
+     * [awaitSettleAndApply] waits for the NEW handle to actually reach this URL before ever
+     * touching height or scroll.
      */
     data class SavedScroll(val position: Position, val url: String)
 
@@ -101,11 +101,11 @@ internal object ScrollRestore {
     ): Boolean {
         for (poll in 0 until maxPolls) {
             // onFailure rethrows CancellationException instead of swallowing it - runCatching is
-            // Throwable-wide by default, and a cancellation caught here and NOT rethrown lets this
-            // loop keep polling past the point its own coroutine was told to stop, which a PR
-            // review correctly flagged: it recovered only because the injected `delay` used in
-            // production is itself cancellable and rethrows - a fact the tests' `delay = {}` does
-            // not share, so the real guarantee was never actually exercised.
+            // Throwable-wide by default, and a cancellation caught here and NOT rethrown would let
+            // this loop keep polling past the point its own coroutine was told to stop. Without
+            // this, cancellation would only work by accident, because the injected `delay` used
+            // in production is itself cancellable and rethrows - a fact the tests' `delay = {}`
+            // does not share, so that path alone would never actually exercise the guarantee.
             val result =
                 runCatching { check() }
                     .onFailure { if (it is CancellationException) throw it }
@@ -126,15 +126,28 @@ internal object ScrollRestore {
      * early-exit LOGIC is what a regression is most likely to break, and that logic is what this
      * makes testable without a live renderer.
      *
-     * **The navigation-wait phase is not optional colour - it is the fix for a bug a PR review
-     * caught.** A freshly (re)created `BrowserHandle` starts on `about:blank`/empty while its own
-     * `createBrowser` navigation is still in flight. Skipping straight to the height-settle loop
-     * on THAT document reports `settled: true` within one or two polls - long before the real
-     * page exists - and every subsequent `applyScroll` then lands on the wrong document (or is
-     * wrongly skipped once the real navigation finally does commit, if the caller was comparing
-     * a URL read at that same moment against itself). Waiting for `readUrl() == expectedUrl`
-     * FIRST is what makes every later phase actually operate on the page whose scroll was
-     * captured, not on whatever the handle happened to report when this was called.
+     * **The navigation-wait phase is not optional colour.** A freshly (re)created `BrowserHandle`
+     * starts on `about:blank`/empty while its own `createBrowser` navigation is still in flight.
+     * Skipping straight to the height-settle loop on THAT document reports `settled: true` within
+     * one or two polls - long before the real page exists - and every subsequent `applyScroll`
+     * then lands on the wrong document (or is wrongly skipped once the real navigation finally
+     * does commit, if the caller was comparing a URL read at that same moment against itself).
+     * Waiting for `readUrl() == expectedUrl` FIRST is what makes every later phase actually
+     * operate on the page whose scroll was captured, not on whatever the handle happened to
+     * report when this was called.
+     *
+     * The default cap (`maxNavigationWaitPolls` x `navigationWaitPollMs`) is generous on purpose:
+     * this is the cold-reload path by construction - the tab was hibernated precisely so its
+     * renderer went away - and a heavy page on a slow connection taking several seconds to commit
+     * its URL is ordinary, not a wedge. A background poll loop costs nothing while it waits, so
+     * the cap only needs to be shorter than "the user gave up and closed the tab," not shorter
+     * than "a slow page."
+     *
+     * Comparison is exact string equality on the URL, which is brittle to anything that changes
+     * it between visits - a server redirect, an auth bounce, a page that `replaceState`s away a
+     * query param, a per-session token in the URL. [SavedScroll]'s fragment handling in
+     * [shouldAttemptRestore] survives a path-level comparison; exact-match here does not. Accepted
+     * for now: the failure mode is "restore silently skipped," not a wrong-page write.
      *
      * @return true if the navigation wait AND the height-settle both completed within their caps;
      *   false if either was hit first. A navigation-wait timeout means nothing here is safe to
@@ -160,7 +173,7 @@ internal object ScrollRestore {
         applyScroll: suspend () -> Unit,
         readPosition: suspend () -> Position?,
         delay: suspend (Long) -> Unit,
-        maxNavigationWaitPolls: Int = 20,
+        maxNavigationWaitPolls: Int = 60,
         navigationWaitPollMs: Long = 150L,
         maxSettlePolls: Int = 20,
         settlePollMs: Long = 150L,
@@ -186,9 +199,12 @@ internal object ScrollRestore {
             // have the original document's position applied to whatever replaced it.
             val stillOnExpectedPage =
                 runCatching { readUrl() }.onFailure { if (it is CancellationException) throw it }.getOrNull() == expectedUrl
-            if (stillOnExpectedPage) {
-                runCatching { applyScroll() }.onFailure { if (it is CancellationException) throw it }
-            }
+            // Stop entirely on a redirect rather than spending the remaining attempts' delay and
+            // readPosition on a document this deliberately refuses to touch - and `landed ==
+            // target` on THAT document would exit the loop by accident, on a coincidence, not on
+            // having actually restored anything.
+            if (!stillOnExpectedPage) return settled
+            runCatching { applyScroll() }.onFailure { if (it is CancellationException) throw it }
             delay(reapplyDelayMs)
             val landed = runCatching { readPosition() }.onFailure { if (it is CancellationException) throw it }.getOrNull()
             // A bare `return` here is a non-local return out of awaitSettleAndApply - repeat()

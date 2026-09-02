@@ -1563,32 +1563,35 @@ private val browserDisposeExecutor = java.util.concurrent.Executors.newCachedThr
  *
  * Not truly fire-and-forget any more: the launched Job is stored on [hoistedState] so
  * [disposeBrowserHandleOffThread] can await it before disposing the handle this call is running
- * against - a codex red-team finding on an earlier revision of this file, where an install lands
- * mid-flight during ANY dispose (tab close, retry, hibernation) was an untracked, unfenced race
- * against `executeJavaScript` on a handle about to be disposed.
+ * against - without tracking it, an install landing mid-flight during ANY dispose (tab close,
+ * retry, hibernation) would be an untracked, unfenced race against `executeJavaScript` on a
+ * handle about to be disposed.
  */
 private fun installDirtyMarker(
     handle: BrowserHandle,
     coroutineScope: CoroutineScope,
     hoistedState: FluckBrowserTabState,
 ) {
+    // A rapid second navigation can call this again before the first install's job has finished;
+    // cancelling the outgoing one before overwriting the field is what keeps "tracked so dispose
+    // can await/cancel it" true for every install, not just the most recent.
+    hoistedState.dirtyMarkerInstallJob?.cancel()
     val job =
         coroutineScope.launch {
             runCatching { withContext(Dispatchers.IO) { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) } }
         }
     hoistedState.dirtyMarkerInstallJob = job
-    // A PR review caught that the KDoc claimed this self-nulls on completion while nothing
-    // actually did it - identity-checked so a completion callback firing late (after a NEWER
-    // install already replaced this field, e.g. a rapid second navigation) cannot null out a
-    // job that isn't this one any more.
+    // Identity-checked so a completion callback firing late (after a NEWER install already
+    // replaced this field, e.g. the rapid-navigation case above) cannot null out a job that isn't
+    // this one any more.
     job.invokeOnCompletion { if (hoistedState.dirtyMarkerInstallJob === job) hoistedState.dirtyMarkerInstallJob = null }
 }
 
 /**
  * Reads [ScrollRestore.CAPTURE_JS] AND the current URL off a still-live handle, right before it
- * is disposed - bundled together (via [ScrollRestore.SavedScroll]) because a PR review caught
- * that a prior revision compared the RESTORING handle's URL against itself; the URL that
- * actually needs verifying is the one this OLD handle is on right now, at capture time.
+ * is disposed - bundled together (via [ScrollRestore.SavedScroll]) because comparing the
+ * RESTORING handle's URL against itself verifies nothing; the URL that actually needs verifying
+ * is the one this OLD handle is on right now, at capture time.
  *
  * `getCurrentUrl()` is a plain synchronous getter (no native round trip), safe to call from
  * whatever dispatcher we're on, before or after the JS round trip.
@@ -1616,6 +1619,10 @@ private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Sa
 /** Bound to [captureScrollOrNull]'s own 1s capture timeout - these are meant to be sub-millisecond DOM ops on a healthy page. */
 private const val RESTORE_CALL_TIMEOUT_MS = 1_000L
 
+/** Wrapped the same way [ScrollRestore.CAPTURE_JS] is, so a thrown exception and a genuine `null` height stay distinguishable through [pollUntil]'s `runCatching`. */
+private const val READ_HEIGHT_JS =
+    "(function(){try{return document.documentElement.scrollHeight;}catch(e){return null;}})()"
+
 /**
  * Applies a captured scroll position to a freshly (re)created handle, once the document has
  * settled - not at `DOMContentLoaded`, which loses a race with any page that re-renders after
@@ -1623,19 +1630,23 @@ private const val RESTORE_CALL_TIMEOUT_MS = 1_000L
  *
  * A thin binding over [ScrollRestore.awaitSettleAndApply] - see that function's KDoc for why the
  * settle signal is document height rather than `readyState`, for the loop-correctness bug this
- * replaced, and for why it waits for [saved]'s URL to actually load before touching height at
- * all (a PR review caught that a freshly created handle starts on `about:blank` while its own
- * navigation is still in flight).
+ * replaced, and for why it waits for [saved]'s URL to actually load before touching height at all
+ * (a freshly created handle starts on `about:blank` while its own navigation is still in flight).
  *
  * The whole call runs on Dispatchers.IO, not the caller's Main - same reason as
- * [captureScrollOrNull]: up to ~28 sequential `executeJavaScript` round trips happen inside
+ * [captureScrollOrNull]: up to several sequential `executeJavaScript` round trips happen inside
  * [ScrollRestore.awaitSettleAndApply], and a wedged renderer or a slow-to-hydrate SPA blocking
  * any one of them must park a background thread, not the app's UI thread.
  *
- * Each individual call is ALSO bounded ([RESTORE_CALL_TIMEOUT_MS]) - a PR review caught that
- * [ScrollRestore.awaitSettleAndApply]'s own caps are poll COUNTS, not wall-clock time, so a
- * slow-but-not-wedged renderer could stretch the whole job well past
- * `disposeBrowserHandleOffThread`'s 2s join budget without any single call ever throwing.
+ * Each individual call is also wrapped in `bounded` ([RESTORE_CALL_TIMEOUT_MS]), but this does
+ * NOT actually cap a wedged call's wall-clock time - see [captureScrollOrNull]'s KDoc (and
+ * `busyState()`'s own identical admission) for why `withTimeoutOrNull` can only abandon OUR wait,
+ * never a call that blocks without suspending. What it caps is the well-behaved case: on a healthy
+ * renderer this keeps one slow-but-not-wedged call from running unbounded, rather than adding a
+ * comment that promises a guarantee the code cannot give. [ScrollRestore.awaitSettleAndApply]'s
+ * own caps are poll COUNTS, not wall-clock - the two do not compose into a hard deadline, and
+ * `disposeBrowserHandleOffThread`'s 2s join is a best-effort wait on top of both, not a bound
+ * either of them enforces. Tracked with the pre-existing renderer-timeout gap as BossConsole#300.
  */
 private suspend fun restoreScrollOnSettle(
     handle: BrowserHandle,
@@ -1652,7 +1663,7 @@ private suspend fun restoreScrollOnSettle(
                 target = saved.position,
                 expectedUrl = saved.url,
                 readUrl = { bounded { handle.getCurrentUrl() } },
-                readHeight = { bounded { handle.executeJavaScript("document.documentElement.scrollHeight")?.toString() } },
+                readHeight = { bounded { handle.executeJavaScript(READ_HEIGHT_JS)?.toString() } },
                 applyScroll = { bounded { handle.executeJavaScript(ScrollRestore.restoreJs(saved.position)) } },
                 readPosition = { bounded { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }?.let { ScrollRestore.parseCapture(it) } },
                 delay = { kotlinx.coroutines.delay(it) },
@@ -1673,15 +1684,19 @@ internal fun disposeBrowserHandleOffThread(
 ) {
     browserDisposeExecutor.execute {
         try {
-            // Codex + a JxBrowser-domain red-team pass, both independently: installDirtyMarker
-            // and restoreScrollOnSettle are launched fire-and-forget on the long-lived
-            // coroutineScope, with nothing joining them before ANY of this file's several dispose
-            // call sites runs. This closes that gap for the NORMAL-completion case - a job that
-            // is genuinely still running (not yet reached its own internal timeout) is now
-            // awaited here before dispose, at the one call site (hibernation) that passes them.
+            // installDirtyMarker and restoreScrollOnSettle are launched fire-and-forget on the
+            // long-lived coroutineScope, with nothing joining them before ANY of this file's
+            // several dispose call sites runs otherwise. This closes that gap for the
+            // NORMAL-completion case - a job that is genuinely still running is awaited here
+            // before dispose, at the one call site (hibernation) that passes them. The caller
+            // must snapshot the job references BEFORE calling releaseBrowserHandle() for this to
+            // mean anything: that function cancels both jobs and each nulls its own hoistedState
+            // field via invokeOnCompletion, so building the list from hoistedState AFTER release
+            // (as an earlier revision did) reads back fields already nulled by the cancellation
+            // that just ran, and awaits nothing.
             //
-            // What this does NOT close, per the same reviewers: `Job.join()` only tells us the
-            // JOB completed, and a job wrapping `withTimeoutOrNull { executeJavaScript(...) }`
+            // What this does NOT close even with a correct snapshot: `Job.join()` only tells us
+            // the JOB completed, and a job wrapping `withTimeoutOrNull { executeJavaScript(...) }`
             // completes the instant that timeout gives up - which is NOT the same moment the
             // underlying native call actually returns if the renderer is genuinely wedged. That
             // orphaned call can still be running on Main after this join() returns, and it is a
@@ -2234,10 +2249,10 @@ internal class FluckBrowserTabState {
             requestHostExitFullscreen(handle)
         }
         browserHandle = null
-        // A PR review caught that only ONE of this file's six dispose call sites (hibernation)
-        // awaited installDirtyMarker's/restoreScrollOnSettle's jobs before disposing - the other
-        // five (tab close, retry, crash-recovery, fullscreen-exit recovery, handle replacement)
-        // all funnel through THIS function first, so cancelling here covers every one of them
+        // Only ONE of this file's six dispose call sites (hibernation) awaits
+        // installDirtyMarker's/restoreScrollOnSettle's jobs before disposing - the other five
+        // (tab close, retry, crash-recovery, fullscreen-exit recovery, handle replacement) all
+        // funnel through THIS function first, so cancelling here covers every one of them
         // structurally, rather than threading an awaitJobs list through six call sites by hand.
         // Cancellation cannot retroactively stop a call already blocked in native code (see
         // captureScrollOrNull's KDoc for why not), but it DOES stop the job from starting its
@@ -2245,6 +2260,11 @@ internal class FluckBrowserTabState {
         // is real exposure reduction even though it is not a complete fix. Each job nulls its own
         // reference in [installDirtyMarker] / the wake effect via `invokeOnCompletion`, so a
         // cancel here on an already-finished job is a harmless no-op, not a double-cancel.
+        //
+        // The hibernation call site must read these two fields BEFORE calling this function, not
+        // after: by the time this returns, cancellation has usually already completed and nulled
+        // both, which is exactly why a naive "build awaitJobs from hoistedState after release"
+        // ends up awaiting an empty list.
         dirtyMarkerInstallJob?.cancel()
         scrollRestoreJob?.cancel()
         clearFullscreenState()
@@ -3402,31 +3422,36 @@ internal fun FluckBrowserTabContent(
                         return@launch
                     }
                     println("[FluckBrowser] Hibernating idle tab to release its renderer")
+                    // Snapshotted BEFORE releaseBrowserHandle(), which cancels both jobs and (via
+                    // each job's own invokeOnCompletion) nulls these same hoistedState fields once
+                    // cancellation completes - usually well within the capture window below. Read
+                    // after release, this list is built from already-nulled fields almost every
+                    // time and disposeBrowserHandleOffThread's await becomes a no-op that looks
+                    // like real protection but isn't. Snapshotting first is what makes the await
+                    // in the `finally` below actually wait on the jobs that were live at
+                    // hibernation time, not on whatever release happened to leave behind.
+                    val jobsToAwait =
+                        listOfNotNull(hoistedState.dirtyMarkerInstallJob, hoistedState.scrollRestoreJob)
                     val handle = hoistedState.releaseBrowserHandle()
                     if (handle != null) {
                         try {
                             // Sequenced ahead of dispose, not run concurrently with it in OUR
                             // bookkeeping - executeJavaScript against a handle that is mid-dispose
-                            // is undefined JxBrowser behaviour. Two independent adversarial
-                            // reviews (codex + a JxBrowser-domain pass) correctly pushed back on
-                            // an earlier, stronger claim here: this ordering guarantees no overlap
-                            // ONLY when captureScrollOrNull's executeJavaScript call returns
-                            // within its own 1s timeout. withTimeoutOrNull abandons OUR wait, not
-                            // the underlying call - if the renderer is genuinely wedged past 1s,
-                            // the native call may still be running when disposeBrowserHandleOffThread
-                            // posts dispose() on a different thread. busyState()'s own comment
-                            // already admits the identical limitation for its own
-                            // executeJavaScript-with-timeout call, so this is a pre-existing gap
-                            // this diff participates in, not one it introduces or worsens - fully
-                            // closing it needs a host-side capability (an abortable
-                            // executeJavaScript, or a way to ask "no native call pending on this
-                            // handle") that this plugin cannot build alone. captureScrollOrNull
-                            // rethrows CancellationException (matching busyState's own
-                            // convention) rather than swallowing it - the `finally` below is what
-                            // guarantees dispose still runs when that happens, rather than
-                            // relying on a swallow-then-fall-through that a future "fix" to match
-                            // that same convention would have quietly turned into a leaked
-                            // Chromium process tree.
+                            // is undefined JxBrowser behaviour. This ordering guarantees no
+                            // overlap ONLY when captureScrollOrNull's executeJavaScript call
+                            // returns within its own 1s timeout. withTimeoutOrNull abandons OUR
+                            // wait, not the underlying call - if the renderer is genuinely wedged
+                            // past 1s, the native call may still be running when
+                            // disposeBrowserHandleOffThread posts dispose() on a different thread.
+                            // busyState()'s own comment already admits the identical limitation
+                            // for its own executeJavaScript-with-timeout call, so this is a
+                            // pre-existing gap this diff participates in, not one it introduces or
+                            // worsens - fully closing it needs a host-side capability (an
+                            // abortable executeJavaScript, or a way to ask "no native call pending
+                            // on this handle") that this plugin cannot build alone.
+                            // captureScrollOrNull rethrows CancellationException (matching
+                            // busyState's own convention) rather than swallowing it - the `finally`
+                            // below is what guarantees dispose still runs when that happens.
                             //
                             // Written only if the tab has NOT already woken while this was
                             // capturing (up to 1s): releaseBrowserHandle() already nulled
@@ -3443,13 +3468,10 @@ internal fun FluckBrowserTabContent(
                             // Off the UI thread so hibernating a background tab can't hitch
                             // the foreground UI. In a finally so cancellation (tab re-entry,
                             // right above in this same effect) can never skip disposal and leak
-                            // the handle - see the comment above. Also awaits any still-running
-                            // dirty-marker install or scroll-restore job for THIS handle first -
-                            // see disposeBrowserHandleOffThread's KDoc for why.
-                            disposeBrowserHandleOffThread(
-                                handle,
-                                awaitJobs = listOfNotNull(hoistedState.dirtyMarkerInstallJob, hoistedState.scrollRestoreJob),
-                            )
+                            // the handle - see the comment above. Awaits the jobs snapshotted
+                            // before release, not whatever hoistedState holds now - see
+                            // disposeBrowserHandleOffThread's KDoc for why that distinction matters.
+                            disposeBrowserHandleOffThread(handle, awaitJobs = jobsToAwait)
                         }
                     }
                 }
@@ -5742,6 +5764,36 @@ internal fun BrowserToolbar(
                 tint = BossThemeColors.TextPrimary,
                 modifier = Modifier.size(18.dp)
             )
+        }
+
+        // Copy-link button, left of the URL bar. Mirrors ShareLinkRow's copy-feedback pattern
+        // (swap to a checkmark, revert after ~1.6s) so copying a link feels the same everywhere
+        // in this file. Copies urlBarText.text specifically - that is this composable's own
+        // definition of "current URL" (see `val currentUrl = urlBarText.text` at the call site,
+        // already used for bookmarking), not a separately tracked loaded-vs-draft value.
+        run {
+            val clipboardManager = LocalClipboardManager.current
+            var urlCopied by remember { mutableStateOf(false) }
+            LaunchedEffect(urlCopied) {
+                if (urlCopied) {
+                    delay(1600)
+                    urlCopied = false
+                }
+            }
+            IconButton(
+                onClick = {
+                    clipboardManager.setText(AnnotatedString(urlBarText.text))
+                    urlCopied = true
+                },
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = if (urlCopied) Icons.Filled.Check else Icons.Filled.Link,
+                    contentDescription = if (urlCopied) "Copied" else "Copy link",
+                    tint = if (urlCopied) BossThemeColors.SuccessColor else BossThemeColors.TextPrimary,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
         }
 
         // URL text field with bookmark star, zoom indicator, and autocomplete dropdown

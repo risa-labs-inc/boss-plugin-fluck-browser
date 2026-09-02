@@ -123,9 +123,42 @@ class UserInputGuardTest {
             "addEventListener('compositionstart', mark, true)" in js,
             "must go through the same trusted, capture-phase, editable-target checks as keydown",
         )
+    }
+
+    /**
+     * A modifier held alongside a printable key is a shortcut (Cmd+A/C/X, Ctrl+A/C/X), never a
+     * character insertion - real typing never carries ctrl/meta/alt. Without this guard,
+     * select-all-then-copy on a filled form would mark it dirty for a shortcut that inserted
+     * nothing, exempting the tab from hibernation for no typing at all.
+     */
+    @Test
+    fun `a modifier held alongside a printable key is a shortcut, not a keystroke`() {
+        val js = DirtyInputMarker.INSTALL_JS
         assertTrue(
-            "removeEventListener('compositionstart', mark, true)" in js,
-            "must be torn down once armed, like every other listener here",
+            "e.ctrlKey || e.metaKey || e.altKey" in js,
+            "keydown must exclude ctrl/meta/alt-modified keys - those are shortcuts, not typing",
+        )
+    }
+
+    /**
+     * A trusted `submit` resets the flag. Without this, one keystroke into a search box exempts a
+     * long-lived SPA tab (Gmail/Slack/Jira-shaped apps) from hibernation for its entire document
+     * lifetime - the exact class of heavy, long-lived renderer hibernation exists to reclaim.
+     * Capture phase and `isTrusted`-gated for the same reason the mark listeners are: a page's
+     * own submit handler must not be able to fake or suppress this from either direction.
+     */
+    @Test
+    fun `a trusted submit clears the flag, so a later edit can re-arm it`() {
+        val js = DirtyInputMarker.INSTALL_JS
+        assertTrue(
+            "addEventListener('submit', clear, true)" in js,
+            "submit must be a trusted, capture-phase listener like the mark listeners",
+        )
+        val clearBody = js.substringAfter("var clear = function(e){").substringBefore("};")
+        assertTrue("isTrusted" in clearBody, "the clear listener must gate on isTrusted like every other listener here")
+        assertTrue(
+            "window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} = 0" in clearBody,
+            "the submit listener must reset the flag, not just observe it",
         )
     }
 

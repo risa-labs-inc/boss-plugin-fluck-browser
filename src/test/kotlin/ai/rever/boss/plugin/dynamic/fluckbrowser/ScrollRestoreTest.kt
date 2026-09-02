@@ -170,11 +170,18 @@ class ScrollRestoreTest {
      * bounced elsewhere - a login/session check is a real example) must not have the ORIGINAL
      * document's position applied to whatever replaced it. Re-checked on every reapply attempt,
      * not just once up front.
+     *
+     * Also pins that a detected redirect stops the loop outright rather than spending its
+     * remaining attempts' delay and readPosition on a document this deliberately refuses to
+     * touch - `positionReads` would be 3 (one per attempt) under the earlier version of this loop,
+     * which kept looping after `stillOnExpectedPage` went false and could even exit via
+     * `landed == target` by coincidence on the wrong document.
      */
     @Test
     fun `reapply skips the actual scroll application once the page has navigated away mid-restore`() = runTest {
         var urlReads = 0
         var applies = 0
+        var positionReads = 0
         ScrollRestore.awaitSettleAndApply(
             target = TARGET,
             expectedUrl = EXPECTED_URL,
@@ -184,11 +191,12 @@ class ScrollRestoreTest {
             readUrl = { urlReads++; if (urlReads == 1) EXPECTED_URL else "https://example.com/login" },
             readHeight = { "1000" },
             applyScroll = { applies++ },
-            readPosition = { ScrollRestore.Position(0, 0) }, // never lands - forces every reapply attempt to run
+            readPosition = { positionReads++; ScrollRestore.Position(0, 0) },
             delay = {},
             reapplyAttempts = 3,
         )
         assertEquals(0, applies, "the redirect happens before the first reapply's URL check - apply must never run")
+        assertEquals(0, positionReads, "a redirect must stop the loop immediately, not burn the remaining attempts")
     }
 
     // endregion
