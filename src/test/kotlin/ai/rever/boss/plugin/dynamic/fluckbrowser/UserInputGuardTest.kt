@@ -116,8 +116,12 @@ class UserInputGuardTest {
         assertTrue("'paste'" in js && "'cut'" in js, "paste and cut are typing by other means")
         assertTrue("'Enter'" !in js, "Enter usually IS the submit; marking dirty on the keystroke that saves the work inverts the guard")
         assertTrue(
-            "typeof window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} !== 'undefined'" in js,
-            "the flag doubles as the install guard - reinstalling must not clear it",
+            "Object.getOwnPropertyDescriptor(window, '${DirtyInputMarker.DIRTY_FLAG_PROPERTY}')" in js,
+            "the install guard must look for THIS script's accessor, not for the name being defined",
+        )
+        assertTrue(
+            "typeof window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} !== 'undefined'" !in js,
+            "guarding on the value let a page suppress the install by squatting the name first",
         )
     }
 

@@ -44,8 +44,15 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  *
  *  - **Clearing it** (`window.__fluckDirty = 0` on a timer, or an accidental name collision)
  *    would switch the guard off for that tab and hand back exactly the work loss this exists to
- *    prevent. Closed: with no setter, the assignment is ignored in sloppy mode and throws in
- *    strict mode, and `configurable: false` refuses both `delete` and a redefinition.
+ *    prevent. Closed in both directions, which needed two separate things: with no setter, an
+ *    assignment after install is ignored in sloppy mode and throws in strict mode, and
+ *    `configurable: false` refuses both `delete` and a redefinition; and the install guard checks
+ *    for this script's own accessor rather than for the name being defined at all, so a page
+ *    occupying the name BEFORE install (page scripts run first - install is on
+ *    `NavigationFinished`) no longer suppresses the install. The name is reclaimed instead.
+ *    The one remaining way out is a page that pre-defines the property non-configurable, which
+ *    makes `defineProperty` throw into the outer `catch` and leaves the guard off for that tab.
+ *    Unavoidable from script, and a deliberate act rather than a one-line accident.
  *  - **Setting it** cannot be closed the same way and is not worth closing - a page that keeps
  *    itself permanently dirty (by typing into itself with trusted CDP input, say) exempts itself
  *    from hibernation. That is a self-inflicted process-tree leak, bounded by the next visit,
@@ -94,10 +101,17 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  * - A client-side route change (`pushState`, a hash change, an SPA router) does NOT clear the
  *   flag. The document persists, so [INSTALL_JS]'s install guard correctly early-returns and
  *   nothing resets it; only a trusted `submit` does. A tab typed into once therefore stays exempt
- *   for its whole background session, re-armed only by being foregrounded and backgrounded again.
- *   Same false-positive-safe direction as everything else here, and the same shape `PLAYING_MEDIA`
- *   already has - but named because it lands on exactly the long-lived SPA class hibernation most
- *   wants to reclaim, which makes it a wider sliver than the cancelled-IME case below.
+ *   for the whole life of that DOCUMENT - not just that background session. Foregrounding and
+ *   backgrounding re-arms the idle timer, but the flag is untouched by it, so the next check
+ *   reads dirty and skips again. Same false-positive-safe direction as everything else here, but
+ *   named because it lands on exactly the long-lived SPA class hibernation most wants to reclaim,
+ *   which makes it a wider sliver than the cancelled-IME case below.
+ *
+ *   Closing the setter closed it to this plugin too: there is deliberately no Kotlin-side clear.
+ *   One could be added (a nonce-named clear function defined at install time, so the page cannot
+ *   guess it) but nothing today would call it - an age-based or wake-time reset is a policy
+ *   decision, not a mechanism gap, and adding the mechanism with no caller would be a second
+ *   reachable escape hatch maintained for a hypothetical.
  * - One flag, one `lastForm`, for the whole document. Typing into form B and then into form A
  *   moves `lastForm` to A, so submitting A clears the flag while B's draft is still unsubmitted.
  *   The form check below narrows the common shape of this (type a draft, submit an unrelated
@@ -117,9 +131,11 @@ internal object DirtyInputMarker {
     const val DIRTY_FLAG_PROPERTY: String = "__fluckDirty"
 
     /**
-     * Idempotent: the property doubles as the install guard, so re-running on the same document
-     * neither re-arms listeners nor clears a flag already set. States: `undefined` = not
-     * installed, `0` = installed and clean, `1` = the user has typed.
+     * Idempotent: the property's DESCRIPTOR is the install guard - a non-configurable accessor is
+     * this script's own signature - so re-running on the same document neither re-arms listeners
+     * nor clears a flag already set. Deliberately not the property's value: that let a page
+     * occupy the name first and suppress the install entirely (see the guard's own comment).
+     * States: no accessor = not installed, `0` = installed and clean, `1` = the user has typed.
      *
      * Keys: any printable character (length 1 covers space), plus Backspace and Delete - editing
      * is typing. Enter is deliberately excluded: on a form it usually IS the submit, and marking
@@ -167,11 +183,22 @@ internal object DirtyInputMarker {
      */
     const val INSTALL_JS: String =
         "(function(){try{" +
-            "if (typeof window.$DIRTY_FLAG_PROPERTY !== 'undefined') return;" +
+            // The install guard asks whether OUR accessor is already there - not whether the NAME
+            // is taken. Guarding on `typeof window.X !== 'undefined'` used the flag's own value as
+            // the guard, which handed any page a one-line way to switch the feature off before it
+            // ever installed: this script runs on NavigationFinished, page scripts run before
+            // that, so `window.$DIRTY_FLAG_PROPERTY = 0` at document start made the guard see a
+            // defined property, return early, attach NO listeners, and leave BUSY_SCRIPT reading
+            // the page's own permanent 0. An accidental name collision did the same thing.
+            // Checking the descriptor instead means the name being occupied by anything that is
+            // not ours falls through to the defineProperty below, which RECLAIMS it (a plain
+            // `window.x = 0` assignment is configurable, so redefining over it succeeds).
+            "var own = Object.getOwnPropertyDescriptor(window, '$DIRTY_FLAG_PROPERTY');" +
+            "if (own && typeof own.get === 'function' && !own.configurable) return;" +
             // The flag itself lives in this closure, not on `window`; the property is a
             // non-configurable GETTER over it. See the class KDoc's tamper note - a plain
-            // writable property let any page script (or an accidental name collision) run
-            // `window.$DIRTY_FLAG_PROPERTY = 0` and switch the guard off for that tab.
+            // writable property let any page script run `window.$DIRTY_FLAG_PROPERTY = 0` and
+            // switch the guard off after install, the way the guard above let it do so before.
             // The reader (BUSY_SCRIPT) is unaffected: it still reads the property.
             "var dirty = 0;" +
             "var lastForm = null;" +

@@ -2840,8 +2840,17 @@ internal fun FluckBrowserTabContent(
                     // urlBarText is Compose state read here on an IO thread — safe
                     // (snapshot reads are thread-consistent), and deliberately
                     // snapshotted at launch time per the comment above.
+                    //
+                    // Through visiblePageUrl, so a tab backgrounded MID-EDIT wakes onto the page
+                    // it was actually showing rather than onto a half-typed draft. Scroll restore
+                    // makes that visible: savedScroll.url comes from getCurrentUrl() on the old
+                    // handle, so a recreation seeded from the draft never matches, and the restore
+                    // spends its whole navigation-wait cap polling for a URL that will not arrive.
+                    // Same reason the loading listener reads the committed URL rather than the box.
                     browserService.createBrowser(
-                        BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
+                        BrowserConfig(
+                            url = visiblePageUrl(urlBarText.text, hoistedState.loadedUrl).ifBlank { initialUrl },
+                        )
                     )
                 }.also { hoistedState.browserCreation = it }
             var handle = withTimeoutOrNull(BROWSER_CREATION_TIMEOUT_MS) { creation.await() }

@@ -69,14 +69,20 @@ internal fun HomeSwipeSurface(
         progress = 0f
     }
 
-    // Ends the gesture and fires the navigation IF it earned one - the ONE place that happens,
-    // so onNavigate is called from neither the Scroll nor the Exit handler directly.
+    // Runs one finished gesture through the decision and navigates if it earned it. The ONE
+    // place onNavigate is called, so neither pointer handler below calls it directly.
     // homeSwipeEnabled() is read per gesture, not cached: the host republishes the key the moment
     // the setting changes, and a relaunch to pick that up would be a poor answer.
-    fun endGesture() {
-        val direction = endHomeSwipe(gesture)
-        cancelGesture()
+    fun decide(finished: HomeSwipeGesture) {
+        val direction = endHomeSwipe(finished)
         if (direction != null && homeSwipeEnabled()) onNavigate(direction)
+    }
+
+    // Ends the CURRENT gesture: decide, then clear.
+    fun endGesture() {
+        val finished = gesture
+        cancelGesture()
+        decide(finished)
     }
 
     // The affordance's own end-of-gesture timer, and the ONLY place a swipe held past the commit
@@ -114,6 +120,14 @@ internal fun HomeSwipeSurface(
                             canGoBack = canGoBack,
                             canGoForward = canGoForward,
                         )
+                    // A gesture retired by THIS event's lateness has to be decided here: the
+                    // timer that would otherwise have ended it is about to be cancelled by the
+                    // tick below, and advanceHomeSwipe has already replaced it with a fresh one.
+                    // The window is real - advanceHomeSwipe retires at GESTURE_GAP_MS while the
+                    // timer fires 60ms later - and a trackpad emits nothing while the fingers are
+                    // still, so "swipe past the threshold, hold, nudge before releasing" lands in
+                    // it without any second physical swipe.
+                    step.ended?.let { decide(it) }
                     gesture = step.gesture
                     lastEventTick++
                     val enabled = homeSwipeEnabled()

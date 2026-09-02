@@ -137,13 +137,28 @@ internal data class HomeSwipeGesture(
  * What one scroll event did: the gesture that follows it, and how far along the affordance
  * should be drawn (0 when there is nothing to draw).
  *
- * No `navigate` field here any more - see [endHomeSwipe] for why the decision moved to gesture
- * END rather than living in every per-event step.
+ * No `navigate` field here - see [endHomeSwipe] for why the decision moved to gesture END rather
+ * than living in every per-event step. [ended] is not that field coming back: it hands the caller
+ * a gesture to DECIDE about, it does not decide.
  */
 internal data class HomeSwipeStep(
     val gesture: HomeSwipeGesture,
     val direction: HomeSwipeDirection? = null,
     val progress: Float = 0f,
+    /**
+     * The gesture this event RETIRED, when its own arrival is what ended it - set only when the
+     * event fell outside [GESTURE_GAP_MS] of a gesture that had already started.
+     *
+     * Not the same thing as [gesture], which is the fresh one this event begins. It exists because
+     * the two ways a gesture can end run on different clocks: [advanceHomeSwipe] retires one after
+     * [GESTURE_GAP_MS], while [HomeSwipeSurface]'s timer fires at `GESTURE_GAP_MS + 60`. An event
+     * landing in that 60ms window cancels the pending timer AND discards the gesture here, so a
+     * swipe that had already earned a navigation was silently thrown away - reachable without a
+     * second physical swipe, since a trackpad emits nothing while the fingers are still: swipe
+     * past the threshold, hold ~150ms, nudge before releasing. Handing the retired gesture back
+     * lets the caller run it through [endHomeSwipe] instead of losing it.
+     */
+    val ended: HomeSwipeGesture? = null,
 )
 
 /**
@@ -155,7 +170,10 @@ internal data class HomeSwipeStep(
  *
  * Never navigates - see [endHomeSwipe]. This only tracks progress and the two ways a gesture can
  * be ruled out early (an unwanted scroll chain, too much vertical, a reversal, an unavailable
- * direction); reaching the commit distance is just a progress value like any other here.
+ * direction); reaching the commit distance is just a progress value like any other here. When
+ * this event's own lateness is what ends the previous gesture, that gesture comes back on
+ * [HomeSwipeStep.ended] for the caller to run through [endHomeSwipe] - still not a decision made
+ * here.
  */
 internal fun advanceHomeSwipe(
     gesture: HomeSwipeGesture,
@@ -173,10 +191,13 @@ internal fun advanceHomeSwipe(
     val continuing = gesture.lastEventAtMs != 0L && nowMs - gesture.lastEventAtMs <= GESTURE_GAP_MS
     val base = if (continuing) gesture else HomeSwipeGesture()
     val stamped = base.copy(lastEventAtMs = nowMs)
+    // A gesture that had actually started and is not being continued is retired by this event,
+    // not discarded - see HomeSwipeStep.ended for the window that made the difference visible.
+    val retired = gesture.takeIf { !continuing && it.events > 0 }
 
-    if (stamped.rejected) return HomeSwipeStep(stamped)
+    if (stamped.rejected) return HomeSwipeStep(stamped, ended = retired)
     // Something under the pointer scrolled. That is what the event was for.
-    if (consumed) return HomeSwipeStep(stamped.copy(rejected = true))
+    if (consumed) return HomeSwipeStep(stamped.copy(rejected = true), ended = retired)
 
     // Vertical travel counts from the first event of the gesture, including events with no
     // horizontal component, or a plain vertical scroll that curls sideways at the end would
@@ -198,9 +219,9 @@ internal fun advanceHomeSwipe(
         //
         // Mirrors the same MIN_EVENTS gate the horizontal path applies below, so a vertical
         // event cannot draw an affordance the horizontal ones would not have.
-        if (withY.events < MIN_EVENTS) return HomeSwipeStep(withY)
+        if (withY.events < MIN_EVENTS) return HomeSwipeStep(withY, ended = retired)
         val carried = (kotlin.math.abs(withY.accumX) / COMMIT_UNITS).coerceAtMost(1f)
-        return HomeSwipeStep(withY, direction = withY.direction, progress = carried)
+        return HomeSwipeStep(withY, direction = withY.direction, progress = carried, ended = retired)
     }
 
     val moved = withY.copy(accumX = withY.accumX + deltaX, events = withY.events + 1)
@@ -212,7 +233,7 @@ internal fun advanceHomeSwipe(
         yDelta > CANCEL_STRONG_RATIO * xDelta ||
             (yDelta * CANCEL_MIXED_RATIO > xDelta && yDelta > CANCEL_VERTICAL_LOW) ||
             yDelta > CANCEL_VERTICAL_HIGH
-    if (cancelled) return HomeSwipeStep(moved.copy(rejected = true))
+    if (cancelled) return HomeSwipeStep(moved.copy(rejected = true), ended = retired)
 
     val heading = if (moved.accumX < 0f) HomeSwipeDirection.BACK else HomeSwipeDirection.FORWARD
     val settled =
@@ -220,21 +241,21 @@ internal fun advanceHomeSwipe(
             // Decided once per gesture and latched: which way it goes, and whether that way exists.
             moved.direction == null -> {
                 val available = if (heading == HomeSwipeDirection.BACK) canGoBack else canGoForward
-                if (!available) return HomeSwipeStep(moved.copy(rejected = true))
+                if (!available) return HomeSwipeStep(moved.copy(rejected = true), ended = retired)
                 moved.copy(direction = heading)
             }
             // Reversed mid-swipe. An abandon, rather than flipping the navigation under the user -
             // this is the gesture's own cancel-by-reversing, independent of [endHomeSwipe]'s
             // release-time check: a full direction flip rules the gesture out immediately, it does
             // not wait for the fingers to lift.
-            moved.direction != heading -> return HomeSwipeStep(moved.copy(rejected = true))
+            moved.direction != heading -> return HomeSwipeStep(moved.copy(rejected = true), ended = retired)
             else -> moved
         }
 
-    if (settled.events < MIN_EVENTS) return HomeSwipeStep(settled)
+    if (settled.events < MIN_EVENTS) return HomeSwipeStep(settled, ended = retired)
 
     val progress = (kotlin.math.abs(settled.accumX) / COMMIT_UNITS).coerceAtMost(1f)
-    return HomeSwipeStep(settled, direction = settled.direction, progress = progress)
+    return HomeSwipeStep(settled, direction = settled.direction, progress = progress, ended = retired)
 }
 
 /**

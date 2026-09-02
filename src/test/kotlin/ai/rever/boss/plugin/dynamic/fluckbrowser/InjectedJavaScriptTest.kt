@@ -246,8 +246,56 @@ class InjectedJavaScriptTest {
         }
 
     /**
-     * The property doubles as the install guard, and the marker is reinstalled on every
-     * navigation event. A second install that re-armed listeners would double every mark, and one
+     * The install guard's own hole, and the more serious half of the tamper story: page scripts
+     * run BEFORE this does (install is on `NavigationFinished`), so while the guard asked whether
+     * the NAME was defined, one line at document start suppressed the install entirely - no
+     * listeners, and `BUSY_SCRIPT` reading the page's own permanent 0 for the document's life.
+     * Strictly worse than clearing the flag after install, because nothing was ever armed to
+     * notice. The guard now looks for this script's own accessor, so an occupied name is
+     * reclaimed instead of obeyed.
+     */
+    @Test
+    fun `a page occupying the flag name before install does not suppress the guard`() =
+        sandbox().use { js ->
+            js.eval("window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} = 0;")
+            js.install()
+            assertEquals(1, js.evalInt("window.listenerCount('keydown')"), "listeners must actually be attached")
+            js.eval("window.dispatch('keydown', window.el('INPUT'), { key: 'a' })")
+            assertEquals(1, js.dirty(), "the guard must still see typing on a page that squatted the name")
+            js.eval("window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} = 0;")
+            assertEquals(1, js.dirty(), "and the reclaimed property must be read-only like any other install")
+        }
+
+    /** The same, for a page that squats the name with a value rather than the clean 0. */
+    @Test
+    fun `a squatted name of any shape is reclaimed`() =
+        sandbox().use { js ->
+            js.eval("window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} = 'nonsense';")
+            js.install()
+            js.eval("window.dispatch('keydown', window.el('INPUT'), { key: 'a' })")
+            assertEquals(1, js.dirty())
+        }
+
+    /**
+     * The one way out that cannot be closed from script: a page that pre-defines the property
+     * non-configurable makes `defineProperty` throw into `INSTALL_JS`'s own catch. Pinned so the
+     * behaviour is known rather than discovered - the guard is off for that tab, and the script
+     * must still not throw out into `executeJavaScript`.
+     */
+    @Test
+    fun `a non-configurable squat defeats the install, without throwing`() =
+        sandbox().use { js ->
+            js.eval(
+                "Object.defineProperty(window, '${DirtyInputMarker.DIRTY_FLAG_PROPERTY}', " +
+                    "{ value: 0, configurable: false, writable: false });",
+            )
+            js.install()
+            assertEquals(0, js.evalInt("window.listenerCount('keydown')"), "install could not proceed")
+            assertEquals(0, js.dirty(), "and the page's own value is what remains - a known, accepted boundary")
+        }
+
+    /**
+     * The marker is reinstalled on every navigation event. A second install that re-armed listeners would double every mark, and one
      * that reset the flag would discard a draft typed before a same-document navigation.
      */
     @Test

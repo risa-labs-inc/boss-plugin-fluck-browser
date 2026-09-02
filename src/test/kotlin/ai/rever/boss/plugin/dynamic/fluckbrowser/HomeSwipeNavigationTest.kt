@@ -115,6 +115,43 @@ class HomeSwipeNavigationTest {
     }
 
     /**
+     * Models [HomeSwipeSurface]'s Scroll handler end to end: fold each event, decide any gesture
+     * the event's own lateness retired, and apply the end-of-gesture gate once the stream stops.
+     * Returns every navigation in order.
+     *
+     * The difference from [runGestures] is the whole point. That harness ends each gesture itself
+     * before feeding the next one's events, i.e. it models the surface's timer always winning the
+     * race against the next event. This one never ends a gesture by hand, so a gesture retired
+     * inside the `GESTURE_GAP_MS`..`GESTURE_GAP_MS + 60` window - where the next event cancels the
+     * pending timer AND `advanceHomeSwipe` starts fresh - is lost here unless the retired gesture
+     * is actually handed back and decided.
+     */
+    private fun runSurface(
+        events: List<Wheel>,
+        canGoBack: Boolean = true,
+        canGoForward: Boolean = true,
+    ): List<HomeSwipeDirection> {
+        var gesture = HomeSwipeGesture()
+        val navigated = mutableListOf<HomeSwipeDirection>()
+        events.forEachIndexed { index, event ->
+            val step =
+                advanceHomeSwipe(
+                    gesture = gesture,
+                    deltaX = event.dx,
+                    deltaY = event.dy,
+                    nowMs = if (event.atMs != 0L) event.atMs else 1_000L + index,
+                    consumed = event.consumed,
+                    canGoBack = canGoBack,
+                    canGoForward = canGoForward,
+                )
+            step.ended?.let { retired -> endHomeSwipe(retired)?.let(navigated::add) }
+            gesture = step.gesture
+        }
+        if (gesture.events > 0) endHomeSwipe(gesture)?.let(navigated::add)
+        return navigated
+    }
+
+    /**
      * Fold several SEPARATE physical gestures through one continuous state and end each in turn -
      * for the cases that are about the gap between two swipes, not one swipe's own mechanics.
      * Unlike [run], state is NOT reset to a fresh [HomeSwipeGesture] between calls: the point is
@@ -408,6 +445,56 @@ class HomeSwipeNavigationTest {
     @Test
     fun `the same travel spread over enough events does navigate`() {
         assertEquals(HomeSwipeDirection.BACK, run(swipe(MIN_EVENTS, -5f)).navigated)
+    }
+
+    // --- the window between advanceHomeSwipe retiring a gesture and the timer firing -----------
+
+    /**
+     * `advanceHomeSwipe` retires a gesture at [GESTURE_GAP_MS]; the surface's timer fires 60ms
+     * later. An event arriving in between cancels the pending timer and starts a fresh gesture, so
+     * a swipe that had already earned its navigation used to vanish.
+     *
+     * Not a two-swipe edge case: a trackpad emits nothing at all while the fingers are stationary,
+     * so this is swipe past the threshold, hold ~150ms, nudge once before letting go.
+     */
+    @Test
+    fun `a swipe retired by a late event still navigates`() {
+        val heldThenNudged = swipe(12, -1f) + listOf(Wheel(dx = -1f * step, atMs = 1_011L + 150L))
+        assertEquals(listOf(HomeSwipeDirection.BACK), runSurface(heldThenNudged))
+    }
+
+    /** The whole window, not just its midpoint - every delay from just-past-the-gap to past the timer. */
+    @Test
+    fun `the whole retire-to-timer window is covered`() {
+        for (gap in listOf(GESTURE_GAP_MS + 1, 150L, GESTURE_GAP_MS + 60, GESTURE_GAP_MS + 500)) {
+            val events = swipe(12, -1f) + listOf(Wheel(dx = -1f * step, atMs = 1_011L + gap))
+            assertEquals(
+                listOf(HomeSwipeDirection.BACK),
+                runSurface(events),
+                "a swipe retired ${'$'}gap ms later must still navigate",
+            )
+        }
+    }
+
+    /** An event still INSIDE the gap continues the gesture, so there is nothing to retire and one navigation. */
+    @Test
+    fun `an event inside the gap continues the swipe rather than retiring it`() {
+        val events = swipe(12, -1f) + listOf(Wheel(dx = -1f * step, atMs = 1_011L + GESTURE_GAP_MS))
+        assertEquals(listOf(HomeSwipeDirection.BACK), runSurface(events), "one gesture, one navigation")
+    }
+
+    /** Two full swipes separated by a real gap navigate twice - retiring must not swallow the second. */
+    @Test
+    fun `two separated swipes navigate once each`() {
+        val events = swipe(12, -1f) + swipe(12, -1f, startMs = 1_500L)
+        assertEquals(listOf(HomeSwipeDirection.BACK, HomeSwipeDirection.BACK), runSurface(events))
+    }
+
+    /** A retired gesture that never earned anything must not navigate just because it was retired. */
+    @Test
+    fun `retiring a gesture that never reached the commit distance navigates nothing`() {
+        val events = swipe(3, -0.1f) + listOf(Wheel(dx = -1f * step, atMs = 1_003L + 150L))
+        assertTrue(runSurface(events).isEmpty())
     }
 
     // --- the vertical-only event, which AWT delivers as its own MouseWheelEvent ----------------
