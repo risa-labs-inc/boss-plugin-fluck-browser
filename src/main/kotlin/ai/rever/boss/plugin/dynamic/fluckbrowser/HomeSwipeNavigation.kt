@@ -115,6 +115,25 @@ private const val CANCEL_MIXED_RATIO = 1.3f
 private val CANCEL_VERTICAL_LOW get() = COMMIT_UNITS * 0.125f
 private val CANCEL_VERTICAL_HIGH get() = COMMIT_UNITS * 3f
 
+/**
+ * Chrome's three tiers, applied to a gesture's totals. Shared by both paths through
+ * [advanceHomeSwipe]: an event with a horizontal component, and one without.
+ *
+ * Both, because on macOS AWT splits a diagonal swipe into separate horizontal and vertical
+ * events, so the vertical half of "swipe sideways, then drift into a vertical scroll" arrives
+ * entirely through the branch that has no `deltaX`. Checking only the horizontal path meant that
+ * drift accumulated `verticalPath` without ever being weighed against it - and since the commit
+ * decision moved to release, a gesture could cross the commit distance, turn into a plain
+ * vertical scroll, and still navigate when the fingers lifted.
+ */
+private fun cancelledByVertical(gesture: HomeSwipeGesture): Boolean {
+    val yDelta = gesture.verticalPath
+    val xDelta = kotlin.math.abs(gesture.accumX)
+    return yDelta > CANCEL_STRONG_RATIO * xDelta ||
+        (yDelta * CANCEL_MIXED_RATIO > xDelta && yDelta > CANCEL_VERTICAL_LOW) ||
+        yDelta > CANCEL_VERTICAL_HIGH
+}
+
 /** One gesture in progress. Immutable; [advanceHomeSwipe] returns the next one. */
 internal data class HomeSwipeGesture(
     val accumX: Float = 0f,
@@ -204,6 +223,14 @@ internal fun advanceHomeSwipe(
     // arrive here looking like a fresh clean swipe.
     val withY = stamped.copy(verticalPath = stamped.verticalPath + kotlin.math.abs(deltaY))
     if (deltaX == 0f) {
+        // Weighed against the gesture's horizontal travel, exactly as an event WITH a horizontal
+        // component would be - see [cancelledByVertical]. Only once a gesture is actually
+        // underway: with no horizontal event yet there is nothing to cancel, and the vertical
+        // still accumulates, so a plain vertical scroll that curls sideways at the end is
+        // rejected by the horizontal path on its first `deltaX` just as before.
+        if (withY.events > 0 && cancelledByVertical(withY)) {
+            return HomeSwipeStep(withY.copy(rejected = true), ended = retired)
+        }
         // A vertical-only event advances nothing, but it must not LOOK like the gesture ended
         // either: it carries the gesture's existing direction and progress straight through.
         //
@@ -226,14 +253,7 @@ internal fun advanceHomeSwipe(
 
     val moved = withY.copy(accumX = withY.accumX + deltaX, events = withY.events + 1)
 
-    // Chrome's three tiers, in its order.
-    val yDelta = moved.verticalPath
-    val xDelta = kotlin.math.abs(moved.accumX)
-    val cancelled =
-        yDelta > CANCEL_STRONG_RATIO * xDelta ||
-            (yDelta * CANCEL_MIXED_RATIO > xDelta && yDelta > CANCEL_VERTICAL_LOW) ||
-            yDelta > CANCEL_VERTICAL_HIGH
-    if (cancelled) return HomeSwipeStep(moved.copy(rejected = true), ended = retired)
+    if (cancelledByVertical(moved)) return HomeSwipeStep(moved.copy(rejected = true), ended = retired)
 
     val heading = if (moved.accumX < 0f) HomeSwipeDirection.BACK else HomeSwipeDirection.FORWARD
     val settled =

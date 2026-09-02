@@ -125,6 +125,10 @@ class HomeSwipeNavigationTest {
      * inside the `GESTURE_GAP_MS`..`GESTURE_GAP_MS + 60` window - where the next event cancels the
      * pending timer AND `advanceHomeSwipe` starts fresh - is lost here unless the retired gesture
      * is actually handed back and decided.
+     *
+     * A hand-written model, so it can drift from the composable it mirrors. It covers the Scroll
+     * handler and the end-of-gesture gate only - NOT `PointerEventType.Exit`, which cancels
+     * outright and so has no decision to model.
      */
     private fun runSurface(
         events: List<Wheel>,
@@ -543,6 +547,27 @@ class HomeSwipeNavigationTest {
         val out = run(swipe(MIN_EVENTS - 1, -1f) + listOf(Wheel(dx = 0f, dy = 0.1f * step, atMs = 1_009L)))
         assertNull(out.last.direction)
         assertEquals(0f, out.last.progress)
+    }
+
+    /**
+     * A committed swipe that drifts into a plain vertical scroll before release must not navigate.
+     *
+     * AWT splits a diagonal gesture into separate horizontal and vertical events, so that drift
+     * arrives entirely through the `deltaX == 0` branch. While only the horizontal path weighed
+     * vertical travel, the drift accumulated unopposed - and once the commit decision moved to
+     * release, letting go after it still navigated.
+     */
+    @Test
+    fun `a committed swipe that turns into a vertical scroll before release does not navigate`() {
+        val drift = (0 until 12).map { Wheel(dx = 0f, dy = 1f * step, atMs = 1_012L + it) }
+        assertNull(runSurface(swipe(12, -1f) + drift).firstOrNull())
+    }
+
+    /** The same drift, kept small enough to stay inside Chrome's tiers, is still a swipe. */
+    @Test
+    fun `a little vertical wobble before release still navigates`() {
+        val wobble = listOf(Wheel(dx = 0f, dy = 0.1f * step, atMs = 1_012L))
+        assertEquals(listOf(HomeSwipeDirection.BACK), runSurface(swipe(12, -1f) + wobble))
     }
 
     /** A gesture that never had a horizontal component is not a swipe, and the gate must not end one. */

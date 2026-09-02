@@ -177,9 +177,9 @@ class FluckBrowserTabComponent(
                     BrowserShareManager.unregisterTab(config.id)
                     // Also asks the host to leave fullscreen, so closing a tab mid-video
                     // cannot leave its detached fullscreen window on screen.
-                    val handle = state.releaseBrowserHandle()
-                    // Off the UI thread so closing a tab never hitches the app.
-                    if (handle != null) disposeBrowserHandleOffThread(handle)
+                    // Off the UI thread so closing a tab never hitches the app, and awaiting
+                    // whatever was still running against the handle - see [ReleasedHandle].
+                    disposeReleasedHandle(state.releaseBrowserHandle())
                     // Adopt any in-flight (or completed-but-unconsumed) creation:
                     // it runs on the never-cancelled browserCreationScope precisely
                     // so its result stays retrievable here — dispose whatever it
@@ -1635,8 +1635,12 @@ private fun installDirtyMarker(
  * RESTORING handle's URL against itself verifies nothing; the URL that actually needs verifying
  * is the one this OLD handle is on right now, at capture time.
  *
- * `getCurrentUrl()` is a plain synchronous getter (no native round trip), safe to call from
- * whatever dispatcher we're on, before or after the JS round trip.
+ * `getCurrentUrl()` is documented as a plain synchronous getter, and this reads it INSIDE the IO
+ * offload anyway. The caller here is the hibernation job, which runs on `Dispatchers.Main`, and
+ * this is the last thing to touch the handle before it is disposed; the point of moving five
+ * `executeJavaScript` call sites to IO in this file was to stop taking the app's UI thread on
+ * trust about what does and does not reach native code. One line inside the block it was already
+ * next to costs nothing and removes the last unbounded, un-offloaded call on the capture path.
  *
  * 1 second is generous for a synchronous DOM read and short enough that a wedged renderer
  * cannot delay the dispose it is about to receive anyway. Any failure - timeout, thrown,
@@ -1644,14 +1648,16 @@ private fun installDirtyMarker(
  */
 private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.SavedScroll? =
     try {
-        val url = handle.getCurrentUrl()
         // Dispatchers.IO, not the caller's Main - same reason busyState() gives for its own
         // identical call: withTimeoutOrNull can only abandon a call that SUSPENDS, and if
         // executeJavaScript blocks internally (a wedged renderer) this thread stays parked
         // until it answers. On Main that parks the whole app UI; on IO it parks one thread.
         withContext(Dispatchers.IO) {
+            val url = handle.getCurrentUrl()
             withTimeoutOrNull(1_000L) { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }
-        }?.let { ScrollRestore.parseCapture(it) }?.let { ScrollRestore.SavedScroll(it, url) }
+                ?.let { ScrollRestore.parseCapture(it) }
+                ?.let { ScrollRestore.SavedScroll(it, url) }
+        }
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (_: Throwable) {
@@ -1719,6 +1725,32 @@ private suspend fun restoreScrollOnSettle(
     }
 }
 
+/**
+ * A handle released from [FluckBrowserTabState], together with the jobs that were still pending
+ * against it at the moment of release.
+ *
+ * The two travel together because they are only correct together. The jobs have to be read BEFORE
+ * the cancellation inside `releaseBrowserHandle` completes - each nulls its own field via
+ * `invokeOnCompletion`, usually within microseconds - so a caller reading them afterwards gets an
+ * empty list and an await that looks like protection and is not. That was a rule enforced by a
+ * comment at one call site out of six; bundling them makes the wrong order unrepresentable
+ * instead, which is the same reason `browserHandle` has a `private set`.
+ */
+internal data class ReleasedHandle(
+    val handle: BrowserHandle?,
+    val pendingJobs: List<kotlinx.coroutines.Job>,
+)
+
+/**
+ * Dispose a released handle off the UI thread, awaiting whatever was pending against it.
+ *
+ * The one-liner every release-then-dispose site uses, so all of them get the await rather than
+ * only the site that remembered to ask for it.
+ */
+internal fun disposeReleasedHandle(released: ReleasedHandle) {
+    released.handle?.let { disposeBrowserHandleOffThread(it, awaitJobs = released.pendingJobs) }
+}
+
 /** Dispose a handle off the UI thread — dispose() ends in a blocking Chromium IPC round-trip. */
 internal fun disposeBrowserHandleOffThread(
     handle: BrowserHandle,
@@ -1726,37 +1758,23 @@ internal fun disposeBrowserHandleOffThread(
 ) {
     browserDisposeExecutor.execute {
         try {
-            // installDirtyMarker and restoreScrollOnSettle are launched fire-and-forget on the
-            // long-lived coroutineScope, with nothing joining them before ANY of this file's
-            // several dispose call sites runs otherwise. This closes that gap for the
-            // NORMAL-completion case - a job that is genuinely still running is awaited here
-            // before dispose, at the one call site (hibernation) that passes them. The caller
-            // must snapshot the job references BEFORE calling releaseBrowserHandle() for this to
-            // mean anything: that function cancels both jobs and each nulls its own hoistedState
-            // field via invokeOnCompletion, so building the list from hoistedState AFTER release
-            // reads back fields already nulled by the cancellation that just ran, and awaits
-            // nothing.
+            // installDirtyMarker and restoreScrollOnSettle run executeJavaScript against this
+            // handle; joining them first is what stops one landing mid-dispose. Callers get the
+            // list from [ReleasedHandle] rather than assembling it, so every dispose site is
+            // covered rather than only the one that remembered to ask.
             //
-            // What this does NOT close even with a correct snapshot: `Job.join()` only tells us
-            // the JOB completed, and a job wrapping `withTimeoutOrNull { executeJavaScript(...) }`
-            // completes the instant that timeout gives up - which is NOT the same moment the
-            // underlying native call actually returns if the renderer is genuinely wedged. That
-            // orphaned call can still be running on Main after this join() returns, and it is a
-            // pre-existing limitation this plugin cannot close alone (busyState's own comment
-            // already admits the identical gap for its own timeout-wrapped call) - see
-            // captureScrollOrNull's KDoc. This join is real value for the common case; it is not
-            // a proof of safety against a wedged renderer specifically.
+            // What a join CANNOT tell us: a job wrapping `withTimeoutOrNull { executeJavaScript }`
+            // completes the instant that timeout gives up, which is not when the underlying native
+            // call returns if the renderer is wedged. That orphaned call can still be running
+            // after this returns - a pre-existing limitation this plugin cannot close alone
+            // (busyState admits the identical gap), tracked as BossConsole#300.
             //
-            // runBlocking is safe here specifically because this already runs on
-            // browserDisposeExecutor, a background thread whose only job is this dispose - blocking
-            // it briefly costs nothing else. A bounded wait, not indefinite: a wedged renderer must
-            // not delay a dispose that exists partly to recover FROM a wedged renderer.
-            //
-            // ONE timeout around the whole list, not one per job: two jobs each individually
-            // bounded at 2s could burn up to 4s total before dispose() runs, which is exactly the
-            // "genuinely still running" case this exists for - a job parked in a non-suspending
-            // executeJavaScript is precisely the one cancellation can't shorten, so it is also the
-            // one most likely to pay a per-job timeout in full, twice.
+            // runBlocking is safe here because this already runs on browserDisposeExecutor, a
+            // background thread whose only job is this dispose. Bounded, not indefinite: a wedged
+            // renderer must not delay a dispose that exists partly to recover FROM one. ONE
+            // timeout around the whole list, not one per job - a job parked in a non-suspending
+            // executeJavaScript is the one cancellation cannot shorten, so it is also the one
+            // most likely to pay a per-job bound in full, twice.
             kotlinx.coroutines.runBlocking {
                 kotlinx.coroutines.withTimeoutOrNull(2_000L) {
                     awaitJobs.forEach { job -> job.join() }
@@ -2329,28 +2347,25 @@ internal class FluckBrowserTabState {
      * BossConsole#36 (merged) additionally detaches a matching fullscreen view from `BrowserHandle`
      * disposal, which is what covers the invalid-handle case this cannot reach.
      */
-    fun releaseBrowserHandle(): BrowserHandle? {
+    fun releaseBrowserHandle(): ReleasedHandle {
         val handle = browserHandle
         if (isInFullscreen) {
             requestHostExitFullscreen(handle)
         }
         browserHandle = null
-        // Only ONE of this file's six dispose call sites (hibernation) awaits
-        // installDirtyMarker's/restoreScrollOnSettle's jobs before disposing - the other five
-        // (tab close, retry, crash-recovery, fullscreen-exit recovery, handle replacement) all
-        // funnel through THIS function first, so cancelling here covers every one of them
-        // structurally, rather than threading an awaitJobs list through six call sites by hand.
-        // Cancellation cannot retroactively stop a call already blocked in native code (see
-        // captureScrollOrNull's KDoc for why not), but it DOES stop the job from starting its
-        // NEXT round trip - e.g. restoreScrollOnSettle's reapply loop, between attempts - which
-        // is real exposure reduction even though it is not a complete fix. Each job nulls its own
+        // Read BEFORE the cancel below, and returned to the caller rather than left for it to go
+        // and fetch: cancellation completes almost immediately and each job nulls its own field
+        // via invokeOnCompletion, so a list built from these fields afterwards is empty nearly
+        // every time. See [ReleasedHandle].
+        val pending = listOfNotNull(dirtyMarkerInstallJob, scrollRestoreJob)
+        // Cancel AND hand the jobs back, which are two different protections. Cancellation cannot
+        // retroactively stop a call already blocked in native code (see captureScrollOrNull's
+        // KDoc for why not), but it DOES stop the job from starting its NEXT round trip - e.g.
+        // restoreScrollOnSettle's reapply loop, between attempts. The returned list is what lets
+        // every dispose site actually WAIT for a job already in flight. Each job nulls its own
         // reference in [installDirtyMarker] / the wake effect via `invokeOnCompletion`, so a
         // cancel here on an already-finished job is a harmless no-op, not a double-cancel.
         //
-        // The hibernation call site must read these two fields BEFORE calling this function, not
-        // after: by the time this returns, cancellation has usually already completed and nulled
-        // both, which is exactly why a naive "build awaitJobs from hoistedState after release"
-        // ends up awaiting an empty list.
         dirtyMarkerInstallJob?.cancel()
         scrollRestoreJob?.cancel()
         clearFullscreenState()
@@ -2361,7 +2376,7 @@ internal class FluckBrowserTabState {
         // exists - the "the tab says it is doing something it isn't" family this file is being
         // cleaned of. Adoption re-seeds it from the replacement.
         isLoading = false
-        return handle
+        return ReleasedHandle(handle, pending)
     }
 
     /**
@@ -2793,8 +2808,11 @@ internal fun FluckBrowserTabContent(
     val pageUrl = visiblePageUrl(urlBarText.text, loadedUrl)
     val showDashboard = isHomeUrl(currentUrl)
 
-    // Security indicator derived from current URL
-    val isSecure = currentUrl.startsWith("https://")
+    // Security indicator derived from the LOADED page, not the box. showDashboard above asks what
+    // this composable is rendering, which is the draft's question; the padlock is a claim about
+    // the document the user is actually on, and typing "https://…" over an http page must not
+    // put a lock on it.
+    val isSecure = pageUrl.startsWith("https://")
 
     // Lazily created provider - by the time LaunchedEffect runs, the tab should be registered
     var tabUpdateProvider by remember { mutableStateOf<TabUpdateProvider?>(null) }
@@ -2849,7 +2867,19 @@ internal fun FluckBrowserTabContent(
                     // Same reason the loading listener reads the committed URL rather than the box.
                     browserService.createBrowser(
                         BrowserConfig(
-                            url = visiblePageUrl(urlBarText.text, hoistedState.loadedUrl).ifBlank { initialUrl },
+                            // savedScroll's URL wins when there is one, so the recreated handle
+                            // lands on exactly the URL awaitSettleAndApply is waiting for. Those
+                            // are two different reads otherwise - savedScroll.url comes from
+                            // getCurrentUrl() on the OLD handle, loadedUrl from the navigation
+                            // listener - and any URL the listener does not report (an in-page
+                            // fragment navigation, if the host's NavigationFinished does not fire
+                            // for one) or that the server normalises on reload leaves the restore
+                            // polling its full cap for a URL that never arrives. That is the
+                            // fragment case shouldAttemptRestore goes out of its way to preserve,
+                            // lost one layer down. Self-consistent by construction now.
+                            url =
+                                (hoistedState.savedScroll?.url ?: visiblePageUrl(urlBarText.text, hoistedState.loadedUrl))
+                                    .ifBlank { initialUrl },
                         )
                     )
                 }.also { hoistedState.browserCreation = it }
@@ -3247,8 +3277,7 @@ internal fun FluckBrowserTabContent(
                         // so a stale `true` would strand the tab on FullscreenPlaceholder
                         // with an exit button that can't do anything. releaseBrowserHandle
                         // makes that structural rather than a line to remember here.
-                        hoistedState.releaseBrowserHandle()
-                        disposeBrowserHandleOffThread(handle)
+                        disposeReleasedHandle(hoistedState.releaseBrowserHandle())
                         // A recovery in progress belongs on the starting surface, not the error
                         // one: the tab is about to rebuild its browser by itself, and the retry
                         // below is what makes that true. `error` stays null so the rebuild can
@@ -3266,8 +3295,7 @@ internal fun FluckBrowserTabContent(
                     } else {
                         // Max recovery attempts reached
                         error = "Browser recovery failed after $maxRecoveryAttempts attempts. Please close and reopen this tab."
-                        hoistedState.releaseBrowserHandle()
-                        disposeBrowserHandleOffThread(handle)
+                        disposeReleasedHandle(hoistedState.releaseBrowserHandle())
                     }
                     break
                 }
@@ -3542,17 +3570,12 @@ internal fun FluckBrowserTabContent(
                         return@launch
                     }
                     println("[FluckBrowser] Hibernating idle tab to release its renderer")
-                    // Snapshotted BEFORE releaseBrowserHandle(), which cancels both jobs and (via
-                    // each job's own invokeOnCompletion) nulls these same hoistedState fields once
-                    // cancellation completes - usually well within the capture window below. Read
-                    // after release, this list is built from already-nulled fields almost every
-                    // time and disposeBrowserHandleOffThread's await becomes a no-op that looks
-                    // like real protection but isn't. Snapshotting first is what makes the await
-                    // in the `finally` below actually wait on the jobs that were live at
-                    // hibernation time, not on whatever release happened to leave behind.
-                    val jobsToAwait =
-                        listOfNotNull(hoistedState.dirtyMarkerInstallJob, hoistedState.scrollRestoreJob)
-                    val handle = hoistedState.releaseBrowserHandle()
+                    // The jobs come back WITH the handle - see [ReleasedHandle] for why they
+                    // cannot correctly be fetched separately afterwards. This site cannot use
+                    // disposeReleasedHandle because it has to capture scroll off the live handle
+                    // first; it disposes by hand in the `finally` below, with the same list.
+                    val released = hoistedState.releaseBrowserHandle()
+                    val handle = released.handle
                     if (handle != null) {
                         try {
                             // Sequenced ahead of dispose, not run concurrently with it in OUR
@@ -3591,7 +3614,7 @@ internal fun FluckBrowserTabContent(
                             // the handle - see the comment above. Awaits the jobs snapshotted
                             // before release, not whatever hoistedState holds now - see
                             // disposeBrowserHandleOffThread's KDoc for why that distinction matters.
-                            disposeBrowserHandleOffThread(handle, awaitJobs = jobsToAwait)
+                            disposeBrowserHandleOffThread(handle, awaitJobs = released.pendingJobs)
                         }
                     }
                 }
@@ -3887,7 +3910,7 @@ internal fun FluckBrowserTabContent(
             // with `if (browserHandle != null) return`. That was reachable - the old code could
             // show an error over a working browser - and it left Reset Tab as the only way out.
             // Dropping the handle here makes the button mean what it says in every state.
-            hoistedState.releaseBrowserHandle()?.let { disposeBrowserHandleOffThread(it) }
+            disposeReleasedHandle(hoistedState.releaseBrowserHandle())
             error = null
             initMessage = INITIALIZING_MESSAGE
             retryCount = 0

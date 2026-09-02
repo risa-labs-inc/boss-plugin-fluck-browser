@@ -239,7 +239,7 @@ internal object ScrollRestore {
         }
 
         var landed: Position? = null
-        repeat(reapplyAttempts) { attempt ->
+        repeat(reapplyAttempts) {
             // Re-verified on every attempt, not just once before the loop: a redirect landing
             // AFTER the navigation-wait phase already passed (the page that loaded, then bounced
             // elsewhere - a login/session check is a real example on an EMR-class site) must not

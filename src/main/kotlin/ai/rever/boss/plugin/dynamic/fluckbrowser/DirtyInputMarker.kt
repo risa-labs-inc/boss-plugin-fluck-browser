@@ -42,17 +42,15 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  * it through a non-configurable getter. The two directions a reachable global can be abused are
  * not symmetric, and only one of them costs the user anything:
  *
- *  - **Clearing it** (`window.__fluckDirty = 0` on a timer, or an accidental name collision)
- *    would switch the guard off for that tab and hand back exactly the work loss this exists to
- *    prevent. Closed in both directions, which needed two separate things: with no setter, an
- *    assignment after install is ignored in sloppy mode and throws in strict mode, and
- *    `configurable: false` refuses both `delete` and a redefinition; and the install guard checks
- *    for this script's own accessor rather than for the name being defined at all, so a page
- *    occupying the name BEFORE install (page scripts run first - install is on
- *    `NavigationFinished`) no longer suppresses the install. The name is reclaimed instead.
- *    The one remaining way out is a page that pre-defines the property non-configurable, which
- *    makes `defineProperty` throw into the outer `catch` and leaves the guard off for that tab.
- *    Unavoidable from script, and a deliberate act rather than a one-line accident.
+ *  - **Clearing it** would switch the guard off for that tab and hand back exactly the work loss
+ *    this exists to prevent, so it is closed on both sides of install. After install: no setter,
+ *    so an assignment is ignored in sloppy mode and throws in strict mode, and
+ *    `configurable: false` refuses `delete` and redefinition. Before install: the guard tests for
+ *    this script's own accessor rather than for the name being defined, so a page (or an
+ *    accidental collision) occupying the name does not suppress the install - the name is
+ *    reclaimed. The one way out left is a page that pre-defines the property non-configurable,
+ *    which makes `defineProperty` throw into the outer `catch`; unavoidable from script, and a
+ *    deliberate act rather than a one-line accident.
  *  - **Setting it** cannot be closed the same way and is not worth closing - a page that keeps
  *    itself permanently dirty (by typing into itself with trusted CDP input, say) exempts itself
  *    from hibernation. That is a self-inflicted process-tree leak, bounded by the next visit,
@@ -183,23 +181,19 @@ internal object DirtyInputMarker {
      */
     const val INSTALL_JS: String =
         "(function(){try{" +
-            // The install guard asks whether OUR accessor is already there - not whether the NAME
-            // is taken. Guarding on `typeof window.X !== 'undefined'` used the flag's own value as
-            // the guard, which handed any page a one-line way to switch the feature off before it
-            // ever installed: this script runs on NavigationFinished, page scripts run before
-            // that, so `window.$DIRTY_FLAG_PROPERTY = 0` at document start made the guard see a
-            // defined property, return early, attach NO listeners, and leave BUSY_SCRIPT reading
-            // the page's own permanent 0. An accidental name collision did the same thing.
-            // Checking the descriptor instead means the name being occupied by anything that is
-            // not ours falls through to the defineProperty below, which RECLAIMS it (a plain
-            // `window.x = 0` assignment is configurable, so redefining over it succeeds).
+            // The install guard asks whether OUR accessor is there - never whether the NAME is
+            // taken. A page script runs before this does (install is on NavigationFinished), so a
+            // guard on the property's value lets one line at document start suppress the install
+            // entirely: no listeners, and BUSY_SCRIPT reading the page's own 0 for the document's
+            // life. A name occupied by anything that is not ours falls through to the
+            // defineProperty below and is RECLAIMED - a plain assignment is configurable, so
+            // redefining over it succeeds.
             "var own = Object.getOwnPropertyDescriptor(window, '$DIRTY_FLAG_PROPERTY');" +
             "if (own && typeof own.get === 'function' && !own.configurable) return;" +
-            // The flag itself lives in this closure, not on `window`; the property is a
-            // non-configurable GETTER over it. See the class KDoc's tamper note - a plain
-            // writable property let any page script run `window.$DIRTY_FLAG_PROPERTY = 0` and
-            // switch the guard off after install, the way the guard above let it do so before.
-            // The reader (BUSY_SCRIPT) is unaffected: it still reads the property.
+            // The flag lives in this closure, not on `window`; the property is a non-configurable
+            // GETTER over it, so `window.$DIRTY_FLAG_PROPERTY = 0` from page script cannot switch
+            // the guard off. See the class KDoc's tamper note. The reader (BUSY_SCRIPT) is
+            // unaffected: it still reads the property.
             "var dirty = 0;" +
             "var lastForm = null;" +
             "Object.defineProperty(window, '$DIRTY_FLAG_PROPERTY', {" +

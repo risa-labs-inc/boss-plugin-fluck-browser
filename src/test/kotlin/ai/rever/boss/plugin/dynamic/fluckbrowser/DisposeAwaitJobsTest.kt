@@ -18,14 +18,11 @@ import kotlin.test.assertTrue
  * Pins the ordering [disposeBrowserHandleOffThread] exists for: the jobs it is handed finish
  * BEFORE `dispose()` runs.
  *
- * Worth a test rather than a comment because the invariant is entirely in the caller's hands and
- * fails silently when broken. `installDirtyMarker` and `restoreScrollOnSettle` run
- * `executeJavaScript` against a handle the hibernation path is about to dispose; the protection is
- * that the hibernation site snapshots both Job references *before* calling `releaseBrowserHandle()`
- * (which cancels them, and each nulls its own field on completion) and passes them here. A future
- * refactor that builds the list from `hoistedState` after the release reads back nulled fields,
- * passes an empty list, and this function silently stops awaiting anything - no compile error, no
- * failing assertion anywhere else, just a race that shows up as an occasional crash in the field.
+ * `installDirtyMarker` and `restoreScrollOnSettle` run `executeJavaScript` against a handle the
+ * dispose paths are about to destroy; joining them first is what stops one landing mid-dispose.
+ * Callers no longer assemble that list themselves - [ReleasedHandle] carries it out of
+ * `releaseBrowserHandle` - and [ReleasedHandleTest] covers that half. This covers what happens
+ * once the list arrives: the wait, the bound, and that dispose runs regardless.
  *
  * Deliberately not a test of the pre-existing wedged-renderer gap: a `Job.join()` returning does
  * not prove an orphaned native call has stopped (BossConsole#300). What is pinned here is the
@@ -66,7 +63,9 @@ class DisposeAwaitJobsTest {
 
     @Test
     fun `dispose waits for every job it was handed`() {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        // Dispatchers.IO, not Default: these jobs block on a latch, and Default's parallelism is
+        // the CPU count - two blocked jobs saturate it outright on a 2-vCPU CI runner.
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val recorder = RecordingHandle()
         val finishedAt = AtomicLong(0)
         val release = CountDownLatch(1)
@@ -110,7 +109,7 @@ class DisposeAwaitJobsTest {
      */
     @Test
     fun `a job that never finishes still disposes, once, within the combined bound`() {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val recorder = RecordingHandle()
         val never = CountDownLatch(1)
         val jobs = List(2) { scope.launch { never.await() } }
@@ -121,7 +120,10 @@ class DisposeAwaitJobsTest {
         val waitedMs = (recorder.disposedAt.get() - startedAt) / 1_000_000
 
         assertTrue(waitedMs >= 1_500, "must actually wait for the jobs, not skip the join (waited ${waitedMs}ms)")
-        assertTrue(waitedMs < 3_500, "one 2s bound for the whole list, not 2s per job (waited ${waitedMs}ms)")
+        // Ceiling is well clear of the 2s bound rather than snug against it: this is wall-clock on
+        // shared CI, and the failure this guards against is a per-job bound (2 jobs = 4s), which
+        // 3.9s still separates from a single one.
+        assertTrue(waitedMs < 3_900, "one 2s bound for the whole list, not 2s per job (waited ${waitedMs}ms)")
         never.countDown()
         scope.coroutineContext[Job]?.cancel()
     }
