@@ -48,7 +48,11 @@ class ScrollRestoreTest {
 
     @Test
     fun `restoreJs applies exactly the captured position`() {
-        assertEquals("window.scrollTo(120, 4500)", ScrollRestore.restoreJs(ScrollRestore.Position(120, 4500)))
+        val js = ScrollRestore.restoreJs(ScrollRestore.Position(120, 4500))
+        assertTrue("window.scrollTo(120, 4500)" in js, "the two ints, in order, and nothing else interpolated: $js")
+        // try/catch-wrapped like CAPTURE_JS and the height read beside it - InjectedJavaScriptTest
+        // is what proves the wrapper still leaves a working scroll behind.
+        assertTrue("try{" in js && "catch(e)" in js, "wrapped like the scripts beside it: $js")
     }
 
     @Test

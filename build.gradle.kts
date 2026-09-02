@@ -85,9 +85,10 @@ dependencies {
     // suite rather than pinned by substring. Substring pins catch deletion and nothing else: a
     // syntax error, an inverted condition, or a filter that never matches all pass them, and
     // INSTALL_JS wraps its whole body in try/catch, so any of those fails silently in production.
-    // Rhino rather than GraalJS: ~1.8MB with no extra runtime, and these scripts are plain ES5.
-    // testImplementation only - nothing ships it. See InjectedJavaScriptTest for the DOM stub.
-    testImplementation("org.mozilla:rhino:1.7.15")
+    // Rhino rather than GraalJS: ~2MB with no extra runtime, and these scripts are plain ES5.
+    // testImplementation only - nothing ships it (buildPluginJar bundles from runtimeClasspath).
+    // See JsSandbox for the DOM stub and InjectedJavaScriptTest for what it makes assertable.
+    testImplementation("org.mozilla:rhino:1.8.0")
 }
 
 // Task to build plugin JAR with compiled classes only

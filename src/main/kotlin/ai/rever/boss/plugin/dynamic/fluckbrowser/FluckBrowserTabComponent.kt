@@ -629,22 +629,28 @@ internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:bl
  * The URL of the page the user is looking at, as opposed to [draft] - whatever is currently in
  * the URL bar.
  *
- * The two are the same value except while the user is mid-edit, and that gap is what this exists
- * for: the affordances that act on "the page I am on" (copy link, bookmark) must not act on a
+ * The affordances that act on "the page I am on" (copy link, bookmark) must not act on a
  * half-typed string. `urlBarText` is not a loaded-URL field - it is an editable text box that
- * merely happens to hold the loaded URL most of the time - so [loaded] is tracked separately off
+ * merely happens to hold the loaded URL most of the time - so [loaded] is tracked separately, off
  * the navigation listener, which reports the committed URL whether or not the box is being
  * edited.
  *
- * Falls back to [draft] when [loaded] is blank, which is the state before the first navigation
- * commits: on a brand-new tab there is no loaded page to prefer, and the draft is the best (only)
- * answer.
+ * **No "is the user editing" flag.** An earlier shape took one, and it was not a sound gate:
+ * `onFocusLost` clears editing state after 200ms WITHOUT restoring the box, so typing `htt` and
+ * then clicking into the page leaves a stale draft with editing already false - the exact case the
+ * flag was supposed to exclude. Preferring [loaded] unconditionally has no downside to trade
+ * against that: when nothing is being edited the two agree anyway, except in the window where
+ * `onNavigate` optimistically writes the resolved URL into the bar before the load commits, and
+ * there the page the user is on is still the old one.
+ *
+ * Falls back to [draft] when [loaded] is blank, which is home (see [isHomeUrl] - `about:blank`
+ * fires no navigation events, so home is represented here as "nothing loaded") and the state
+ * before a brand-new tab's first navigation commits.
  */
 internal fun visiblePageUrl(
     draft: String,
-    isEditing: Boolean,
     loaded: String,
-): String = if (isEditing && loaded.isNotBlank()) loaded else draft
+): String = if (loaded.isNotBlank()) loaded else draft
 
 /** What the starting surface says for the first stretch of a boot. */
 internal const val INITIALIZING_MESSAGE = "Initializing browser..."
@@ -2148,6 +2154,21 @@ internal class FluckBrowserTabState {
     var scrollRestoreJob: kotlinx.coroutines.Job? = null
     var isLoading: Boolean by mutableStateOf(false)
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
+
+    /**
+     * The URL the browser last committed to, as opposed to [urlBarText]'s editable draft. Written
+     * unconditionally from the navigation listener - which that listener deliberately does NOT do
+     * for [urlBarText] while the user is editing - and cleared by `applyHomeTabIdentity`, since
+     * `about:blank` fires no navigation events and so cannot announce its own arrival. See
+     * [visiblePageUrl].
+     *
+     * Hoisted, not `remember`ed in the composable. A tab switch disposes the composition (that is
+     * what arms the hibernation timer) while `browserHandle` survives, so the handle-creation
+     * effect - and with it the navigation listener's registration - does not re-run. A local
+     * `remember` would leave the new composition's copy at `""` forever, with the old listener
+     * closure writing into a dead `MutableState`.
+     */
+    var loadedUrl: String by mutableStateOf("")
     var pageTitle: String by mutableStateOf("New Tab")
     var zoomLevel: Double by mutableStateOf(1.0)
 
@@ -2582,6 +2603,7 @@ internal fun FluckBrowserTabContent(
     val browserHandle by hoistedState::browserHandle
     var isLoading by hoistedState::isLoading
     var urlBarText by hoistedState::urlBarText
+    var loadedUrl by hoistedState::loadedUrl
     var pageTitle by hoistedState::pageTitle
     var zoomLevel by hoistedState::zoomLevel
     var error by hoistedState::error
@@ -2598,11 +2620,6 @@ internal fun FluckBrowserTabContent(
     // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
-    // The last URL the browser actually committed to, written by the navigation listener
-    // UNCONDITIONALLY - unlike urlBarText, which that listener deliberately leaves alone while the
-    // user is editing. Local rather than hoisted because it is only ever consulted while editing,
-    // and isUserEditingUrl (also local) is false in a fresh composition. See [visiblePageUrl].
-    var loadedUrl by remember { mutableStateOf("") }
     val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
     val handlePopupNavigation: (PopupNavigation) -> Unit = { navigation ->
         val body = navigation.postData
@@ -2769,11 +2786,11 @@ internal fun FluckBrowserTabContent(
 
     // Show dashboard for about:blank pages - matches bundled browser exactly
     val currentUrl = urlBarText.text
-    // What "the page I am on" means for copy-link and bookmarking. Identical to currentUrl except
-    // mid-edit; see [visiblePageUrl]. Deliberately NOT substituted for currentUrl wholesale -
-    // showDashboard and isSecure below answer "what is this composable rendering", which is the
-    // draft's question, not the loaded page's.
-    val pageUrl = visiblePageUrl(urlBarText.text, isUserEditingUrl, loadedUrl)
+    // What "the page I am on" means for copy-link and bookmarking. Equal to currentUrl whenever
+    // the box holds the loaded URL, which is almost always; see [visiblePageUrl]. Deliberately NOT
+    // substituted for currentUrl wholesale - showDashboard and isSecure below answer "what is this
+    // composable rendering", which is the box's question, not the loaded page's.
+    val pageUrl = visiblePageUrl(urlBarText.text, loadedUrl)
     val showDashboard = isHomeUrl(currentUrl)
 
     // Security indicator derived from current URL
@@ -2905,11 +2922,23 @@ internal fun FluckBrowserTabContent(
                     pageTitle = HOME_TITLE
                     tabUpdateProvider?.updateTitle(HOME_TITLE)
                     tabUpdateProvider?.updateFavicon(null)
+                    // Home is "nothing loaded" as far as visiblePageUrl is concerned. This is the
+                    // only place that can say so: about:blank fires no navigation events, so
+                    // arriving at home cannot announce itself the way every other URL does, and
+                    // loadedUrl would otherwise keep pointing at the page before it.
+                    loadedUrl = ""
                 }
 
                 // A tab that opens directly on home (e.g. a restored dashboard tab)
                 // may never fire navigation events for about:blank — apply up front.
-                if (isHomeUrl(urlBarText.text)) applyHomeTabIdentity()
+                if (isHomeUrl(urlBarText.text)) {
+                    applyHomeTabIdentity()
+                } else if (loadedUrl.isBlank()) {
+                    // Seed for the same reason: the initial loadUrl is issued inside the handle's
+                    // constructor, so the navigation listener below can be registered after that
+                    // first navigation already finished and never hear about it.
+                    loadedUrl = urlBarText.text
+                }
 
                 // The dirty-typing marker rides navigation: installed now for the document already
                 // committed, and re-installed on every navigation event below. Idempotent per
@@ -5861,6 +5890,12 @@ internal fun BrowserToolbar(
         run {
             val clipboardManager = LocalClipboardManager.current
             var urlCopied by remember { mutableStateOf(false) }
+            // Home has no link to copy - the dashboard is a surface, not a page, and its URL is
+            // blank or about:blank. Disabled rather than copying an empty string and showing the
+            // same green check-mark the successful case does, which would report a copy that did
+            // not happen. Greyed the way Back/Forward are, since an explicit tint overrides the
+            // content alpha IconButton would otherwise dim it with.
+            val copyable = !isHomeUrl(pageUrl)
             LaunchedEffect(urlCopied) {
                 if (urlCopied) {
                     delay(1600)
@@ -5872,12 +5907,18 @@ internal fun BrowserToolbar(
                     clipboardManager.setText(AnnotatedString(pageUrl))
                     urlCopied = true
                 },
+                enabled = copyable,
                 modifier = Modifier.size(32.dp)
             ) {
                 Icon(
                     imageVector = if (urlCopied) Icons.Filled.Check else Icons.Filled.Link,
                     contentDescription = if (urlCopied) "Copied" else "Copy link",
-                    tint = if (urlCopied) BossThemeColors.SuccessColor else BossThemeColors.TextPrimary,
+                    tint =
+                        when {
+                            urlCopied -> BossThemeColors.SuccessColor
+                            copyable -> BossThemeColors.TextPrimary
+                            else -> BossThemeColors.TextMuted
+                        },
                     modifier = Modifier.size(18.dp)
                 )
             }

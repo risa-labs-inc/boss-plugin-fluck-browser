@@ -91,6 +91,13 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  *   flag - the listener runs in capture phase, ahead of the page's own submit handlers, and only
  *   checks `isTrusted`. A submit is treated as strong-enough evidence the user is done, not proof
  *   the data reached a server; see the `clear` listener's own doc for the trade this makes.
+ * - A client-side route change (`pushState`, a hash change, an SPA router) does NOT clear the
+ *   flag. The document persists, so [INSTALL_JS]'s install guard correctly early-returns and
+ *   nothing resets it; only a trusted `submit` does. A tab typed into once therefore stays exempt
+ *   for its whole background session, re-armed only by being foregrounded and backgrounded again.
+ *   Same false-positive-safe direction as everything else here, and the same shape `PLAYING_MEDIA`
+ *   already has - but named because it lands on exactly the long-lived SPA class hibernation most
+ *   wants to reclaim, which makes it a wider sliver than the cancelled-IME case below.
  * - One flag, one `lastForm`, for the whole document. Typing into form B and then into form A
  *   moves `lastForm` to A, so submitting A clears the flag while B's draft is still unsubmitted.
  *   The form check below narrows the common shape of this (type a draft, submit an unrelated

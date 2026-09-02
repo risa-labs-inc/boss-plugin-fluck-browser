@@ -182,7 +182,26 @@ internal fun advanceHomeSwipe(
     // horizontal component, or a plain vertical scroll that curls sideways at the end would
     // arrive here looking like a fresh clean swipe.
     val withY = stamped.copy(verticalPath = stamped.verticalPath + kotlin.math.abs(deltaY))
-    if (deltaX == 0f) return HomeSwipeStep(withY)
+    if (deltaX == 0f) {
+        // A vertical-only event advances nothing, but it must not LOOK like the gesture ended
+        // either: it carries the gesture's existing direction and progress straight through.
+        //
+        // Load-bearing, not tidiness. AWT delivers horizontal and vertical wheel deltas as
+        // SEPARATE MouseWheelEvents on macOS, so roughly half the stream of any slightly sloped
+        // two-finger swipe has `deltaX == 0` - including, often, the last event of the gesture.
+        // Returning a bare step there reported `direction = null, progress = 0f`, which made
+        // [HomeSwipeSurface] blank the affordance mid-swipe and - because its end-of-gesture
+        // timer only arms while something is shown - drop the gesture without ever asking
+        // [endHomeSwipe] whether it had earned a navigation. That was invisible while the commit
+        // decision still lived in this function, because it fired on the horizontal event that
+        // crossed the threshold and never depended on which axis the LAST event carried.
+        //
+        // Mirrors the same MIN_EVENTS gate the horizontal path applies below, so a vertical
+        // event cannot draw an affordance the horizontal ones would not have.
+        if (withY.events < MIN_EVENTS) return HomeSwipeStep(withY)
+        val carried = (kotlin.math.abs(withY.accumX) / COMMIT_UNITS).coerceAtMost(1f)
+        return HomeSwipeStep(withY, direction = withY.direction, progress = carried)
+    }
 
     val moved = withY.copy(accumX = withY.accumX + deltaX, events = withY.events + 1)
 

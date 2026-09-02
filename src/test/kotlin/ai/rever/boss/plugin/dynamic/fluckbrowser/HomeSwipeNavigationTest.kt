@@ -62,6 +62,59 @@ class HomeSwipeNavigationTest {
     }
 
     /**
+     * Like [run], but modelling [HomeSwipeSurface]'s own end-of-gesture GATE as well as the
+     * decision - the surface does not call [endHomeSwipe] unconditionally, it arms a timer that
+     * fires only under a condition, and that condition is the part [run] cannot see.
+     *
+     * Worth a second harness because the gate is where a whole gesture can be lost without
+     * [endHomeSwipe] ever being asked: the gate used to be "something is drawn", which an event
+     * with no horizontal component switched off mid-swipe. [run] stays unconditional deliberately,
+     * so the tests that are about [endHomeSwipe]'s own rules keep exercising it directly rather
+     * than being satisfied by a gate that refused to call it.
+     */
+    private fun runGated(
+        events: List<Wheel>,
+        gate: (HomeSwipeGesture, HomeSwipeStep) -> Boolean = ARMED_FROM_GESTURE,
+        canGoBack: Boolean = true,
+        canGoForward: Boolean = true,
+    ): Run {
+        var gesture = HomeSwipeGesture()
+        var last = HomeSwipeStep(gesture)
+        events.forEachIndexed { index, event ->
+            last =
+                advanceHomeSwipe(
+                    gesture = gesture,
+                    deltaX = event.dx,
+                    deltaY = event.dy,
+                    nowMs = if (event.atMs != 0L) event.atMs else 1_000L + index,
+                    consumed = event.consumed,
+                    canGoBack = canGoBack,
+                    canGoForward = canGoForward,
+                )
+            gesture = last.gesture
+        }
+        return Run(if (gate(gesture, last)) endHomeSwipe(gesture) else null, last)
+    }
+
+    private companion object {
+        /** What [HomeSwipeSurface]'s `LaunchedEffect` arms on today. */
+        val ARMED_FROM_GESTURE: (HomeSwipeGesture, HomeSwipeStep) -> Boolean = { gesture, _ -> gesture.events > 0 }
+
+        /**
+         * What it used to arm on - "something is drawn". Kept as a second gate rather than
+         * deleted, because a gesture asserted to navigate under BOTH survives either half of the
+         * vertical-only fix regressing on its own: this gate is the one [advanceHomeSwipe]
+         * carrying its state through the `dx == 0` branch is what satisfies, and
+         * [ARMED_FROM_GESTURE] is the one that holds even if it stops.
+         *
+         * Neither gate is production code, so no test here can pin which one the surface actually
+         * uses - that is a Compose-level fact. What they pin is that the gesture reaches
+         * [endHomeSwipe] intact under either reading.
+         */
+        val ARMED_FROM_AFFORDANCE: (HomeSwipeGesture, HomeSwipeStep) -> Boolean = { _, step -> step.direction != null }
+    }
+
+    /**
      * Fold several SEPARATE physical gestures through one continuous state and end each in turn -
      * for the cases that are about the gap between two swipes, not one swipe's own mechanics.
      * Unlike [run], state is NOT reset to a fresh [HomeSwipeGesture] between calls: the point is
@@ -355,6 +408,60 @@ class HomeSwipeNavigationTest {
     @Test
     fun `the same travel spread over enough events does navigate`() {
         assertEquals(HomeSwipeDirection.BACK, run(swipe(MIN_EVENTS, -5f)).navigated)
+    }
+
+    // --- the vertical-only event, which AWT delivers as its own MouseWheelEvent ----------------
+
+    /**
+     * macOS/AWT delivers horizontal and vertical wheel deltas as SEPARATE events, so in any
+     * slightly sloped two-finger swipe roughly half the stream carries `dx == 0` - often
+     * including the last event of the gesture. A bare step there reported no direction and zero
+     * progress, which blanked the affordance and (because the surface's end-of-gesture timer
+     * only armed while something was shown) dropped the whole gesture without ever asking
+     * whether it had earned a navigation.
+     *
+     * Run through [runGated] specifically: [run] would pass this even while broken, because it
+     * calls [endHomeSwipe] whether or not the surface would have.
+     */
+    @Test
+    fun `a swipe whose last event carries only vertical still navigates`() {
+        val swipeThenVertical = swipe(12, -1f) + listOf(Wheel(dx = 0f, dy = 0.1f * step, atMs = 1_012L))
+        assertEquals(
+            HomeSwipeDirection.BACK,
+            runGated(swipeThenVertical, gate = ARMED_FROM_GESTURE).navigated,
+            "the surface arms its end-of-gesture timer from the gesture",
+        )
+        assertEquals(
+            HomeSwipeDirection.BACK,
+            runGated(swipeThenVertical, gate = ARMED_FROM_AFFORDANCE).navigated,
+            "and would still reach a decision even armed from the affordance, since the step carries it through",
+        )
+    }
+
+    /** The same event mid-swipe must not blank the puck it has no opinion about. */
+    @Test
+    fun `a vertical-only event carries the affordance through instead of resetting it`() {
+        val out = run(swipe(12, -1f) + listOf(Wheel(dx = 0f, dy = 0.1f * step, atMs = 1_012L)))
+        assertEquals(HomeSwipeDirection.BACK, out.last.direction, "the puck must not vanish mid-swipe")
+        assertEquals(1f, out.last.progress, "nor snap back to empty")
+    }
+
+    /**
+     * It carries state through; it does not manufacture any. A vertical-only event arriving
+     * before the gesture looks real must still draw nothing, exactly as the horizontal path
+     * would at that point.
+     */
+    @Test
+    fun `a vertical-only event before MIN_EVENTS still draws nothing`() {
+        val out = run(swipe(MIN_EVENTS - 1, -1f) + listOf(Wheel(dx = 0f, dy = 0.1f * step, atMs = 1_009L)))
+        assertNull(out.last.direction)
+        assertEquals(0f, out.last.progress)
+    }
+
+    /** A gesture that never had a horizontal component is not a swipe, and the gate must not end one. */
+    @Test
+    fun `a purely vertical scroll never navigates`() {
+        assertNull(runGated((0 until 12).map { Wheel(dx = 0f, dy = -1f * step, atMs = 1_000L + it) }).navigated)
     }
 
     @Test

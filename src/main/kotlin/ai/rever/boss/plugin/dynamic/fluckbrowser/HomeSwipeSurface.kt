@@ -85,8 +85,14 @@ internal fun HomeSwipeSurface(
     // check inside advanceHomeSwipe cannot do this alone: it only runs when a NEXT event arrives,
     // so a swipe held or abandoned would never end on its own. Keyed on the tick, so each event
     // cancels the pending end and starts a new one.
+    // Gated on the GESTURE, not on the affordance. Gating on `shown` made ending the gesture
+    // depend on what the most recent event happened to look like: one event the detector had
+    // nothing to draw for (see advanceHomeSwipe's vertical-only branch) left the timer unarmed
+    // and nothing else ever ends a gesture, so the swipe died silently. `events > 0` is true for
+    // the whole life of any gesture that has seen a horizontal delta, which is every gesture
+    // endHomeSwipe could possibly say yes to.
     LaunchedEffect(lastEventTick) {
-        if (shown != null) {
+        if (gesture.events > 0) {
             delay(GESTURE_GAP_MS + 60)
             endGesture()
         }

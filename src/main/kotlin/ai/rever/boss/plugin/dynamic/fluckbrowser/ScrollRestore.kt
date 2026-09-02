@@ -73,8 +73,15 @@ internal object ScrollRestore {
         return Position(x, y)
     }
 
-    /** The script that applies a captured position to the live page. */
-    internal fun restoreJs(position: Position): String = "window.scrollTo(${position.x}, ${position.y})"
+    /**
+     * The script that applies a captured position to the live page. Wrapped in `try{}catch` like
+     * [CAPTURE_JS] and the caller's height read, so a page that has redefined `window.scrollTo`
+     * (or a restricted document) returns rather than throwing back through `executeJavaScript` -
+     * [awaitSettleAndApply]'s `runCatching` would catch it either way, so this is consistency with
+     * the two scripts beside it, not a new guarantee. Interpolates two `Int`s and nothing else.
+     */
+    internal fun restoreJs(position: Position): String =
+        "(function(){try{window.scrollTo(${position.x}, ${position.y});}catch(e){}})()"
 
     /**
      * Whether restoring [target] captured from [capturedUrl] is worth attempting at all.
@@ -217,7 +224,15 @@ internal object ScrollRestore {
         // be reachable.
         var previousHeight: String? = null
         pollUntil(maxSettlePolls, settlePollMs, delay) {
-            val height = readHeight()
+            // readHeight() throwing must not leave previousHeight holding the sample from BEFORE
+            // the throw: pollUntil's runCatching would swallow the exception before the assignment
+            // below ever ran, and a "1000" -> throw -> "1000" sequence would then read as stable
+            // off two samples that were never adjacent. Assigning inside the runCatching makes a
+            // failed read a null sample, which can never compare equal to anything.
+            val height =
+                runCatching { readHeight() }
+                    .onFailure { if (it is CancellationException) throw it }
+                    .getOrNull()
             val stable = height != null && height == previousHeight
             previousHeight = height
             stable
