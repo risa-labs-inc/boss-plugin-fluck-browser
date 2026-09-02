@@ -231,9 +231,17 @@ internal fun advanceHomeSwipe(
  *   not navigate at all - "cancel" does not require a full reversal, just letting go early
  * - one that reverses direction outright is already `rejected` by [advanceHomeSwipe] and never
  *   reaches here with a direction to navigate
+ * - one built from fewer than [MIN_EVENTS] events does not navigate, matching the affordance:
+ *   a stray delta pair that happens to clear the commit distance is not a swipe
  */
 internal fun endHomeSwipe(gesture: HomeSwipeGesture): HomeSwipeDirection? {
     if (gesture.rejected) return null
+    // [MIN_EVENTS] gates committing, not just drawing. It used to gate both for free, because
+    // the commit decision lived inside [advanceHomeSwipe] AFTER its own `events < MIN_EVENTS`
+    // early return; moving the decision here separated the two, and without this line a
+    // two-event flick past [COMMIT_UNITS] navigates. Restated rather than inherited, since the
+    // two functions no longer share a control path.
+    if (gesture.events < MIN_EVENTS) return null
     val direction = gesture.direction ?: return null
     val progress = kotlin.math.abs(gesture.accumX) / COMMIT_UNITS
     return direction.takeIf { progress >= 1f }

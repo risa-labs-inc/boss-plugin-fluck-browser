@@ -69,13 +69,12 @@ class ScrollRestoreTest {
     private val alreadyNavigated: suspend () -> String? = { EXPECTED_URL }
 
     /**
-     * awaitSettleAndApply itself does NOT special-case the origin any more - a codex red-team
-     * finding on an earlier revision caught that (0,0) is not always the natural landing
-     * position (a fragment URL auto-scrolls elsewhere by default; a user who scrolled back to
-     * the true top before hibernating has a real (0,0) to restore). That decision now lives one
-     * layer up, in shouldAttemptRestore, which HAS the URL this function does not. So this
-     * function must actually attempt an origin target when asked - the opposite of what this
-     * test used to assert.
+     * awaitSettleAndApply does NOT special-case the origin: (0,0) is not always a page's natural
+     * landing position (a fragment URL auto-scrolls elsewhere by default, and a user who scrolled
+     * back to the true top before hibernating has a real (0,0) to restore). Deciding whether an
+     * origin target is worth attempting needs the URL, which this function does not have - so it
+     * lives one layer up, in shouldAttemptRestore, and this function attempts whatever it is
+     * asked to.
      */
     @Test
     fun `awaitSettleAndApply does not special-case the origin - that decision lives in shouldAttemptRestore now`() = runTest {
@@ -107,14 +106,14 @@ class ScrollRestoreTest {
         assertTrue(ScrollRestore.shouldAttemptRestore(nonOrigin, "https://example.com/page#section"))
     }
 
-    // region navigation-wait — the phase a PR review added: fixes comparing a freshly created
-    // handle's URL against itself instead of against the ORIGINAL document's URL
+    // region navigation-wait — waiting for the ORIGINAL document's URL, not comparing a freshly
+    // created handle's URL against itself
 
     /**
-     * The actual bug a PR review caught, reproduced directly: a freshly (re)created handle
-     * starts on `about:blank` while its own navigation is still in flight. Height-settle and
-     * apply must not run until the real page has actually loaded - this asserts zero calls to
-     * either while the URL doesn't match yet, not just the eventual outcome.
+     * A freshly (re)created handle starts on `about:blank` while its own navigation is still in
+     * flight. Height-settle and apply must not run until the real page has actually loaded -
+     * this asserts zero calls to either while the URL doesn't match yet, not just the eventual
+     * outcome.
      */
     @Test
     fun `height-settle and apply do not start until the handle actually reaches the expected URL`() = runTest {
@@ -250,11 +249,11 @@ class ScrollRestoreTest {
     }
 
     /**
-     * The bug a second review round caught: an earlier revision returned the height-settle
-     * result, which reports `true` here even though every apply attempt below silently lands
-     * short of [TARGET] - exactly what `window.scrollTo` clamping to a shorter, still-loading
-     * document looks like from this function's side. A page can look height-stable for one poll
-     * cycle in the middle of a lazy load; that must not be reported as the restore having worked.
+     * Height settling is not the restore having worked. Every apply below silently lands short of
+     * [TARGET] - exactly what `window.scrollTo` clamping to a shorter, still-loading document
+     * looks like from this function's side - while the height reads perfectly stable, which a page
+     * can do for one poll cycle in the middle of a lazy load. Returning the settle result here
+     * would report success on a restore that never happened.
      */
     @Test
     fun `a clamped scrollTo reports failure even though the height looked settled`() = runTest {

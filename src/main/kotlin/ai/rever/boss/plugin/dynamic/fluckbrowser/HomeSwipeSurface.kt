@@ -62,15 +62,20 @@ internal fun HomeSwipeSurface(
     // Bumped on every scroll event so the clear below re-arms rather than accumulating.
     var lastEventTick by remember { mutableStateOf(0L) }
 
-    // Ends the gesture and fires the navigation IF it earned one - the only two places that
-    // happen, so onNavigate is called from neither the Scroll nor the Exit handler directly.
-    // Read per gesture, not cached: the host republishes the key the moment the setting changes,
-    // and a relaunch to pick that up would be a poor answer.
-    fun endGesture() {
-        val direction = endHomeSwipe(gesture)
+    // Drops the gesture and its affordance without deciding anything. The abandon path.
+    fun cancelGesture() {
         gesture = HomeSwipeGesture()
         shown = null
         progress = 0f
+    }
+
+    // Ends the gesture and fires the navigation IF it earned one - the ONE place that happens,
+    // so onNavigate is called from neither the Scroll nor the Exit handler directly.
+    // homeSwipeEnabled() is read per gesture, not cached: the host republishes the key the moment
+    // the setting changes, and a relaunch to pick that up would be a poor answer.
+    fun endGesture() {
+        val direction = endHomeSwipe(gesture)
+        cancelGesture()
         if (direction != null && homeSwipeEnabled()) onNavigate(direction)
     }
 
@@ -109,11 +114,13 @@ internal fun HomeSwipeSurface(
                     shown = step.direction.takeIf { enabled }
                     progress = step.progress
                 }
-                // A pointer that leaves the surface ends the gesture outright - Compose does
-                // report this one, unlike the page detector's world, so it does not have to be
-                // inferred from silence. Still routed through endGesture(): lifting past the
-                // commit distance is exactly as much a release as the timeout is.
-                .onPointerEvent(PointerEventType.Exit) { endGesture() },
+                // A pointer that leaves the surface CANCELS the gesture; it does not end it.
+                // Exit is not a release: a macOS two-finger scroll moves no cursor, so the events
+                // that actually raise Exit mid-swipe are the cursor drifting off the home surface
+                // (onto the toolbar, under an overlay) - none of which mean the user let go. The
+                // GESTURE_GAP_MS timer above already covers every real release, so treating Exit
+                // as one only adds navigations nobody asked for.
+                .onPointerEvent(PointerEventType.Exit) { cancelGesture() },
     ) {
         content()
         shown?.let { direction -> HomeSwipeAffordance(direction, progress) }

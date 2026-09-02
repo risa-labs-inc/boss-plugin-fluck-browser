@@ -99,9 +99,9 @@ internal object ScrollRestore {
      * Runs a bounded poll loop until [check] returns true, or the cap is hit. Extracted once
      * three separate phases in [awaitSettleAndApply] needed the identical shape (poll, check,
      * delay, bounded) - the navigation wait, the height-settle wait, and (implicitly) the reapply
-     * count. A real `for`/`break`, never `repeat(N) { ...; return@repeat }` - see this file's own
-     * history for why that distinction gets a whole paragraph: `return@repeat` is `continue`, and
-     * a loop that "exits early" via `continue` silently runs every remaining iteration anyway.
+     * count. A real `for`/`break`, never `repeat(N) { ...; return@repeat }`: `return@repeat` is
+     * `continue`, so a loop that looks like it exits early silently runs every remaining
+     * iteration anyway.
      */
     private suspend fun pollUntil(
         maxPolls: Int,
@@ -155,6 +155,15 @@ internal object ScrollRestore {
      * the cap only needs to be shorter than "the user gave up and closed the tab," not shorter
      * than "a slow page."
      *
+     * How generous, concretely: the caps here are poll COUNTS, and each poll also pays whatever
+     * its injected call costs. With the caller's `RESTORE_CALL_TIMEOUT_MS` of 1s per call, the
+     * navigation-wait phase's worst case is 60 x (1s + 150ms) ~= 69s, not the 9s the poll delays
+     * alone suggest; settle adds up to 20 x 1.15s and the reapply loop up to 4 x (2s + 300ms).
+     * That is far longer than `disposeBrowserHandleOffThread`'s 2s join is willing to wait, which
+     * is deliberate - that join is a best-effort courtesy before disposing, not a deadline this
+     * loop is written to meet. The bound that actually stops this loop in that case is
+     * cancellation: `releaseBrowserHandle()` cancels the job on the way out.
+     *
      * Comparison is exact string equality on the URL, which is brittle to anything that changes
      * it between visits - a server redirect, an auth bounce, a page that `replaceState`s away a
      * query param, a per-session token in the URL. [SavedScroll]'s fragment handling in
@@ -162,18 +171,17 @@ internal object ScrollRestore {
      * for now: the failure mode is "restore silently skipped," not a wrong-page write.
      *
      * @return true only if [readPosition] actually reads back [target] after an apply - NOT
-     *   whether the height-settle loop stabilized. An earlier revision returned the settle
-     *   result, which reports `true` even when every apply attempt below silently failed: on a
+     *   whether the height-settle loop stabilized. The two are not the same answer: on a
      *   lazy-loading or infinite-scroll page, `window.scrollTo` CLAMPS to the document's current
      *   `scrollHeight`, so restoring to a position captured on a taller, fully-loaded document
      *   lands short every time the page hasn't grown back to that height yet within the reapply
      *   window - and the height itself can look "stable" for a 150ms poll cycle in the middle of
-     *   that load, which is exactly the case this return value now has to call a failure rather
-     *   than silently agree with. `false` covers three distinct reasons - the navigation wait
-     *   timed out, the page redirected away mid-restore, or every reapply attempt landed short -
-     *   collapsed to one boolean deliberately: the caller's only correct response to any of them
-     *   is the same (log it, do not treat the position as restored), so a richer result type
-     *   would add cases without adding a case that changes what happens next.
+     *   that load. Reporting the settle result would call that a success. `false` covers three
+     *   distinct reasons - the navigation wait timed out, the page redirected away mid-restore, or
+     *   every reapply attempt landed short - collapsed to one boolean deliberately: the caller's
+     *   only correct response to any of them is the same (log it, do not treat the position as
+     *   restored), so a richer result type would add cases without adding a case that changes what
+     *   happens next.
      *
      * **Known gap this cannot close:** a `landed == target` read is a snapshot, not a guarantee
      * the position stays there. A route change's own scroll-to-top (a common SPA pattern, fired
@@ -233,9 +241,8 @@ internal object ScrollRestore {
             landed = runCatching { readPosition() }.onFailure { if (it is CancellationException) throw it }.getOrNull()
             // A bare `return` here is a non-local return out of awaitSettleAndApply - repeat()
             // is inline, so this exits the whole function, not just this iteration. That is the
-            // "break", correctly this time; `return@repeat` would be the same mistake again. No
-            // `attempt == reapplyAttempts - 1` disjunct needed any more: falling out of `repeat`
-            // reaches the identical `landed == target` check below on its own.
+            // "break"; `return@repeat` would be `continue`. No last-iteration disjunct is needed:
+            // falling out of `repeat` reaches the identical `landed == target` check below.
             if (landed == target) return true
         }
         return landed == target

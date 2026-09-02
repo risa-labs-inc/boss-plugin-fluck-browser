@@ -94,6 +94,20 @@ class UserInputGuardTest {
      * DirtyInputMarker's KDoc rather than this test, which cannot observe that distinction).
      */
     @Test
+    fun `the flag is exposed to the page as a read-only getter, never a writable property`() {
+        val js = DirtyInputMarker.INSTALL_JS
+        assertTrue(
+            "Object.defineProperty(window, '${DirtyInputMarker.DIRTY_FLAG_PROPERTY}'" in js,
+            "a page running `window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} = 0` on a timer would switch the guard off",
+        )
+        assertTrue("configurable: false" in js, "configurable:false is what refuses delete and redefinition")
+        assertTrue(
+            "window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} = 1" !in js,
+            "the flag must be assigned through the closure variable, not the property",
+        )
+    }
+
+    @Test
     fun `the marker arms on trusted keystrokes in the capture phase`() {
         val js = DirtyInputMarker.INSTALL_JS
         assertTrue("isTrusted" in js, "only a real user event may set the flag")
@@ -146,6 +160,11 @@ class UserInputGuardTest {
      * lifetime - the exact class of heavy, long-lived renderer hibernation exists to reclaim.
      * Capture phase and `isTrusted`-gated for the same reason the mark listeners are: a page's
      * own submit handler must not be able to fake or suppress this from either direction.
+     *
+     * The BEHAVIOUR of the clear - including the `lastForm` scoping that keeps an unrelated
+     * form's submit from dropping another form's draft - is asserted by actually running the
+     * script in [InjectedJavaScriptTest]. This pins only the registration, which that test cannot
+     * distinguish from a listener registered on the bubble phase.
      */
     @Test
     fun `a trusted submit clears the flag, so a later edit can re-arm it`() {
@@ -156,10 +175,7 @@ class UserInputGuardTest {
         )
         val clearBody = js.substringAfter("var clear = function(e){").substringBefore("};")
         assertTrue("isTrusted" in clearBody, "the clear listener must gate on isTrusted like every other listener here")
-        assertTrue(
-            "window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} = 0" in clearBody,
-            "the submit listener must reset the flag, not just observe it",
-        )
+        assertTrue("dirty = 0" in clearBody, "the submit listener must reset the flag, not just observe it")
     }
 
     // endregion

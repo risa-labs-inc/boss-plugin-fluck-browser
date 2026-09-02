@@ -34,12 +34,23 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  *
  * The busy probe is a separate evaluation in a fresh scope, so cross-evaluation state has to
  * live somewhere both can reach, and for page script that is a window property or nothing (the
- * same conclusion CredentialCapture's install-guard note reaches). The costs are accepted with
- * eyes open: a page that PRE-SETS `__fluckDirty = 1` exempts itself from hibernation - a
- * self-inflicted process-tree leak, bounded by the next visit, not a data risk; a page that
- * reads it can fingerprint BOSS, which `window.__bossCoBrowse` already concedes elsewhere.
- * Contrast with CredentialCapture, where a reachable global would have exposed *credentials*:
- * same reasoning, different stakes, opposite conclusion.
+ * same conclusion CredentialCapture's install-guard note reaches). Contrast with
+ * CredentialCapture, where a reachable global would have exposed *credentials*: same reasoning,
+ * different stakes, opposite conclusion.
+ *
+ * The property is READ-only to the page: [INSTALL_JS] keeps the value in a closure and exposes
+ * it through a non-configurable getter. The two directions a reachable global can be abused are
+ * not symmetric, and only one of them costs the user anything:
+ *
+ *  - **Clearing it** (`window.__fluckDirty = 0` on a timer, or an accidental name collision)
+ *    would switch the guard off for that tab and hand back exactly the work loss this exists to
+ *    prevent. Closed: with no setter, the assignment is ignored in sloppy mode and throws in
+ *    strict mode, and `configurable: false` refuses both `delete` and a redefinition.
+ *  - **Setting it** cannot be closed the same way and is not worth closing - a page that keeps
+ *    itself permanently dirty (by typing into itself with trusted CDP input, say) exempts itself
+ *    from hibernation. That is a self-inflicted process-tree leak, bounded by the next visit,
+ *    not a data risk.
+ *  - **Reading it** fingerprints BOSS, which `window.__bossCoBrowse` already concedes elsewhere.
  *
  * The credential channel (`setPageEventScript`) was deliberately NOT used, although a
  * Kotlin-side flag would avoid the global: the channel has one script slot per handle, owned by
@@ -80,6 +91,12 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  *   flag - the listener runs in capture phase, ahead of the page's own submit handlers, and only
  *   checks `isTrusted`. A submit is treated as strong-enough evidence the user is done, not proof
  *   the data reached a server; see the `clear` listener's own doc for the trade this makes.
+ * - One flag, one `lastForm`, for the whole document. Typing into form B and then into form A
+ *   moves `lastForm` to A, so submitting A clears the flag while B's draft is still unsubmitted.
+ *   The form check below narrows the common shape of this (type a draft, submit an unrelated
+ *   search box) but cannot close it; per-form state would need a set of dirty forms and a
+ *   correspondingly richer probe result, which is more machinery than the remaining sliver of
+ *   risk justifies.
  */
 internal object DirtyInputMarker {
     /**
@@ -116,13 +133,17 @@ internal object DirtyInputMarker {
      * once the flag is set - see the `submit` listener below for why "nothing left to learn"
      * stopped being true.
      *
-     * A trusted `submit` (capture phase) resets the flag to `0`. Without it, one keystroke into a
-     * search box exempts a long-lived SPA tab (Gmail, Slack, Jira, Linear-shaped apps) from
-     * hibernation for the rest of its document lifetime, which is exactly the class of heavy,
-     * long-lived renderer hibernation exists to reclaim. Classic forms already clear the flag for
-     * free on navigation; this covers the SPA case that `preventDefault()`s the submit and never
-     * navigates - the `submit` event still fires either way, so the listener does not need to know
-     * whether the app went on to navigate.
+     * A trusted `submit` (capture phase) resets the flag to `0`, but only when the submitted form
+     * is the one the typing went into (`lastForm`), or when the typing was not in a form at all.
+     * Without any clear at all, one keystroke into a search box exempts a long-lived SPA tab
+     * (Gmail, Slack, Jira, Linear-shaped apps) from hibernation for the rest of its document
+     * lifetime, which is exactly the class of heavy, long-lived renderer hibernation exists to
+     * reclaim. Classic forms already clear the flag for free on navigation; this covers the SPA
+     * case that `preventDefault()`s the submit and never navigates - the `submit` event still
+     * fires either way, so the listener does not need to know whether the app went on to
+     * navigate. The `lastForm` check is what keeps that from over-reaching in the other
+     * direction: an unrelated form's submit says nothing about a draft sitting in a different
+     * one, and clearing on it would silently make the draft hibernatable.
      *
      * This is a real trade in the opposite direction from every other over-triggering case in this
      * file: a submit is evidence the work was likely saved, not certain proof - a client-side
@@ -140,7 +161,17 @@ internal object DirtyInputMarker {
     const val INSTALL_JS: String =
         "(function(){try{" +
             "if (typeof window.$DIRTY_FLAG_PROPERTY !== 'undefined') return;" +
-            "window.$DIRTY_FLAG_PROPERTY = 0;" +
+            // The flag itself lives in this closure, not on `window`; the property is a
+            // non-configurable GETTER over it. See the class KDoc's tamper note - a plain
+            // writable property let any page script (or an accidental name collision) run
+            // `window.$DIRTY_FLAG_PROPERTY = 0` and switch the guard off for that tab.
+            // The reader (BUSY_SCRIPT) is unaffected: it still reads the property.
+            "var dirty = 0;" +
+            "var lastForm = null;" +
+            "Object.defineProperty(window, '$DIRTY_FLAG_PROPERTY', {" +
+            "get: function(){ return dirty; }," +
+            "configurable: false" +
+            "});" +
             "var editable = function(t){" +
             "if (!t) return false;" +
             "if (t.readOnly) return false;" +
@@ -159,11 +190,23 @@ internal object DirtyInputMarker {
             "var k = e.key || '';" +
             "if (k.length !== 1 && k !== 'Backspace' && k !== 'Delete') return;" +
             "}" +
-            "window.$DIRTY_FLAG_PROPERTY = 1;" +
+            // Which form the typing went into, so `clear` can tell "the draft was submitted"
+            // from "some other form on the page was submitted". Null for contenteditable and
+            // for an input outside any form - see `clear` for what that case falls back to.
+            "lastForm = (e.target && e.target.form) || null;" +
+            "dirty = 1;" +
             "};" +
             "var clear = function(e){" +
             "if (!e.isTrusted) return;" +
-            "window.$DIRTY_FLAG_PROPERTY = 0;" +
+            // A submit only speaks for the form the typing was actually in. Without this, a
+            // query typed into a site's search box and submitted would clear the flag set by a
+            // long unsubmitted comment in a different form on the same page - the exact loss
+            // this feature exists to prevent, and likelier than any of the over-triggering
+            // cases the KDoc accepts. `lastForm === null` keeps the old clear-on-any-submit
+            // behaviour, which is what the SPA case this listener was added for needs.
+            "if (lastForm && e.target !== lastForm) return;" +
+            "lastForm = null;" +
+            "dirty = 0;" +
             "};" +
             "window.addEventListener('keydown', mark, true);" +
             "window.addEventListener('paste', mark, true);" +

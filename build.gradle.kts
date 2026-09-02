@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.2.26"
+version = "1.2.27"
 
 java {
     toolchain {
@@ -81,6 +81,13 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.3.0")
     testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    // Test-only JS engine, so the scripts this plugin injects into pages are EXECUTED by the
+    // suite rather than pinned by substring. Substring pins catch deletion and nothing else: a
+    // syntax error, an inverted condition, or a filter that never matches all pass them, and
+    // INSTALL_JS wraps its whole body in try/catch, so any of those fails silently in production.
+    // Rhino rather than GraalJS: ~1.8MB with no extra runtime, and these scripts are plain ES5.
+    // testImplementation only - nothing ships it. See InjectedJavaScriptTest for the DOM stub.
+    testImplementation("org.mozilla:rhino:1.7.15")
 }
 
 // Task to build plugin JAR with compiled classes only

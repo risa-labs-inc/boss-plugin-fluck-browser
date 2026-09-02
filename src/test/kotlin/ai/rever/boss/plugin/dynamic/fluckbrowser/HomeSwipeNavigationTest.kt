@@ -329,6 +329,34 @@ class HomeSwipeNavigationTest {
         assertEquals(0f, out.last.progress)
     }
 
+    /**
+     * [MIN_EVENTS] gates COMMITTING, not just drawing - and the two are no longer the same code
+     * path. While the commit decision lived inside [advanceHomeSwipe] it sat after that
+     * function's own `events < MIN_EVENTS` early return and inherited the guard for free; with
+     * the decision moved to [endHomeSwipe], a two-event flick carrying enough distance to clear
+     * [COMMIT_UNITS] navigates unless [endHomeSwipe] restates it.
+     *
+     * The distance here is deliberately past the commit point (2 events x 5 steps ~= 3.9 units
+     * against a 3.5 threshold), so nothing but the event count can be what refuses it. Asserted
+     * on `navigated`, which the drawing test above does not look at.
+     */
+    @Test
+    fun `a flick with too few events does not navigate, however far it travelled`() {
+        val out = run(swipe(MIN_EVENTS - 1, -5f))
+        assertTrue(
+            kotlin.math.abs(out.last.gesture.accumX) / COMMIT_UNITS >= 1f,
+            "the setup must actually clear the commit distance, or this proves nothing",
+        )
+        assertNull(out.navigated, "fewer than MIN_EVENTS is a stray delta, not a swipe")
+        assertNull(out.last.direction, "and nothing is drawn for it either")
+    }
+
+    /** The same distance over enough events IS a swipe - so the guard above is a floor, not a wall. */
+    @Test
+    fun `the same travel spread over enough events does navigate`() {
+        assertEquals(HomeSwipeDirection.BACK, run(swipe(MIN_EVENTS, -5f)).navigated)
+    }
+
     @Test
     fun `progress ramps to one at the commit`() {
         val half = run(swipe(5, -1f)).last

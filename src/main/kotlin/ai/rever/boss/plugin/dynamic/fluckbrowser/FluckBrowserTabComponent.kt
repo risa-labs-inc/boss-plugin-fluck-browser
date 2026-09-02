@@ -625,6 +625,27 @@ internal const val HOME_TITLE = "Home"
 
 internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:blank"
 
+/**
+ * The URL of the page the user is looking at, as opposed to [draft] - whatever is currently in
+ * the URL bar.
+ *
+ * The two are the same value except while the user is mid-edit, and that gap is what this exists
+ * for: the affordances that act on "the page I am on" (copy link, bookmark) must not act on a
+ * half-typed string. `urlBarText` is not a loaded-URL field - it is an editable text box that
+ * merely happens to hold the loaded URL most of the time - so [loaded] is tracked separately off
+ * the navigation listener, which reports the committed URL whether or not the box is being
+ * edited.
+ *
+ * Falls back to [draft] when [loaded] is blank, which is the state before the first navigation
+ * commits: on a brand-new tab there is no loaded page to prefer, and the draft is the best (only)
+ * answer.
+ */
+internal fun visiblePageUrl(
+    draft: String,
+    isEditing: Boolean,
+    loaded: String,
+): String = if (isEditing && loaded.isNotBlank()) loaded else draft
+
 /** What the starting surface says for the first stretch of a boot. */
 internal const val INITIALIZING_MESSAGE = "Initializing browser..."
 
@@ -1587,7 +1608,13 @@ private fun installDirtyMarker(
     hoistedState.dirtyMarkerInstallJob?.cancel()
     val job =
         coroutineScope.launch {
+            // Rethrows CancellationException rather than swallowing it, matching captureScrollOrNull
+            // and every runCatching inside ScrollRestore: runCatching is Throwable-wide, so a
+            // cancelled install caught here would complete this job NORMALLY. Nothing runs after
+            // the runCatching today, so today that only mislabels the job's completion - but it is
+            // the same shape that would silently keep going the moment anything is added below it.
             runCatching { withContext(Dispatchers.IO) { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) } }
+                .onFailure { if (it is CancellationException) throw it }
         }
     hoistedState.dirtyMarkerInstallJob = job
     // Identity-checked so a completion callback firing late (after a NEWER install already
@@ -1701,8 +1728,8 @@ internal fun disposeBrowserHandleOffThread(
             // must snapshot the job references BEFORE calling releaseBrowserHandle() for this to
             // mean anything: that function cancels both jobs and each nulls its own hoistedState
             // field via invokeOnCompletion, so building the list from hoistedState AFTER release
-            // (as an earlier revision did) reads back fields already nulled by the cancellation
-            // that just ran, and awaits nothing.
+            // reads back fields already nulled by the cancellation that just ran, and awaits
+            // nothing.
             //
             // What this does NOT close even with a correct snapshot: `Job.join()` only tells us
             // the JOB completed, and a job wrapping `withTimeoutOrNull { executeJavaScript(...) }`
@@ -2571,6 +2598,11 @@ internal fun FluckBrowserTabContent(
     // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
+    // The last URL the browser actually committed to, written by the navigation listener
+    // UNCONDITIONALLY - unlike urlBarText, which that listener deliberately leaves alone while the
+    // user is editing. Local rather than hoisted because it is only ever consulted while editing,
+    // and isUserEditingUrl (also local) is false in a fresh composition. See [visiblePageUrl].
+    var loadedUrl by remember { mutableStateOf("") }
     val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
     val handlePopupNavigation: (PopupNavigation) -> Unit = { navigation ->
         val body = navigation.postData
@@ -2737,6 +2769,11 @@ internal fun FluckBrowserTabContent(
 
     // Show dashboard for about:blank pages - matches bundled browser exactly
     val currentUrl = urlBarText.text
+    // What "the page I am on" means for copy-link and bookmarking. Identical to currentUrl except
+    // mid-edit; see [visiblePageUrl]. Deliberately NOT substituted for currentUrl wholesale -
+    // showDashboard and isSecure below answer "what is this composable rendering", which is the
+    // draft's question, not the loaded page's.
+    val pageUrl = visiblePageUrl(urlBarText.text, isUserEditingUrl, loadedUrl)
     val showDashboard = isHomeUrl(currentUrl)
 
     // Security indicator derived from current URL
@@ -2845,6 +2882,12 @@ internal fun FluckBrowserTabContent(
                 // previously stopped a fast-enough re-hibernation from disposing mid-restore.
                 hoistedState.savedScroll?.let { saved ->
                     hoistedState.savedScroll = null
+                    // Cancel-before-overwrite, symmetric with installDirtyMarker and for the same
+                    // reason: a field that still has a job in it is a job nothing would join or
+                    // cancel again once the reference is gone. Hard to reach here (savedScroll is
+                    // consumed once, and releaseBrowserHandle cancels on the way out), so this is
+                    // the invariant made structural rather than a live bug being fixed.
+                    hoistedState.scrollRestoreJob?.cancel()
                     val job = coroutineScope.launch { restoreScrollOnSettle(handle, saved) }
                     hoistedState.scrollRestoreJob = job
                     // See installDirtyMarker's identical pattern for why this is identity-checked.
@@ -2879,6 +2922,7 @@ internal fun FluckBrowserTabContent(
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
                     installDirtyMarker(handle, coroutineScope, hoistedState)
+                    loadedUrl = url
                     // Only update URL bar if user isn't actively editing
                     // AND sufficient time has passed since last input (300ms buffer for Tab completion)
                     val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
@@ -3519,12 +3563,12 @@ internal fun FluckBrowserTabContent(
     // Keep the URL-bar star in sync with external collection edits — e.g. when the
     // user removes a bookmark from the bookmarks panel, isBookmarked must reflect that.
     val bookmarkCollections = bookmarkDataProvider?.collections?.collectAsState(initial = emptyList())?.value
-    LaunchedEffect(bookmarkCollections, currentUrl, pageTitle, bookmarkDataProvider) {
+    LaunchedEffect(bookmarkCollections, pageUrl, pageTitle, bookmarkDataProvider) {
         bookmarkDataProvider?.let { provider ->
             val tabConfig = ai.rever.boss.plugin.workspace.TabConfig(
                 type = "browser",
                 title = pageTitle,
-                url = currentUrl
+                url = pageUrl
             )
             isBookmarked = provider.isTabBookmarked(tabConfig)
         }
@@ -3618,6 +3662,7 @@ internal fun FluckBrowserTabContent(
         // system property (read inline so a recompose after toggling reflects it).
         val shareButtonEnabled = System.getProperty("boss.fluck.showShareButton") == "true"
         BrowserToolbar(
+            pageUrl = pageUrl,
             onShare = if (shareButtonEnabled) {
                 {
                     BrowserShareManager.share(tabId, shareMaskInputs)
@@ -3708,7 +3753,7 @@ internal fun FluckBrowserTabContent(
                     val tabConfig = TabConfig(
                         type = "browser",
                         title = pageTitle,
-                        url = currentUrl
+                        url = pageUrl
                     )
                     if (isBookmarked) {
                         // Remove bookmark
@@ -4046,7 +4091,7 @@ internal fun FluckBrowserTabContent(
                                     val tabConfig = TabConfig(
                                         type = "browser",
                                         title = pageTitle,
-                                        url = currentUrl
+                                        url = pageUrl
                                     )
                                     if (isBookmarked) {
                                         // Remove bookmark
@@ -5686,6 +5731,10 @@ private fun ShareLinkRow(label: String, url: String) {
 @Composable
 internal fun BrowserToolbar(
     urlBarText: TextFieldValue,
+    // The loaded page's URL, which equals urlBarText except while the user is mid-edit. Only the
+    // copy-link button reads it - everything else here is about the text box itself. See
+    // visiblePageUrl.
+    pageUrl: String,
     onUrlBarTextChange: (TextFieldValue) -> Unit,
     onNavigate: (String) -> Unit,
     canGoBack: Boolean,
@@ -5806,9 +5855,9 @@ internal fun BrowserToolbar(
 
         // Copy-link button, left of the URL bar. Mirrors ShareLinkRow's copy-feedback pattern
         // (swap to a checkmark, revert after ~1.6s) so copying a link feels the same everywhere
-        // in this file. Copies urlBarText.text specifically - that is this composable's own
-        // definition of "current URL" (see `val currentUrl = urlBarText.text` at the call site,
-        // already used for bookmarking), not a separately tracked loaded-vs-draft value.
+        // in this file. Copies pageUrl, not urlBarText.text: a copy-LINK affordance means "the
+        // page I am on", and mid-edit the text box holds a half-typed string instead. The
+        // bookmark paths at the call site read the same value, so the two agree.
         run {
             val clipboardManager = LocalClipboardManager.current
             var urlCopied by remember { mutableStateOf(false) }
@@ -5820,7 +5869,7 @@ internal fun BrowserToolbar(
             }
             IconButton(
                 onClick = {
-                    clipboardManager.setText(AnnotatedString(urlBarText.text))
+                    clipboardManager.setText(AnnotatedString(pageUrl))
                     urlCopied = true
                 },
                 modifier = Modifier.size(32.dp)
