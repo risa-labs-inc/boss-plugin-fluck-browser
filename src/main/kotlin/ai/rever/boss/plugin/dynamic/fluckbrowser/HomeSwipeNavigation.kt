@@ -203,10 +203,11 @@ internal fun advanceHomeSwipe(
     canGoBack: Boolean,
     canGoForward: Boolean,
 ): HomeSwipeStep {
-    // A gap in the stream is the end of the previous gesture. Unlike the page detector there is
-    // no timer companion to this: a Compose surface can also be told the pointer left, and the
-    // caller ends the gesture on exit, which covers the lifted finger that never sends another
-    // event.
+    // A gap in the stream is the end of the previous gesture, and the gesture it ends comes back
+    // on HomeSwipeStep.ended rather than being dropped. This is not the only thing that ends a
+    // gesture - HomeSwipeSurface runs a quiescence timer too, and the two cover different cases:
+    // this one only fires when a NEXT event arrives, so a gesture that simply stops needs the
+    // timer. Pointer exit is neither; it cancels outright.
     val continuing = gesture.lastEventAtMs != 0L && nowMs - gesture.lastEventAtMs <= GESTURE_GAP_MS
     val base = if (continuing) gesture else HomeSwipeGesture()
     val stamped = base.copy(lastEventAtMs = nowMs)

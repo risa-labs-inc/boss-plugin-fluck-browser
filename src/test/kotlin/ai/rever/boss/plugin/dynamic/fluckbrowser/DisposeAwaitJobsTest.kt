@@ -11,7 +11,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.Test
-import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
@@ -78,10 +77,10 @@ class DisposeAwaitJobsTest {
                 }
             }
 
+        // No "has it disposed yet" assertion here: dispose is posted to an executor, so a
+        // not-yet-scheduled broken implementation would pass it just as well as a correct one.
+        // The timestamp comparison below is what actually proves the ordering.
         disposeBrowserHandleOffThread(recorder.handle, awaitJobs = jobs)
-        // Nothing may dispose while the jobs are still running.
-        assertEquals(1L, recorder.disposed.count, "dispose must not run ahead of the jobs it was given")
-
         release.countDown()
         awaitDispose(recorder)
         assertTrue(

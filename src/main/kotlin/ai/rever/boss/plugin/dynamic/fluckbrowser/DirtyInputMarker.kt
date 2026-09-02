@@ -17,8 +17,8 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  * documented failure modes are structurally impossible via those two paths - not "impossible",
  * full stop; see the CDP note below, which is a different path with a different answer.
  *
- * A keystroke basis also covers `contenteditable`, which the DOM approach never could - a rich
- *-text editor has no default to diff against, but typing into one is still typing.
+ * A keystroke basis also covers `contenteditable`, which the DOM approach never could - a
+ * rich-text editor has no default to diff against, but typing into one is still typing.
  *
  * **Not a defence against CDP-level input injection.** `Input.dispatchKeyEvent` over the Chrome
  * DevTools Protocol produces `isTrusted: true` by design - Chromium cannot distinguish it from

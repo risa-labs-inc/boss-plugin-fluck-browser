@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -108,6 +109,68 @@ class ScrollRestoreTest {
         // A non-origin target is always worth attempting, fragment or not.
         assertTrue(ScrollRestore.shouldAttemptRestore(nonOrigin, "https://example.com/page"))
         assertTrue(ScrollRestore.shouldAttemptRestore(nonOrigin, "https://example.com/page#section"))
+    }
+
+    /**
+     * `pollUntil`'s `runCatching` is Throwable-wide, so a cancellation caught and not rethrown
+     * would let the loop keep polling after its coroutine was told to stop. Its own comment notes
+     * the production `delay` rethrows and the tests' `delay = {}` does not, so this path is the
+     * only thing that exercises the guarantee - and it had no test.
+     */
+    @Test
+    fun `a cancelled probe stops the poll loop instead of being swallowed`() = runTest {
+        var heightReads = 0
+        assertFailsWith<kotlinx.coroutines.CancellationException> {
+            ScrollRestore.awaitSettleAndApply(
+                target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
+                readHeight = { heightReads++; throw kotlinx.coroutines.CancellationException("tab closed") },
+                applyScroll = {},
+                readPosition = { TARGET },
+                delay = {},
+                maxSettlePolls = 20,
+            )
+        }
+        assertEquals(1, heightReads, "must stop at the first cancellation, not poll out the cap")
+    }
+
+    /**
+     * A restore that lands a pixel or two off under zoom or a fractional device-pixel ratio has
+     * succeeded. Requiring exact equality spent every reapply attempt re-applying a position that
+     * was already there and then reported failure.
+     */
+    @Test
+    fun `a landing within the tolerance counts as restored`() = runTest {
+        var applies = 0
+        val settled =
+            ScrollRestore.awaitSettleAndApply(
+                target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
+                readHeight = { "1000" },
+                applyScroll = { applies++ },
+                readPosition = { ScrollRestore.Position(TARGET.x, TARGET.y - ScrollRestore.LANDING_TOLERANCE_PX) },
+                delay = {},
+            )
+        assertTrue(settled, "a two-pixel miss is a successful restore")
+        assertEquals(1, applies, "and must not spend the remaining reapply attempts on it")
+    }
+
+    /** The tolerance must not hide the failure it sits next to: a clamp misses by thousands. */
+    @Test
+    fun `a clamped landing is still a failure despite the tolerance`() = runTest {
+        val settled =
+            ScrollRestore.awaitSettleAndApply(
+                target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
+                readHeight = { "1000" },
+                applyScroll = {},
+                readPosition = { ScrollRestore.Position(0, 1200) },
+                delay = {},
+            )
+        assertFalse(settled)
     }
 
     // region navigation-wait — waiting for the ORIGINAL document's URL, not comparing a freshly

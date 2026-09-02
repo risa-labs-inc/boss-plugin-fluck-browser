@@ -1719,9 +1719,14 @@ private suspend fun restoreScrollOnSettle(
         }
     if (!settled) {
         // Logged for the same reason a skipped hibernation is: "the scroll position didn't
-        // restore" is otherwise indistinguishable in the field from "restore is broken" versus
-        // "this particular page never stops resizing" (or never navigated there at all).
-        println("[FluckBrowser] Scroll restore: navigation or page-height settle never completed within the cap")
+        // restore" is otherwise indistinguishable in the field from "restore is broken". Names
+        // all three endings rather than only the first - awaitSettleAndApply collapses them to
+        // one boolean deliberately (the caller's response to each is identical), so the log line
+        // is the only place the distinction can still be read.
+        println(
+            "[FluckBrowser] Scroll restore did not land: the page never reached the captured URL, " +
+                "redirected away mid-restore, or every reapply clamped short of the saved position",
+        )
     }
 }
 
@@ -2157,18 +2162,21 @@ internal class FluckBrowserTabState {
      * job actually completes, is not required for correctness (a completed Job's `join()` returns
      * immediately either way) but keeps this from holding a reference to a finished job forever.
      *
-     * Plain `var`, not `@Volatile` or any other synchronization: correct only because every
-     * writer - [installDirtyMarker] (called from `addNavigationListener`), [releaseBrowserHandle],
-     * the hibernation job's snapshot, and each job's own `invokeOnCompletion` - runs on
-     * `Dispatchers.Main`. Nothing in this file states that for the navigation-listener callback
-     * specifically; it holds today because the pre-existing listener body a few lines below
-     * assigns Compose state (`urlBarText`, `pageTitle`, …) directly, which is itself only safe on
-     * Main. If the host ever dispatched that callback off the UI thread, the two failure modes
-     * this field exists to prevent would both reopen: `releaseBrowserHandle()`'s cancel could
-     * read a stale reference and miss a live job, and a concurrent navigation could launch a
-     * fresh install against a handle already released.
+     * `@Volatile`, because not every writer is on `Dispatchers.Main` and an earlier version of
+     * this doc claimed otherwise. `invokeOnCompletion` runs on whichever thread completes the job,
+     * and cancelling a job suspended inside `withContext(Dispatchers.IO)` completes it on an IO
+     * thread - so the `= null` write genuinely happens off Main. The identity check at each of
+     * those handlers is what makes the write harmless; `@Volatile` is what makes it visible.
+     *
+     * Volatile gives visibility, not atomicity, and the read-then-cancel and check-then-null pairs
+     * here are still not atomic. They do not need to be: cancelling an already-finished job is a
+     * no-op, and the identity check means a late completion can only ever null out its own
+     * reference. What it must not do is read a stale one, which is what this prevents.
      */
+    @Volatile
     var dirtyMarkerInstallJob: kotlinx.coroutines.Job? = null
+
+    @Volatile
     var scrollRestoreJob: kotlinx.coroutines.Job? = null
     var isLoading: Boolean by mutableStateOf(false)
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
@@ -2365,7 +2373,6 @@ internal class FluckBrowserTabState {
         // every dispose site actually WAIT for a job already in flight. Each job nulls its own
         // reference in [installDirtyMarker] / the wake effect via `invokeOnCompletion`, so a
         // cancel here on an already-finished job is a harmless no-op, not a double-cancel.
-        //
         dirtyMarkerInstallJob?.cancel()
         scrollRestoreJob?.cancel()
         clearFullscreenState()
@@ -2853,6 +2860,13 @@ internal fun FluckBrowserTabContent(
             // the URL captured when it was launched: it exists only while a boot is
             // already in flight, and the browser it produces reports its real
             // location through the navigation listener anyway.
+            // Resolved ONCE, and used both to create the browser and to seed loadedUrl at
+            // adoption below - the two were computed separately and could disagree on a wake
+            // whose captured URL is the post-redirect one, leaving loadedUrl briefly wrong until
+            // the navigation listener corrected it.
+            val creationUrl =
+                (hoistedState.savedScroll?.url ?: visiblePageUrl(urlBarText.text, hoistedState.loadedUrl))
+                    .ifBlank { initialUrl }
             val creation = hoistedState.browserCreation
                 ?: browserCreationScope.async {
                     // urlBarText is Compose state read here on an IO thread — safe
@@ -2867,19 +2881,18 @@ internal fun FluckBrowserTabContent(
                     // Same reason the loading listener reads the committed URL rather than the box.
                     browserService.createBrowser(
                         BrowserConfig(
-                            // savedScroll's URL wins when there is one, so the recreated handle
-                            // lands on exactly the URL awaitSettleAndApply is waiting for. Those
-                            // are two different reads otherwise - savedScroll.url comes from
-                            // getCurrentUrl() on the OLD handle, loadedUrl from the navigation
-                            // listener - and any URL the listener does not report (an in-page
-                            // fragment navigation, if the host's NavigationFinished does not fire
-                            // for one) or that the server normalises on reload leaves the restore
-                            // polling its full cap for a URL that never arrives. That is the
-                            // fragment case shouldAttemptRestore goes out of its way to preserve,
-                            // lost one layer down. Self-consistent by construction now.
-                            url =
-                                (hoistedState.savedScroll?.url ?: visiblePageUrl(urlBarText.text, hoistedState.loadedUrl))
-                                    .ifBlank { initialUrl },
+                            // savedScroll's URL wins when there is one (see creationUrl above),
+                            // so the recreated handle lands on exactly the URL
+                            // awaitSettleAndApply is waiting for. Those are two different reads
+                            // otherwise - savedScroll.url comes from getCurrentUrl() on the OLD
+                            // handle, loadedUrl from the navigation listener - and any URL the
+                            // listener does not report (an in-page fragment navigation, if the
+                            // host's NavigationFinished does not fire for one) or that the server
+                            // normalises on reload leaves the restore polling its full cap for a
+                            // URL that never arrives. That is the fragment case
+                            // shouldAttemptRestore goes out of its way to preserve, lost one
+                            // layer down. Self-consistent by construction now.
+                            url = creationUrl,
                         )
                     )
                 }.also { hoistedState.browserCreation = it }
@@ -2975,8 +2988,9 @@ internal fun FluckBrowserTabContent(
                 } else if (loadedUrl.isBlank()) {
                     // Seed for the same reason: the initial loadUrl is issued inside the handle's
                     // constructor, so the navigation listener below can be registered after that
-                    // first navigation already finished and never hear about it.
-                    loadedUrl = urlBarText.text
+                    // first navigation already finished and never hear about it. From the same
+                    // creationUrl the browser was actually given, not a second reading of the box.
+                    loadedUrl = creationUrl
                 }
 
                 // The dirty-typing marker rides navigation: installed now for the document already
@@ -2989,6 +3003,15 @@ internal fun FluckBrowserTabContent(
 
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
+                    // This handle may already have been released - hibernation nulls
+                    // browserHandle and then SUSPENDS in captureScrollOrNull, leaving Main free
+                    // while the old handle is still alive with this listener attached. A late
+                    // redirect or meta-refresh landing in that window would otherwise launch a
+                    // fresh installDirtyMarker job that is not in the released bundle, so nothing
+                    // joins it and its executeJavaScript can land during dispose() - the exact
+                    // race the job tracking exists to close. It would also write loadedUrl for a
+                    // handle the tab has given up, changing what the tab wakes onto.
+                    if (hoistedState.browserHandle !== handle) return@addNavigationListener
                     installDirtyMarker(handle, coroutineScope, hoistedState)
                     loadedUrl = url
                     // Only update URL bar if user isn't actively editing
@@ -3264,8 +3287,14 @@ internal fun FluckBrowserTabContent(
                         recoveryAttempts++
                         println("[FluckBrowser] Browser invalid, triggering recovery (attempt $recoveryAttempts/$maxRecoveryAttempts)")
 
-                        // Save current URL for recovery
-                        val currentUrl = urlBarText.text
+                        // The page the tab was ON, not the URL-bar draft. Deliberate, and worth
+                        // stating because visiblePageUrl changes what this line used to mean: a
+                        // renderer that crashes WHILE loading B now recovers to A rather than to
+                        // B, since loadedUrl only advances on NavigationFinished. Recovering onto
+                        // the page that was actually rendering is the safer of the two - the load
+                        // that crashed is the one least worth immediately repeating - and
+                        // recovery re-seeds loadedUrl below so the recreation agrees with it.
+                        val currentUrl = pageUrl
 
                         // Reset state to trigger reinitialization. Dispose the
                         // invalid handle too — even a crashed/stale handle still
@@ -3288,6 +3317,9 @@ internal fun FluckBrowserTabContent(
                         delay(100)
                         if (!isHomeUrl(currentUrl)) {
                             urlBarText = TextFieldValue(currentUrl, TextRange(currentUrl.length))
+                            // Both, so the recreation below resolves to this same URL rather than
+                            // to whatever loadedUrl held before the crash.
+                            loadedUrl = currentUrl
                         }
 
                         // Increment retry count to trigger LaunchedEffect

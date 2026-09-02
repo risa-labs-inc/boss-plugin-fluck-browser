@@ -42,7 +42,26 @@ internal object ScrollRestore {
     data class Position(val x: Int, val y: Int) {
         /** The default for a freshly loaded page - restoring to it is a wasted round trip. */
         val isOrigin: Boolean get() = x == 0 && y == 0
+
+        /**
+         * Whether [other] is the same position to the eye, within [LANDING_TOLERANCE_PX].
+         *
+         * Exact equality is the wrong test for a restore that succeeded: [CAPTURE_JS] rounds, and
+         * under browser zoom or a fractional device-pixel ratio `scrollTo(0, 4500)` legitimately
+         * reads back 4499 or 4501. Requiring an exact match there spends every reapply attempt
+         * (~1.2s) re-applying a position that already landed, and then reports a failure.
+         */
+        fun isNear(other: Position): Boolean =
+            kotlin.math.abs(x - other.x) <= LANDING_TOLERANCE_PX &&
+                kotlin.math.abs(y - other.y) <= LANDING_TOLERANCE_PX
     }
+
+    /**
+     * How far off a reapplied position may land and still count as restored. Two pixels: large
+     * enough to absorb rounding and zoom-scaling error, far too small to hide the failure this
+     * check exists to catch - a clamped `scrollTo` lands hundreds or thousands of pixels short.
+     */
+    const val LANDING_TOLERANCE_PX: Int = 2
 
     /**
      * A captured position, bundled with the URL of the document it was captured from.
@@ -250,7 +269,7 @@ internal object ScrollRestore {
             // readPosition on a document this deliberately refuses to touch - `landed` from a
             // PRIOR attempt, still held in the outer variable, is what the final `return` below
             // is judged against, not a fresh read of the wrong document.
-            if (!stillOnExpectedPage) return landed == target
+            if (!stillOnExpectedPage) return landed?.isNear(target) == true
             runCatching { applyScroll() }.onFailure { if (it is CancellationException) throw it }
             delay(reapplyDelayMs)
             landed = runCatching { readPosition() }.onFailure { if (it is CancellationException) throw it }.getOrNull()
@@ -258,8 +277,8 @@ internal object ScrollRestore {
             // is inline, so this exits the whole function, not just this iteration. That is the
             // "break"; `return@repeat` would be `continue`. No last-iteration disjunct is needed:
             // falling out of `repeat` reaches the identical `landed == target` check below.
-            if (landed == target) return true
+            if (landed?.isNear(target) == true) return true
         }
-        return landed == target
+        return landed?.isNear(target) == true
     }
 }
