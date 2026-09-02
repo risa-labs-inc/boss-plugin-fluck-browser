@@ -101,6 +101,17 @@ internal object DirtyInputMarker {
      * the guard - the same reasoning CredentialCapture documents for its submit listeners.
      * Listeners remove themselves once the flag is set: after the first real keystroke there is
      * nothing left to learn.
+     *
+     * **Accepted over-triggering, a codex red-team finding on an earlier revision:** an IME
+     * session that is STARTED then cancelled (Escape, no text committed) still marks the flag,
+     * permanently, since there is no `compositionend` handling to tell a committed composition
+     * from an empty one. This is the same deliberate bias every over-triggering case in this file
+     * already carries - a false positive keeps a process alive an idle cycle longer; a false
+     * negative destroys work - so it is left as-is rather than added complexity to distinguish
+     * "composition happened" from "composition produced text". The install-timing race this
+     * shares with the keydown listener (a marker installed after the user's first input event
+     * cannot retroactively see it) is likewise pre-existing, not new here - see "Install timing"
+     * above.
      */
     val INSTALL_JS: String =
         "(function(){try{" +
@@ -108,6 +119,7 @@ internal object DirtyInputMarker {
             "window.$DIRTY_FLAG_PROPERTY = 0;" +
             "var editable = function(t){" +
             "if (!t) return false;" +
+            "if (t.readOnly) return false;" +
             "var tag = (t.tagName || '').toUpperCase();" +
             "return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!t.isContentEditable;" +
             "};" +
@@ -115,6 +127,11 @@ internal object DirtyInputMarker {
             "if (!e.isTrusted) return;" +
             "if (!editable(e.target)) return;" +
             "if (e.type === 'keydown'){" +
+            // A modifier held alongside a printable key is a shortcut (copy/cut/select-all/…),
+            // never a character insertion - real typing never carries ctrl/meta/alt. Paste
+            // already has its own dedicated, correct listener below; this exists so Cmd+A/C/X
+            // alone (which insert nothing) cannot mark a page dirty for a shortcut, not a keystroke.
+            "if (e.ctrlKey || e.metaKey || e.altKey) return;" +
             "var k = e.key || '';" +
             "if (k.length !== 1 && k !== 'Backspace' && k !== 'Delete') return;" +
             "}" +

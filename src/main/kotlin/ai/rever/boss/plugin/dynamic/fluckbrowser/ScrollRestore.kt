@@ -52,6 +52,21 @@ internal object ScrollRestore {
     internal fun restoreJs(position: Position): String = "window.scrollTo(${position.x}, ${position.y})"
 
     /**
+     * Whether restoring [target] on [currentUrl] is worth attempting at all.
+     *
+     * The origin is skipped ONLY when the URL has no fragment. A fragment URL (`#section`)
+     * auto-scrolls there on load by the browser's own default behaviour - if the user had
+     * manually scrolled back to the true top before hibernating, (0,0) is a real captured
+     * position that must override that default, not a value indistinguishable from "nothing was
+     * captured". Pulled out as its own pure function - see [awaitSettleAndApply]'s KDoc for why
+     * that function no longer makes this call itself.
+     */
+    internal fun shouldAttemptRestore(
+        target: Position,
+        currentUrl: String,
+    ): Boolean = !target.isOrigin || currentUrl.contains('#')
+
+    /**
      * Waits for the page to stop resizing, then applies [target], verifying and reapplying up
      * to [reapplyAttempts] times.
      *
@@ -90,8 +105,13 @@ internal object ScrollRestore {
         reapplyAttempts: Int = 4,
         reapplyDelayMs: Long = 300L,
     ): Boolean {
-        if (target.isOrigin) return true
-
+        // No isOrigin shortcut here any more - a codex red-team finding on an earlier revision
+        // caught that (0,0) is not always the natural landing position. A page loaded from a
+        // fragment URL (#section) auto-scrolls to that element on its own; if the user had
+        // manually scrolled back to the true top before hibernating, (0,0) is then a REAL
+        // captured position that must be applied, not a default worth skipping. This function
+        // has no URL, so it cannot make that call - see shouldAttemptRestore, which the caller
+        // (restoreScrollOnSettle) checks before ever reaching here.
         var previousHeight: String? = null
         var settled = false
         for (poll in 0 until maxSettlePolls) {

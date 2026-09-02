@@ -64,8 +64,17 @@ class ScrollRestoreTest {
 
     private val TARGET = ScrollRestore.Position(0, 4500)
 
+    /**
+     * awaitSettleAndApply itself does NOT special-case the origin any more - a codex red-team
+     * finding on an earlier revision caught that (0,0) is not always the natural landing
+     * position (a fragment URL auto-scrolls elsewhere by default; a user who scrolled back to
+     * the true top before hibernating has a real (0,0) to restore). That decision now lives one
+     * layer up, in shouldAttemptRestore, which HAS the URL this function does not. So this
+     * function must actually attempt an origin target when asked - the opposite of what this
+     * test used to assert.
+     */
     @Test
-    fun `restoring to the origin is a no-op — no height poll, no apply`() = runTest {
+    fun `awaitSettleAndApply does not special-case the origin - that decision lives in shouldAttemptRestore now`() = runTest {
         var heightReads = 0
         var applies = 0
         val settled =
@@ -77,8 +86,19 @@ class ScrollRestoreTest {
                 delay = {},
             )
         assertTrue(settled)
-        assertEquals(0, heightReads)
-        assertEquals(0, applies)
+        assertTrue(heightReads >= 1, "must actually poll for an origin target, not skip straight to settled")
+        assertTrue(applies >= 1, "must actually attempt to apply (0,0) - the caller decided this was worth attempting")
+    }
+
+    @Test
+    fun `shouldAttemptRestore skips the origin only when the URL has no fragment`() {
+        val origin = ScrollRestore.Position(0, 0)
+        val nonOrigin = ScrollRestore.Position(0, 500)
+        assertFalse(ScrollRestore.shouldAttemptRestore(origin, "https://example.com/page"))
+        assertTrue(ScrollRestore.shouldAttemptRestore(origin, "https://example.com/page#section"))
+        // A non-origin target is always worth attempting, fragment or not.
+        assertTrue(ScrollRestore.shouldAttemptRestore(nonOrigin, "https://example.com/page"))
+        assertTrue(ScrollRestore.shouldAttemptRestore(nonOrigin, "https://example.com/page#section"))
     }
 
     /**
@@ -158,6 +178,30 @@ class ScrollRestoreTest {
         // Settling (height) and landing (position) are independent outcomes - the height poll
         // succeeded above, so this is still reported settled even though the position never took.
         assertTrue(settled)
+    }
+
+    /**
+     * The prior three tests only exercise readHeight succeeding or "never stabilises" - never
+     * throwing. `runCatching` around each injected call is meant to degrade a page that answers
+     * garbage (or throws) to "not settled" rather than crash the whole hibernation-wake coroutine;
+     * this is what actually proves that, instead of taking it on faith from reading the code.
+     */
+    @Test
+    fun `a throwing readHeight does not crash the settle loop and does not falsely report settled`() = runTest {
+        var heightReads = 0
+        var applies = 0
+        val settled =
+            ScrollRestore.awaitSettleAndApply(
+                target = TARGET,
+                readHeight = { heightReads++; throw RuntimeException("DOM read failed") },
+                applyScroll = { applies++ },
+                readPosition = { TARGET },
+                delay = {},
+                maxSettlePolls = 5,
+            )
+        assertFalse(settled, "a height read that always throws must never report settled")
+        assertEquals(5, heightReads, "must keep polling up to the cap, not abort early on the first throw")
+        assertTrue(applies >= 1, "an unsettled page still deserves a restore attempt after a throwing probe")
     }
 
     // endregion

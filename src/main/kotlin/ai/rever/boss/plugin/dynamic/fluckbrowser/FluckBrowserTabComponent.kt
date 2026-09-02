@@ -1548,13 +1548,6 @@ private val browserDisposeExecutor = java.util.concurrent.Executors.newCachedThr
 }
 
 /**
- * Reads [ScrollRestore.CAPTURE_JS] off a still-live handle, right before it is disposed.
- *
- * 1 second is generous for a synchronous DOM read and short enough that a wedged renderer
- * cannot delay the dispose it is about to receive anyway. Any failure - timeout, thrown,
- * malformed result - degrades to "nothing to restore", never to a stale or wrong position.
- */
-/**
  * Installs [DirtyInputMarker.INSTALL_JS] on [handle], off the UI thread.
  *
  * One function rather than the identical `coroutineScope.launch { handle.executeJavaScript(...) }`
@@ -1564,19 +1557,34 @@ private val browserDisposeExecutor = java.util.concurrent.Executors.newCachedThr
  *
  * Dispatchers.IO for the same reason [captureScrollOrNull] is: `executeJavaScript` on
  * `coroutineScope` (Dispatchers.Main) has no suspension point of its own, so a wedged renderer
- * would park the app's UI thread rather than a background one. Launched fire-and-forget - a
- * failed install here degrades to "hibernation treats this tab as never dirty", which is the
- * existing, already-accepted behaviour for a host with no page-event channel at all.
+ * would park the app's UI thread rather than a background one. A failed install here degrades to
+ * "hibernation treats this tab as never dirty", which is the existing, already-accepted
+ * behaviour for a host with no page-event channel at all.
+ *
+ * Not truly fire-and-forget any more: the launched Job is stored on [hoistedState] so
+ * [disposeBrowserHandleOffThread] can await it before disposing the handle this call is running
+ * against - a codex red-team finding on an earlier revision of this file, where an install lands
+ * mid-flight during ANY dispose (tab close, retry, hibernation) was an untracked, unfenced race
+ * against `executeJavaScript` on a handle about to be disposed.
  */
 private fun installDirtyMarker(
     handle: BrowserHandle,
     coroutineScope: CoroutineScope,
+    hoistedState: FluckBrowserTabState,
 ) {
-    coroutineScope.launch {
-        runCatching { withContext(Dispatchers.IO) { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) } }
-    }
+    hoistedState.dirtyMarkerInstallJob =
+        coroutineScope.launch {
+            runCatching { withContext(Dispatchers.IO) { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) } }
+        }
 }
 
+/**
+ * Reads [ScrollRestore.CAPTURE_JS] off a still-live handle, right before it is disposed.
+ *
+ * 1 second is generous for a synchronous DOM read and short enough that a wedged renderer
+ * cannot delay the dispose it is about to receive anyway. Any failure - timeout, thrown,
+ * malformed result - degrades to "nothing to restore", never to a stale or wrong position.
+ */
 private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Position? =
     try {
         // Dispatchers.IO, not the caller's Main - same reason busyState() gives for its own
@@ -1610,12 +1618,26 @@ private suspend fun restoreScrollOnSettle(
     handle: BrowserHandle,
     target: ScrollRestore.Position,
 ) {
+    // getCurrentUrl() is a plain synchronous getter (no native round trip), safe to call from
+    // whatever dispatcher we're on.
+    val urlAtCapture = handle.getCurrentUrl()
+    if (!ScrollRestore.shouldAttemptRestore(target, urlAtCapture)) return
+
     val settled =
         withContext(Dispatchers.IO) {
             ScrollRestore.awaitSettleAndApply(
                 target = target,
                 readHeight = { handle.executeJavaScript("document.documentElement.scrollHeight")?.toString() },
-                applyScroll = { handle.executeJavaScript(ScrollRestore.restoreJs(target)) },
+                applyScroll = {
+                    // A codex red-team finding: this handle is bound to whatever document is
+                    // CURRENTLY live on it, not to the one whose scroll position was captured.
+                    // Nothing about the settle loop verifies a redirect or a fresh navigation
+                    // didn't happen underneath it during the seconds this can run for - without
+                    // this check, the old document's position gets applied to a different page.
+                    if (handle.getCurrentUrl() == urlAtCapture) {
+                        handle.executeJavaScript(ScrollRestore.restoreJs(target))
+                    }
+                },
                 readPosition = { handle.executeJavaScript(ScrollRestore.CAPTURE_JS)?.let { ScrollRestore.parseCapture(it) } },
                 delay = { kotlinx.coroutines.delay(it) },
             )
@@ -1629,9 +1651,38 @@ private suspend fun restoreScrollOnSettle(
 }
 
 /** Dispose a handle off the UI thread — dispose() ends in a blocking Chromium IPC round-trip. */
-internal fun disposeBrowserHandleOffThread(handle: BrowserHandle) {
+internal fun disposeBrowserHandleOffThread(
+    handle: BrowserHandle,
+    awaitJobs: List<kotlinx.coroutines.Job> = emptyList(),
+) {
     browserDisposeExecutor.execute {
         try {
+            // Codex + a JxBrowser-domain red-team pass, both independently: installDirtyMarker
+            // and restoreScrollOnSettle are launched fire-and-forget on the long-lived
+            // coroutineScope, with nothing joining them before ANY of this file's several dispose
+            // call sites runs. This closes that gap for the NORMAL-completion case - a job that
+            // is genuinely still running (not yet reached its own internal timeout) is now
+            // awaited here before dispose, at the one call site (hibernation) that passes them.
+            //
+            // What this does NOT close, per the same reviewers: `Job.join()` only tells us the
+            // JOB completed, and a job wrapping `withTimeoutOrNull { executeJavaScript(...) }`
+            // completes the instant that timeout gives up - which is NOT the same moment the
+            // underlying native call actually returns if the renderer is genuinely wedged. That
+            // orphaned call can still be running on Main after this join() returns, and it is a
+            // pre-existing limitation this plugin cannot close alone (busyState's own comment
+            // already admits the identical gap for its own timeout-wrapped call) - see
+            // captureScrollOrNull's KDoc. This join is real value for the common case; it is not
+            // a proof of safety against a wedged renderer specifically.
+            //
+            // runBlocking is safe here specifically because this already runs on
+            // browserDisposeExecutor, a background thread whose only job is this dispose - blocking
+            // it briefly costs nothing else. A bounded wait, not indefinite: a wedged renderer must
+            // not delay a dispose that exists partly to recover FROM a wedged renderer.
+            awaitJobs.forEach { job ->
+                kotlinx.coroutines.runBlocking {
+                    kotlinx.coroutines.withTimeoutOrNull(2_000L) { job.join() }
+                }
+            }
             handle.dispose()
         } catch (t: Throwable) {
             println("[FluckBrowser] Browser dispose failed: ${t.message}")
@@ -1988,6 +2039,16 @@ internal class FluckBrowserTabState {
      * hand off to itself across the dispose/recreate boundary.
      */
     var savedScroll: ScrollRestore.Position? = null
+
+    /**
+     * The two fire-and-forget jobs [installDirtyMarker] and the wake-time [restoreScrollOnSettle]
+     * launch against the current handle. Tracked so [disposeBrowserHandleOffThread] can await
+     * them before disposing - see its KDoc. Both nulled by whichever function set them once that
+     * job actually completes, is not required for correctness (a completed Job's `join()` returns
+     * immediately either way) but keeps this from holding a reference to a finished job forever.
+     */
+    var dirtyMarkerInstallJob: kotlinx.coroutines.Job? = null
+    var scrollRestoreJob: kotlinx.coroutines.Job? = null
     var isLoading: Boolean by mutableStateOf(false)
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
     var pageTitle: String by mutableStateOf("New Tab")
@@ -2689,9 +2750,13 @@ internal fun FluckBrowserTabContent(
                 // coroutineScope (not this LaunchedEffect's own scope) so a tab switch away
                 // mid-restore does not cancel it - the settle-poll runs for at most
                 // RESTORE_SETTLE_MAX_POLLS * RESTORE_SETTLE_POLL_MS regardless.
+                //
+                // Job stored on hoistedState so disposeBrowserHandleOffThread can await it before
+                // disposing this same handle - restore can run several seconds, and nothing
+                // previously stopped a fast-enough re-hibernation from disposing mid-restore.
                 hoistedState.savedScroll?.let { target ->
                     hoistedState.savedScroll = null
-                    coroutineScope.launch { restoreScrollOnSettle(handle, target) }
+                    hoistedState.scrollRestoreJob = coroutineScope.launch { restoreScrollOnSettle(handle, target) }
                 }
 
                 // Register this tab+handle so the co-browse share server can enumerate
@@ -2717,11 +2782,11 @@ internal fun FluckBrowserTabContent(
                 // with the flag naturally cleared - so submit-and-navigate resets it for free.
                 // Keystroke-based, NOT a DOM diff; see DirtyInputMarker for the three withdrawn
                 // attempts that rule the DOM approach out.
-                installDirtyMarker(handle, coroutineScope)
+                installDirtyMarker(handle, coroutineScope, hoistedState)
 
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
-                    installDirtyMarker(handle, coroutineScope)
+                    installDirtyMarker(handle, coroutineScope, hoistedState)
                     // Only update URL bar if user isn't actively editing
                     // AND sufficient time has passed since last input (300ms buffer for Tab completion)
                     val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
@@ -3306,12 +3371,22 @@ internal fun FluckBrowserTabContent(
                     val handle = hoistedState.releaseBrowserHandle()
                     if (handle != null) {
                         try {
-                            // MUST complete before dispose is even posted, not run concurrently
-                            // with it - executeJavaScript against a handle that is mid-dispose is
-                            // undefined JxBrowser behaviour, the same uncatchable native-crash
-                            // class the whole ladder plan was built to stay clear of. Sequencing
-                            // this suspend call ahead of dispose in the try body is what makes
-                            // that true; do not parallelise the two. captureScrollOrNull now
+                            // Sequenced ahead of dispose, not run concurrently with it in OUR
+                            // bookkeeping - executeJavaScript against a handle that is mid-dispose
+                            // is undefined JxBrowser behaviour. Two independent adversarial
+                            // reviews (codex + a JxBrowser-domain pass) correctly pushed back on
+                            // an earlier, stronger claim here: this ordering guarantees no overlap
+                            // ONLY when captureScrollOrNull's executeJavaScript call returns
+                            // within its own 1s timeout. withTimeoutOrNull abandons OUR wait, not
+                            // the underlying call - if the renderer is genuinely wedged past 1s,
+                            // the native call may still be running when disposeBrowserHandleOffThread
+                            // posts dispose() on a different thread. busyState()'s own comment
+                            // already admits the identical limitation for its own
+                            // executeJavaScript-with-timeout call, so this is a pre-existing gap
+                            // this diff participates in, not one it introduces or worsens - fully
+                            // closing it needs a host-side capability (an abortable
+                            // executeJavaScript, or a way to ask "no native call pending on this
+                            // handle") that this plugin cannot build alone. captureScrollOrNull
                             // rethrows CancellationException (matching busyState's own
                             // convention) rather than swallowing it - the `finally` below is what
                             // guarantees dispose still runs when that happens, rather than
@@ -3334,8 +3409,13 @@ internal fun FluckBrowserTabContent(
                             // Off the UI thread so hibernating a background tab can't hitch
                             // the foreground UI. In a finally so cancellation (tab re-entry,
                             // right above in this same effect) can never skip disposal and leak
-                            // the handle - see the comment above.
-                            disposeBrowserHandleOffThread(handle)
+                            // the handle - see the comment above. Also awaits any still-running
+                            // dirty-marker install or scroll-restore job for THIS handle first -
+                            // see disposeBrowserHandleOffThread's KDoc for why.
+                            disposeBrowserHandleOffThread(
+                                handle,
+                                awaitJobs = listOfNotNull(hoistedState.dirtyMarkerInstallJob, hoistedState.scrollRestoreJob),
+                            )
                         }
                     }
                 }
