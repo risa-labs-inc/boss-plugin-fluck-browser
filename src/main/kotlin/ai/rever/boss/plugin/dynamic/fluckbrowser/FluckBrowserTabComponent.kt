@@ -1244,13 +1244,15 @@ internal object TabHibernation {
      * covered by any of them, because the DOM does not answer "has a human typed here" by
      * enumeration.
      *
-     * A page-load `input` listener setting a dirty flag would answer it properly, and is the right
-     * follow-up; it needs an injection point at navigation, and getting that wrong fails toward
-     * losing the work it is meant to protect. Not something to land at the end of a review series.
+     * A page-load `input` listener setting a dirty flag answers this properly and has since
+     * landed - see [DirtyInputMarker] and its own read of `BUSY_SCRIPT` below, ordered after
+     * this function's 'media' answer for the same reason media is checked first here: neither
+     * answer may skip ahead of the other.
      *
-     * So the shipped guarantee is narrow and true: **hibernation never cuts audio**, and a
-     * backgrounded tab may be reloaded, which discards unsaved input the same way Chrome's own
-     * memory saver does. That is documented in the README next to the opt-out.
+     * So the shipped guarantee is narrow and true: **hibernation never cuts audio**, and (before
+     * [DirtyInputMarker]) a backgrounded tab could be reloaded, discarding unsaved input the same
+     * way Chrome's own memory saver does. That was documented in the README next to the opt-out;
+     * the guard now narrows how often the reload case is actually reached.
      *
      * Done in JavaScript because `BrowserHandle` exposes no audio state; JxBrowser's
      * `browser.audio()` is not surfaced through plugin-api, and adding it means an api release,
@@ -1352,6 +1354,13 @@ internal object TabHibernation {
      * and no log line. `executeJavaScript` returns `Any?`, so a wrapper type or a quoted JSON
      * string would otherwise collapse every branch. Normalising first is cheap insurance against a
      * marshalling change nobody would notice. Mirrors `middleClickUrlFromScriptResult` above.
+     *
+     * Sharing [normalizeJsStringResult] moved this onto its trailing trim (recovering whitespace
+     * *inside* the quotes, e.g. `"' pip '"`), which this function's own inline logic never had -
+     * such a value used to fall through to [BusyState.IDLE] and now resolves to
+     * [BusyState.PICTURE_IN_PICTURE]. An improvement, but a real change to this decision path
+     * from the host's actual `executeJavaScript` marshalling, not the pure deduplication the rest
+     * of that refactor is.
      */
     internal fun busyStateFromScriptResult(result: Any?): BusyState =
         when (normalizeJsStringResult(result)?.lowercase()) {
@@ -1619,7 +1628,7 @@ private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Sa
 /** Bound to [captureScrollOrNull]'s own 1s capture timeout - these are meant to be sub-millisecond DOM ops on a healthy page. */
 private const val RESTORE_CALL_TIMEOUT_MS = 1_000L
 
-/** Wrapped the same way [ScrollRestore.CAPTURE_JS] is, so a thrown exception and a genuine `null` height stay distinguishable through [pollUntil]'s `runCatching`. */
+/** Wrapped the same way [ScrollRestore.CAPTURE_JS] is, so a thrown exception and a genuine `null` height stay distinguishable through the `runCatching` inside [ScrollRestore.awaitSettleAndApply]'s poll loop. */
 private const val READ_HEIGHT_JS =
     "(function(){try{return document.documentElement.scrollHeight;}catch(e){return null;}})()"
 
@@ -1709,9 +1718,15 @@ internal fun disposeBrowserHandleOffThread(
             // browserDisposeExecutor, a background thread whose only job is this dispose - blocking
             // it briefly costs nothing else. A bounded wait, not indefinite: a wedged renderer must
             // not delay a dispose that exists partly to recover FROM a wedged renderer.
-            awaitJobs.forEach { job ->
-                kotlinx.coroutines.runBlocking {
-                    kotlinx.coroutines.withTimeoutOrNull(2_000L) { job.join() }
+            //
+            // ONE timeout around the whole list, not one per job: two jobs each individually
+            // bounded at 2s could burn up to 4s total before dispose() runs, which is exactly the
+            // "genuinely still running" case this exists for - a job parked in a non-suspending
+            // executeJavaScript is precisely the one cancellation can't shorten, so it is also the
+            // one most likely to pay a per-job timeout in full, twice.
+            kotlinx.coroutines.runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(2_000L) {
+                    awaitJobs.forEach { job -> job.join() }
                 }
             }
             handle.dispose()
@@ -2069,6 +2084,18 @@ internal class FluckBrowserTabState {
      * it is applied on wake. Plain var, not `mutableStateOf` - like [hibernationJob], nothing in
      * the UI reads this; it exists purely for the wake effect to hand off to itself across the
      * dispose/recreate boundary.
+     *
+     * **Known gap: a restore that fails to land is not distinguished from one that never ran.**
+     * [restoreScrollOnSettle] does not write back here on failure - there is nothing to write,
+     * the whole point of this field is being consumed once - so a wake that lands short (see
+     * [ScrollRestore.awaitSettleAndApply]'s `@return` KDoc for why that happens on a
+     * lazy-loading page) leaves the tab sitting wherever the failed apply left it. If the user
+     * does not manually scroll back before the NEXT hibernation, that wrong position is what
+     * gets captured and overwrites the original good one - a transient restore failure becomes
+     * permanent. Narrow in practice (the idle window before hibernation is 10-30 minutes, so the
+     * two events are normally far apart) and not fixed here: closing it means [captureScrollOrNull]
+     * threading through "did the last restore actually land" from a whole prior wake, which is
+     * more state than this field carries today.
      */
     var savedScroll: ScrollRestore.SavedScroll? = null
 
@@ -2078,6 +2105,17 @@ internal class FluckBrowserTabState {
      * them before disposing - see its KDoc. Both nulled by whichever function set them once that
      * job actually completes, is not required for correctness (a completed Job's `join()` returns
      * immediately either way) but keeps this from holding a reference to a finished job forever.
+     *
+     * Plain `var`, not `@Volatile` or any other synchronization: correct only because every
+     * writer - [installDirtyMarker] (called from `addNavigationListener`), [releaseBrowserHandle],
+     * the hibernation job's snapshot, and each job's own `invokeOnCompletion` - runs on
+     * `Dispatchers.Main`. Nothing in this file states that for the navigation-listener callback
+     * specifically; it holds today because the pre-existing listener body a few lines below
+     * assigns Compose state (`urlBarText`, `pageTitle`, …) directly, which is itself only safe on
+     * Main. If the host ever dispatched that callback off the UI thread, the two failure modes
+     * this field exists to prevent would both reopen: `releaseBrowserHandle()`'s cancel could
+     * read a stale reference and miss a live job, and a concurrent navigation could launch a
+     * fresh install against a handle already released.
      */
     var dirtyMarkerInstallJob: kotlinx.coroutines.Job? = null
     var scrollRestoreJob: kotlinx.coroutines.Job? = null

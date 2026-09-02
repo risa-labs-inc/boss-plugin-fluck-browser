@@ -22,6 +22,16 @@ internal object ScrollRestore {
      * Reads the window's current scroll offset. `|| 0` guards a page where `scrollX`/`scrollY`
      * are `NaN` or undefined (some sandboxed or about: pages), so a capture failure reads as the
      * origin rather than throwing and losing the whole capture.
+     *
+     * **Known gap: only the window scrolls, never an inner container.** An app-shell SPA -
+     * `height:100vh; overflow:auto` on some inner div, which is how Gmail, Jira and Linear-shaped
+     * apps are commonly built - reports `window.scrollY === 0` permanently no matter how far the
+     * user has scrolled inside it, so [shouldAttemptRestore] sees an origin position on a
+     * fragment-less URL and this feature does nothing for that tab. That overlaps heavily with
+     * exactly the class of heavy, long-lived renderer hibernation exists to reclaim. Deferred
+     * rather than fixed: finding "the" scrollable container generically (as opposed to a
+     * site-specific selector) is a real feature, not a bugfix, and the failure mode here is a
+     * silent no-op rather than a wrong restore.
      */
     const val CAPTURE_JS: String =
         "(function(){try{" +
@@ -111,7 +121,9 @@ internal object ScrollRestore {
                     .onFailure { if (it is CancellationException) throw it }
                     .getOrDefault(false)
             if (result) return true
-            delay(pollDelayMs)
+            // Skip the delay after the LAST poll: nothing left to wait for before the next check,
+            // because there is no next check - this loop is about to report failure regardless.
+            if (poll < maxPolls - 1) delay(pollDelayMs)
         }
         return false
     }
@@ -149,21 +161,28 @@ internal object ScrollRestore {
      * [shouldAttemptRestore] survives a path-level comparison; exact-match here does not. Accepted
      * for now: the failure mode is "restore silently skipped," not a wrong-page write.
      *
-     * @return true if the navigation wait AND the height-settle both completed within their caps;
-     *   false if either was hit first. A navigation-wait timeout means nothing here is safe to
-     *   restore onto and the function returns immediately, without attempting height-settle or
-     *   any apply at all - unlike an unsettled height (still worth one attempt on whatever the
-     *   page is now), landing on the wrong document is not worth attempting anything against.
+     * @return true only if [readPosition] actually reads back [target] after an apply - NOT
+     *   whether the height-settle loop stabilized. An earlier revision returned the settle
+     *   result, which reports `true` even when every apply attempt below silently failed: on a
+     *   lazy-loading or infinite-scroll page, `window.scrollTo` CLAMPS to the document's current
+     *   `scrollHeight`, so restoring to a position captured on a taller, fully-loaded document
+     *   lands short every time the page hasn't grown back to that height yet within the reapply
+     *   window - and the height itself can look "stable" for a 150ms poll cycle in the middle of
+     *   that load, which is exactly the case this return value now has to call a failure rather
+     *   than silently agree with. `false` covers three distinct reasons - the navigation wait
+     *   timed out, the page redirected away mid-restore, or every reapply attempt landed short -
+     *   collapsed to one boolean deliberately: the caller's only correct response to any of them
+     *   is the same (log it, do not treat the position as restored), so a richer result type
+     *   would add cases without adding a case that changes what happens next.
      *
-     * **Known gap this cannot close:** height stability is a proxy for "the page stopped
-     * changing", and it false-positives on a page whose content changes WITHOUT changing
-     * document height - a virtualized list, a fixed-height app shell. There, the settle loop
-     * reports done on the first or second poll, [applyScroll] runs immediately, and a route
-     * change's own scroll-to-top (a common SPA pattern, fired on mount) can overwrite it a
-     * moment later with no signal that it happened - this function still reports `settled: true`
-     * for that outcome, because the height genuinely never moved. Closing this needs a second
-     * proxy (a `MutationObserver` count, say) and was judged not worth the complexity for what
-     * degrades, in the failure case, to a wrong scroll offset rather than lost data.
+     * **Known gap this cannot close:** a `landed == target` read is a snapshot, not a guarantee
+     * the position stays there. A route change's own scroll-to-top (a common SPA pattern, fired
+     * on mount, on a page whose content changes without its document height changing - a
+     * virtualized list, a fixed-height app shell) can overwrite the position a moment AFTER the
+     * read that made this function report success. Closing this needs a second read some time
+     * after the first, trading a known false negative (the clamp case above) for a slower,
+     * still-not-certain answer, and was judged not worth it for what degrades, in the failure
+     * case, to a wrong scroll offset rather than lost data.
      */
     internal suspend fun awaitSettleAndApply(
         target: Position,
@@ -183,15 +202,20 @@ internal object ScrollRestore {
         val navigated = pollUntil(maxNavigationWaitPolls, navigationWaitPollMs, delay) { readUrl() == expectedUrl }
         if (!navigated) return false
 
+        // A readiness gate for when to START applying, not a claim about whether the apply will
+        // succeed - its result is deliberately not what this function returns. See the @return
+        // KDoc above for the bug that conflating the two caused: a lazy-loading page can look
+        // height-stable mid-load, long before it has grown tall enough for `target` to actually
+        // be reachable.
         var previousHeight: String? = null
-        val settled =
-            pollUntil(maxSettlePolls, settlePollMs, delay) {
-                val height = readHeight()
-                val stable = height != null && height == previousHeight
-                previousHeight = height
-                stable
-            }
+        pollUntil(maxSettlePolls, settlePollMs, delay) {
+            val height = readHeight()
+            val stable = height != null && height == previousHeight
+            previousHeight = height
+            stable
+        }
 
+        var landed: Position? = null
         repeat(reapplyAttempts) { attempt ->
             // Re-verified on every attempt, not just once before the loop: a redirect landing
             // AFTER the navigation-wait phase already passed (the page that loaded, then bounced
@@ -200,18 +224,20 @@ internal object ScrollRestore {
             val stillOnExpectedPage =
                 runCatching { readUrl() }.onFailure { if (it is CancellationException) throw it }.getOrNull() == expectedUrl
             // Stop entirely on a redirect rather than spending the remaining attempts' delay and
-            // readPosition on a document this deliberately refuses to touch - and `landed ==
-            // target` on THAT document would exit the loop by accident, on a coincidence, not on
-            // having actually restored anything.
-            if (!stillOnExpectedPage) return settled
+            // readPosition on a document this deliberately refuses to touch - `landed` from a
+            // PRIOR attempt, still held in the outer variable, is what the final `return` below
+            // is judged against, not a fresh read of the wrong document.
+            if (!stillOnExpectedPage) return landed == target
             runCatching { applyScroll() }.onFailure { if (it is CancellationException) throw it }
             delay(reapplyDelayMs)
-            val landed = runCatching { readPosition() }.onFailure { if (it is CancellationException) throw it }.getOrNull()
+            landed = runCatching { readPosition() }.onFailure { if (it is CancellationException) throw it }.getOrNull()
             // A bare `return` here is a non-local return out of awaitSettleAndApply - repeat()
             // is inline, so this exits the whole function, not just this iteration. That is the
-            // "break", correctly this time; `return@repeat` would be the same mistake again.
-            if (landed == target || attempt == reapplyAttempts - 1) return settled
+            // "break", correctly this time; `return@repeat` would be the same mistake again. No
+            // `attempt == reapplyAttempts - 1` disjunct needed any more: falling out of `repeat`
+            // reaches the identical `landed == target` check below on its own.
+            if (landed == target) return true
         }
-        return settled
+        return landed == target
     }
 }

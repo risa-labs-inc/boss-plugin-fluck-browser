@@ -230,7 +230,7 @@ class ScrollRestoreTest {
     }
 
     @Test
-    fun `a height that never stabilises hits the cap and reports unsettled, but still attempts a restore`() = runTest {
+    fun `an unsettled height still attempts a restore, and reports success once the position lands`() = runTest {
         var heightReads = 0
         var applies = 0
         val settled =
@@ -244,9 +244,34 @@ class ScrollRestoreTest {
                 delay = {},
                 maxSettlePolls = 5,
             )
-        assertFalse(settled, "height never repeated, so this must report unsettled")
-        assertEquals(5, heightReads)
-        assertTrue(applies >= 1, "an unsettled page still deserves one restore attempt, not silence")
+        assertTrue(settled, "the position landed - that is what this reports now, independent of height ever settling")
+        assertEquals(5, heightReads, "the settle gate still runs to its cap even though it never stabilised")
+        assertEquals(1, applies, "lands on the very first reapply attempt")
+    }
+
+    /**
+     * The bug a second review round caught: an earlier revision returned the height-settle
+     * result, which reports `true` here even though every apply attempt below silently lands
+     * short of [TARGET] - exactly what `window.scrollTo` clamping to a shorter, still-loading
+     * document looks like from this function's side. A page can look height-stable for one poll
+     * cycle in the middle of a lazy load; that must not be reported as the restore having worked.
+     */
+    @Test
+    fun `a clamped scrollTo reports failure even though the height looked settled`() = runTest {
+        var applies = 0
+        val settled =
+            ScrollRestore.awaitSettleAndApply(
+                target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
+                readHeight = { "1000" }, // stable immediately - looks settled
+                applyScroll = { applies++ },
+                readPosition = { ScrollRestore.Position(0, 1200) }, // clamped short of TARGET.y=4500, every time
+                delay = {},
+                reapplyAttempts = 4,
+            )
+        assertFalse(settled, "a height that looked stable must not be reported as the restore having landed")
+        assertEquals(4, applies, "must still exhaust every reapply attempt on a page that might yet grow")
     }
 
     @Test
@@ -283,19 +308,19 @@ class ScrollRestoreTest {
                 reapplyAttempts = 4,
             )
         assertEquals(4, applies, "must stop at the configured cap, not loop forever on a page that never lands")
-        // Settling (height) and landing (position) are independent outcomes - the height poll
-        // succeeded above, so this is still reported settled even though the position never took.
-        assertTrue(settled)
+        assertFalse(settled, "a position that never lands must report failure, however healthy the height-settle looked")
     }
 
     /**
-     * The prior three tests only exercise readHeight succeeding or "never stabilises" - never
-     * throwing. `runCatching` around each injected call is meant to degrade a page that answers
-     * garbage (or throws) to "not settled" rather than crash the whole hibernation-wake coroutine;
-     * this is what actually proves that, instead of taking it on faith from reading the code.
+     * The prior tests only exercise readHeight succeeding or "never stabilises" - never throwing.
+     * `runCatching` around each injected call is meant to degrade a page that answers garbage (or
+     * throws) to "not settled" rather than crash the whole hibernation-wake coroutine; this is
+     * what actually proves that, instead of taking it on faith from reading the code. Paired with
+     * a position that never lands, so the final `settled` result is pinned too, not just the poll
+     * count and the absence of a crash.
      */
     @Test
-    fun `a throwing readHeight does not crash the settle loop and does not falsely report settled`() = runTest {
+    fun `a throwing readHeight does not crash the settle loop, and a restore that never lands still reports failure`() = runTest {
         var heightReads = 0
         var applies = 0
         val settled =
@@ -305,13 +330,14 @@ class ScrollRestoreTest {
                 readUrl = alreadyNavigated,
                 readHeight = { heightReads++; throw RuntimeException("DOM read failed") },
                 applyScroll = { applies++ },
-                readPosition = { TARGET },
+                readPosition = { ScrollRestore.Position(0, 0) }, // never matches TARGET
                 delay = {},
                 maxSettlePolls = 5,
+                reapplyAttempts = 4,
             )
-        assertFalse(settled, "a height read that always throws must never report settled")
-        assertEquals(5, heightReads, "must keep polling up to the cap, not abort early on the first throw")
-        assertTrue(applies >= 1, "an unsettled page still deserves a restore attempt after a throwing probe")
+        assertFalse(settled, "a restore that never lands must report failure, throwing height read or not")
+        assertEquals(5, heightReads, "must keep polling the settle gate up to its cap, not abort early on the first throw")
+        assertEquals(4, applies, "an unsettled page still deserves every configured restore attempt")
     }
 
     // endregion
