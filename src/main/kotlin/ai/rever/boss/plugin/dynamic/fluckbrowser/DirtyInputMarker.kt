@@ -55,14 +55,27 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  * the property undefined, so navigation resets the flag for free - submit-and-navigate clears
  * it with no bookkeeping.
  *
+ * A PR review flagged this as the single host assumption the whole feature rests on and worth
+ * confirming rather than trusting the API's own KDoc ("called when the browser navigates" says
+ * nothing about start-vs-commit): the host's implementation fires this listener specifically
+ * from its `NavigationFinished` handler, with a comment on that exact call site noting it "fires
+ * on navigation completion" - not from `NavigationStarted`. Commit semantics confirmed.
+ *
  * ## What it deliberately misses, so the next reader does not "fix" it
  *
  * - Mouse-only edits (a checkbox toggled, a select chosen by mouse, drag-and-drop text).
  *   Trusted `change`/`click` could catch them, but Chromium fires trusted change events for
  *   autofill too, which reopens the 20-hour login-page exemption. Redoing a click is cheap;
- *   retyping a paragraph is not. The guard protects typing.
+ *   retyping a paragraph is not. The guard protects typing. A PR review noted the one apparent
+ *   exception: keyboard type-ahead on a focused `<select>` (pressing a letter to jump to a
+ *   matching option) DOES mark dirty, because it is a `keydown` with a length-1 key like any
+ *   other. Not actually an inconsistency - a keystroke that changed the select's value is
+ *   typing by this guard's own definition; it is *mouse-driven* select changes specifically that
+ *   are missed, not select changes in general.
  * - Typing inside frames. The listener runs in the main frame only; a cross-origin frame was
  *   never reachable, and a same-origin frame is deferred until this is worth per-frame plumbing.
+ *   A shadow-DOM editor is missed for the same practical reason: a keystroke inside one retargets
+ *   `e.target` to the shadow host, where `isContentEditable` is typically false.
  * - An SPA submit that never navigates leaves the flag set, so the tab is "left alone" at the
  *   recheck limit - the same bounded trade SHOWN_IN_POP_OUT makes for calls, and the safe
  *   direction: a leaked process tree costs memory until the next visit; a discarded draft costs
@@ -113,7 +126,7 @@ internal object DirtyInputMarker {
      * cannot retroactively see it) is likewise pre-existing, not new here - see "Install timing"
      * above.
      */
-    val INSTALL_JS: String =
+    const val INSTALL_JS: String =
         "(function(){try{" +
             "if (typeof window.$DIRTY_FLAG_PROPERTY !== 'undefined') return;" +
             "window.$DIRTY_FLAG_PROPERTY = 0;" +

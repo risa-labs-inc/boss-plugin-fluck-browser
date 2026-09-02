@@ -1399,7 +1399,7 @@ internal object TabHibernation {
      * `internal` only so the ordering test can read it - it has no other caller outside this
      * object, and the script cannot be tested any other way without a JS engine.
      */
-    internal val BUSY_SCRIPT =
+    internal const val BUSY_SCRIPT =
         "(function(){try{" +
             // Asked first: a PiP window is on screen showing this tab, and neither check below
             // would necessarily notice it.
@@ -1572,33 +1572,49 @@ private fun installDirtyMarker(
     coroutineScope: CoroutineScope,
     hoistedState: FluckBrowserTabState,
 ) {
-    hoistedState.dirtyMarkerInstallJob =
+    val job =
         coroutineScope.launch {
             runCatching { withContext(Dispatchers.IO) { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) } }
         }
+    hoistedState.dirtyMarkerInstallJob = job
+    // A PR review caught that the KDoc claimed this self-nulls on completion while nothing
+    // actually did it - identity-checked so a completion callback firing late (after a NEWER
+    // install already replaced this field, e.g. a rapid second navigation) cannot null out a
+    // job that isn't this one any more.
+    job.invokeOnCompletion { if (hoistedState.dirtyMarkerInstallJob === job) hoistedState.dirtyMarkerInstallJob = null }
 }
 
 /**
- * Reads [ScrollRestore.CAPTURE_JS] off a still-live handle, right before it is disposed.
+ * Reads [ScrollRestore.CAPTURE_JS] AND the current URL off a still-live handle, right before it
+ * is disposed - bundled together (via [ScrollRestore.SavedScroll]) because a PR review caught
+ * that a prior revision compared the RESTORING handle's URL against itself; the URL that
+ * actually needs verifying is the one this OLD handle is on right now, at capture time.
+ *
+ * `getCurrentUrl()` is a plain synchronous getter (no native round trip), safe to call from
+ * whatever dispatcher we're on, before or after the JS round trip.
  *
  * 1 second is generous for a synchronous DOM read and short enough that a wedged renderer
  * cannot delay the dispose it is about to receive anyway. Any failure - timeout, thrown,
  * malformed result - degrades to "nothing to restore", never to a stale or wrong position.
  */
-private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Position? =
+private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.SavedScroll? =
     try {
+        val url = handle.getCurrentUrl()
         // Dispatchers.IO, not the caller's Main - same reason busyState() gives for its own
         // identical call: withTimeoutOrNull can only abandon a call that SUSPENDS, and if
         // executeJavaScript blocks internally (a wedged renderer) this thread stays parked
         // until it answers. On Main that parks the whole app UI; on IO it parks one thread.
         withContext(Dispatchers.IO) {
             withTimeoutOrNull(1_000L) { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }
-        }?.let { ScrollRestore.parseCapture(it) }
+        }?.let { ScrollRestore.parseCapture(it) }?.let { ScrollRestore.SavedScroll(it, url) }
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (_: Throwable) {
         null
     }
+
+/** Bound to [captureScrollOrNull]'s own 1s capture timeout - these are meant to be sub-millisecond DOM ops on a healthy page. */
+private const val RESTORE_CALL_TIMEOUT_MS = 1_000L
 
 /**
  * Applies a captured scroll position to a freshly (re)created handle, once the document has
@@ -1606,47 +1622,47 @@ private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Po
  * load (an SPA's own hydration undoing the very scroll this just applied).
  *
  * A thin binding over [ScrollRestore.awaitSettleAndApply] - see that function's KDoc for why the
- * settle signal is document height rather than `readyState` (which fires well before a JS-heavy
- * page finishes rendering its real content), and for the loop-correctness bug this replaced.
+ * settle signal is document height rather than `readyState`, for the loop-correctness bug this
+ * replaced, and for why it waits for [saved]'s URL to actually load before touching height at
+ * all (a PR review caught that a freshly created handle starts on `about:blank` while its own
+ * navigation is still in flight).
  *
  * The whole call runs on Dispatchers.IO, not the caller's Main - same reason as
- * [captureScrollOrNull]: up to ~24 sequential `executeJavaScript` round trips happen inside
+ * [captureScrollOrNull]: up to ~28 sequential `executeJavaScript` round trips happen inside
  * [ScrollRestore.awaitSettleAndApply], and a wedged renderer or a slow-to-hydrate SPA blocking
  * any one of them must park a background thread, not the app's UI thread.
+ *
+ * Each individual call is ALSO bounded ([RESTORE_CALL_TIMEOUT_MS]) - a PR review caught that
+ * [ScrollRestore.awaitSettleAndApply]'s own caps are poll COUNTS, not wall-clock time, so a
+ * slow-but-not-wedged renderer could stretch the whole job well past
+ * `disposeBrowserHandleOffThread`'s 2s join budget without any single call ever throwing.
  */
 private suspend fun restoreScrollOnSettle(
     handle: BrowserHandle,
-    target: ScrollRestore.Position,
+    saved: ScrollRestore.SavedScroll,
 ) {
-    // getCurrentUrl() is a plain synchronous getter (no native round trip), safe to call from
-    // whatever dispatcher we're on.
-    val urlAtCapture = handle.getCurrentUrl()
-    if (!ScrollRestore.shouldAttemptRestore(target, urlAtCapture)) return
+    if (!ScrollRestore.shouldAttemptRestore(saved.position, saved.url)) return
+
+    suspend fun <T> bounded(block: suspend () -> T): T? =
+        withTimeoutOrNull(RESTORE_CALL_TIMEOUT_MS) { block() }
 
     val settled =
         withContext(Dispatchers.IO) {
             ScrollRestore.awaitSettleAndApply(
-                target = target,
-                readHeight = { handle.executeJavaScript("document.documentElement.scrollHeight")?.toString() },
-                applyScroll = {
-                    // A codex red-team finding: this handle is bound to whatever document is
-                    // CURRENTLY live on it, not to the one whose scroll position was captured.
-                    // Nothing about the settle loop verifies a redirect or a fresh navigation
-                    // didn't happen underneath it during the seconds this can run for - without
-                    // this check, the old document's position gets applied to a different page.
-                    if (handle.getCurrentUrl() == urlAtCapture) {
-                        handle.executeJavaScript(ScrollRestore.restoreJs(target))
-                    }
-                },
-                readPosition = { handle.executeJavaScript(ScrollRestore.CAPTURE_JS)?.let { ScrollRestore.parseCapture(it) } },
+                target = saved.position,
+                expectedUrl = saved.url,
+                readUrl = { bounded { handle.getCurrentUrl() } },
+                readHeight = { bounded { handle.executeJavaScript("document.documentElement.scrollHeight")?.toString() } },
+                applyScroll = { bounded { handle.executeJavaScript(ScrollRestore.restoreJs(saved.position)) } },
+                readPosition = { bounded { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }?.let { ScrollRestore.parseCapture(it) } },
                 delay = { kotlinx.coroutines.delay(it) },
             )
         }
     if (!settled) {
         // Logged for the same reason a skipped hibernation is: "the scroll position didn't
         // restore" is otherwise indistinguishable in the field from "restore is broken" versus
-        // "this particular page never stops resizing".
-        println("[FluckBrowser] Scroll restore: page height never settled within the cap")
+        // "this particular page never stops resizing" (or never navigated there at all).
+        println("[FluckBrowser] Scroll restore: navigation or page-height settle never completed within the cap")
     }
 }
 
@@ -2033,12 +2049,13 @@ internal class FluckBrowserTabState {
     var hibernationJob: kotlinx.coroutines.Job? = null
 
     /**
-     * Scroll position captured the instant before a hibernation dispose, consumed (set back to
-     * null) the moment it is applied on wake. Plain var, not `mutableStateOf` - like
-     * [hibernationJob], nothing in the UI reads this; it exists purely for the wake effect to
-     * hand off to itself across the dispose/recreate boundary.
+     * Scroll position (bundled with the URL it was captured from - see [ScrollRestore.SavedScroll])
+     * captured the instant before a hibernation dispose, consumed (set back to null) the moment
+     * it is applied on wake. Plain var, not `mutableStateOf` - like [hibernationJob], nothing in
+     * the UI reads this; it exists purely for the wake effect to hand off to itself across the
+     * dispose/recreate boundary.
      */
-    var savedScroll: ScrollRestore.Position? = null
+    var savedScroll: ScrollRestore.SavedScroll? = null
 
     /**
      * The two fire-and-forget jobs [installDirtyMarker] and the wake-time [restoreScrollOnSettle]
@@ -2217,6 +2234,19 @@ internal class FluckBrowserTabState {
             requestHostExitFullscreen(handle)
         }
         browserHandle = null
+        // A PR review caught that only ONE of this file's six dispose call sites (hibernation)
+        // awaited installDirtyMarker's/restoreScrollOnSettle's jobs before disposing - the other
+        // five (tab close, retry, crash-recovery, fullscreen-exit recovery, handle replacement)
+        // all funnel through THIS function first, so cancelling here covers every one of them
+        // structurally, rather than threading an awaitJobs list through six call sites by hand.
+        // Cancellation cannot retroactively stop a call already blocked in native code (see
+        // captureScrollOrNull's KDoc for why not), but it DOES stop the job from starting its
+        // NEXT round trip - e.g. restoreScrollOnSettle's reapply loop, between attempts - which
+        // is real exposure reduction even though it is not a complete fix. Each job nulls its own
+        // reference in [installDirtyMarker] / the wake effect via `invokeOnCompletion`, so a
+        // cancel here on an already-finished job is a harmless no-op, not a double-cancel.
+        dirtyMarkerInstallJob?.cancel()
+        scrollRestoreJob?.cancel()
         clearFullscreenState()
         // For the same reason fullscreen state is cleared here rather than at each call site:
         // isLoading describes THIS handle's navigation, and the listener that would flip it goes
@@ -2748,15 +2778,19 @@ internal fun FluckBrowserTabContent(
                 // Consumed once: a plain retry or crash-recovery on the SAME creation must not
                 // re-apply a scroll position from a previous life of this tab. Launched on
                 // coroutineScope (not this LaunchedEffect's own scope) so a tab switch away
-                // mid-restore does not cancel it - the settle-poll runs for at most
-                // RESTORE_SETTLE_MAX_POLLS * RESTORE_SETTLE_POLL_MS regardless.
+                // mid-restore does not cancel it - awaitSettleAndApply's own poll counts bound
+                // the navigation-wait and settle phases regardless, and RESTORE_CALL_TIMEOUT_MS
+                // bounds every individual call within them.
                 //
                 // Job stored on hoistedState so disposeBrowserHandleOffThread can await it before
                 // disposing this same handle - restore can run several seconds, and nothing
                 // previously stopped a fast-enough re-hibernation from disposing mid-restore.
-                hoistedState.savedScroll?.let { target ->
+                hoistedState.savedScroll?.let { saved ->
                     hoistedState.savedScroll = null
-                    hoistedState.scrollRestoreJob = coroutineScope.launch { restoreScrollOnSettle(handle, target) }
+                    val job = coroutineScope.launch { restoreScrollOnSettle(handle, saved) }
+                    hoistedState.scrollRestoreJob = job
+                    // See installDirtyMarker's identical pattern for why this is identity-checked.
+                    job.invokeOnCompletion { if (hoistedState.scrollRestoreJob === job) hoistedState.scrollRestoreJob = null }
                 }
 
                 // Register this tab+handle so the co-browse share server can enumerate

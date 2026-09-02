@@ -63,6 +63,10 @@ class ScrollRestoreTest {
     // region awaitSettleAndApply — the loop this class exists to make testable without a browser
 
     private val TARGET = ScrollRestore.Position(0, 4500)
+    private val EXPECTED_URL = "https://example.com/page"
+
+    /** Most tests below aren't about navigation timing - the real page is already there. */
+    private val alreadyNavigated: suspend () -> String? = { EXPECTED_URL }
 
     /**
      * awaitSettleAndApply itself does NOT special-case the origin any more - a codex red-team
@@ -80,6 +84,8 @@ class ScrollRestoreTest {
         val settled =
             ScrollRestore.awaitSettleAndApply(
                 target = ScrollRestore.Position(0, 0),
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
                 readHeight = { heightReads++; "1000" },
                 applyScroll = { applies++ },
                 readPosition = { ScrollRestore.Position(0, 0) },
@@ -101,6 +107,92 @@ class ScrollRestoreTest {
         assertTrue(ScrollRestore.shouldAttemptRestore(nonOrigin, "https://example.com/page#section"))
     }
 
+    // region navigation-wait — the phase a PR review added: fixes comparing a freshly created
+    // handle's URL against itself instead of against the ORIGINAL document's URL
+
+    /**
+     * The actual bug a PR review caught, reproduced directly: a freshly (re)created handle
+     * starts on `about:blank` while its own navigation is still in flight. Height-settle and
+     * apply must not run until the real page has actually loaded - this asserts zero calls to
+     * either while the URL doesn't match yet, not just the eventual outcome.
+     */
+    @Test
+    fun `height-settle and apply do not start until the handle actually reaches the expected URL`() = runTest {
+        var urlReads = 0
+        var heightReads = 0
+        var applies = 0
+        val settled =
+            ScrollRestore.awaitSettleAndApply(
+                target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                // "about:blank" for the first three reads (still navigating), matching what the
+                // reviewer identified: getCurrentUrl() on a just-created handle.
+                readUrl = { urlReads++; if (urlReads <= 3) "about:blank" else EXPECTED_URL },
+                readHeight = { heightReads++; "1000" },
+                applyScroll = { applies++ },
+                readPosition = { TARGET },
+                delay = {},
+            )
+        assertTrue(settled)
+        assertTrue(urlReads > 3, "must keep polling the URL past the still-navigating reads")
+        assertTrue(heightReads >= 1, "must eventually reach the height-settle phase once navigation lands")
+        assertTrue(applies >= 1, "must eventually attempt the apply once navigation lands")
+    }
+
+    /**
+     * If the handle never reaches the expected URL at all (navigation failed, or landed
+     * somewhere else entirely), nothing is safe to restore onto - not even one attempt. This is
+     * the one case where an unsettled outcome does NOT get its usual "still worth trying" apply,
+     * because there is no reason to believe any page it might apply to is the right one.
+     */
+    @Test
+    fun `a navigation that never reaches the expected URL aborts entirely - no height poll, no apply`() = runTest {
+        var heightReads = 0
+        var applies = 0
+        val settled =
+            ScrollRestore.awaitSettleAndApply(
+                target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = { "https://example.com/somewhere-else" },
+                readHeight = { heightReads++; "1000" },
+                applyScroll = { applies++ },
+                readPosition = { TARGET },
+                delay = {},
+                maxNavigationWaitPolls = 5,
+            )
+        assertFalse(settled)
+        assertEquals(0, heightReads, "landing on the wrong page is not worth polling height for")
+        assertEquals(0, applies, "landing on the wrong page is not worth an apply attempt")
+    }
+
+    /**
+     * A redirect landing AFTER the navigation-wait phase already passed (the page loaded, then
+     * bounced elsewhere - a login/session check is a real example) must not have the ORIGINAL
+     * document's position applied to whatever replaced it. Re-checked on every reapply attempt,
+     * not just once up front.
+     */
+    @Test
+    fun `reapply skips the actual scroll application once the page has navigated away mid-restore`() = runTest {
+        var urlReads = 0
+        var applies = 0
+        ScrollRestore.awaitSettleAndApply(
+            target = TARGET,
+            expectedUrl = EXPECTED_URL,
+            // read #1 is the navigation-wait's own check (must see the expected page to proceed
+            // past that phase at all); every read from the reapply loop onward (#2+) sees the
+            // redirect, so the very first reapply attempt's own URL check already fails.
+            readUrl = { urlReads++; if (urlReads == 1) EXPECTED_URL else "https://example.com/login" },
+            readHeight = { "1000" },
+            applyScroll = { applies++ },
+            readPosition = { ScrollRestore.Position(0, 0) }, // never lands - forces every reapply attempt to run
+            delay = {},
+            reapplyAttempts = 3,
+        )
+        assertEquals(0, applies, "the redirect happens before the first reapply's URL check - apply must never run")
+    }
+
+    // endregion
+
     /**
      * The exact regression this suite exists to catch. A `repeat(N) { ...; return@repeat }`
      * version of the settle loop cannot pass this: `return@repeat` only skips that iteration's
@@ -116,6 +208,8 @@ class ScrollRestoreTest {
         val settled =
             ScrollRestore.awaitSettleAndApply(
                 target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
                 readHeight = { heights[heightReads++.coerceAtMost(heights.size - 1)] },
                 applyScroll = {},
                 readPosition = { TARGET },
@@ -134,6 +228,8 @@ class ScrollRestoreTest {
         val settled =
             ScrollRestore.awaitSettleAndApply(
                 target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
                 readHeight = { heightReads++.toString() }, // always different from the previous read
                 applyScroll = { applies++ },
                 readPosition = { TARGET },
@@ -150,6 +246,8 @@ class ScrollRestoreTest {
         var applies = 0
         ScrollRestore.awaitSettleAndApply(
             target = TARGET,
+            expectedUrl = EXPECTED_URL,
+            readUrl = alreadyNavigated,
             readHeight = { "1000" },
             applyScroll = { applies++ },
             // Lands on the second application - the first read (right after the first apply)
@@ -168,6 +266,8 @@ class ScrollRestoreTest {
         val settled =
             ScrollRestore.awaitSettleAndApply(
                 target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
                 readHeight = { "1000" },
                 applyScroll = { applies++ },
                 readPosition = { ScrollRestore.Position(0, 0) }, // never matches TARGET
@@ -193,6 +293,8 @@ class ScrollRestoreTest {
         val settled =
             ScrollRestore.awaitSettleAndApply(
                 target = TARGET,
+                expectedUrl = EXPECTED_URL,
+                readUrl = alreadyNavigated,
                 readHeight = { heightReads++; throw RuntimeException("DOM read failed") },
                 applyScroll = { applies++ },
                 readPosition = { TARGET },
