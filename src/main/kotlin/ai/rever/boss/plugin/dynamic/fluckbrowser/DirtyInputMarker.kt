@@ -14,10 +14,21 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  * page-load input listener setting a dirty flag" - because the DOM does not answer "has a human
  * typed here", but the event stream does: only a real keystroke arrives with `isTrusted`.
  * Autofill fires no trusted keydown. A framework writing to `value` fires none either. Both
- * documented failure modes are structurally impossible here, not patched around.
+ * documented failure modes are structurally impossible via those two paths - not "impossible",
+ * full stop; see the CDP note below, which is a different path with a different answer.
  *
  * A keystroke basis also covers `contenteditable`, which the DOM approach never could - a rich
  *-text editor has no default to diff against, but typing into one is still typing.
+ *
+ * **Not a defence against CDP-level input injection.** `Input.dispatchKeyEvent` over the Chrome
+ * DevTools Protocol produces `isTrusted: true` by design - Chromium cannot distinguish it from
+ * real hardware, which is precisely why legitimate automation (and some password managers) use
+ * it to defeat sites that reject programmatic autofill. A tool driving this browser at that
+ * layer could set the flag from synthetic input and keep a tab permanently exempt. No JS-level
+ * check can close that gap; it would need policy at the layer that grants CDP access at all,
+ * which is out of scope for a busy-state probe. Named here so it is a known, accepted boundary
+ * rather than a silent one - the guard's actual claim is narrower than "structurally impossible"
+ * read in isolation would suggest.
  *
  * ## Why the flag is a window property
  *
@@ -59,6 +70,16 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
  */
 internal object DirtyInputMarker {
     /**
+     * The window property name, shared with [FluckBrowserTabComponent.BUSY_SCRIPT] (the reader)
+     * so setter and reader cannot drift independently. Both a `const val`, so - like
+     * `PAGE_EVENT_BRIDGE` elsewhere in this plugin - the value is inlined into each referencing
+     * file's constant pool at compile time rather than looked up at runtime; the two files still
+     * recompile together, so the single source of truth holds without a runtime cross-module
+     * dependency.
+     */
+    const val DIRTY_FLAG_PROPERTY: String = "__fluckDirty"
+
+    /**
      * Idempotent: the property doubles as the install guard, so re-running on the same document
      * neither re-arms listeners nor clears a flag already set. States: `undefined` = not
      * installed, `0` = installed and clean, `1` = the user has typed.
@@ -67,32 +88,45 @@ internal object DirtyInputMarker {
      * is typing. Enter is deliberately excluded: on a form it usually IS the submit, and marking
      * the tab dirty on the keystroke that saves the work inverts the guard's meaning.
      *
+     * `compositionstart` is a second, independent trigger for the same flag - not a variant of
+     * the keydown check. CJK/Korean/Japanese IME composition reports `key === 'Process'` (or
+     * `'Unidentified'`) on every keydown in the sequence; the actual characters never arrive as a
+     * keydown that satisfies the length-1-or-edit-key filter above, so a user composing a whole
+     * paragraph through an IME would leave the flag unset and hibernate mid-draft with no signal
+     * at all. `compositionstart` fires only for a real, user-driven input-method session - there
+     * is no autofill or programmatic-value-assignment path that goes through IME composition, so
+     * adding it does not reopen the autofill hole the keydown length check exists to avoid.
+     *
      * Capture phase, so a page that stops propagation on its own editor cannot hide typing from
      * the guard - the same reasoning CredentialCapture documents for its submit listeners.
      * Listeners remove themselves once the flag is set: after the first real keystroke there is
      * nothing left to learn.
      */
-    const val INSTALL_JS: String =
+    val INSTALL_JS: String =
         "(function(){try{" +
-            "if (typeof window.__fluckDirty !== 'undefined') return;" +
-            "window.__fluckDirty = 0;" +
+            "if (typeof window.$DIRTY_FLAG_PROPERTY !== 'undefined') return;" +
+            "window.$DIRTY_FLAG_PROPERTY = 0;" +
+            "var editable = function(t){" +
+            "if (!t) return false;" +
+            "var tag = (t.tagName || '').toUpperCase();" +
+            "return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!t.isContentEditable;" +
+            "};" +
             "var mark = function(e){" +
             "if (!e.isTrusted) return;" +
-            "var t = e.target;" +
-            "if (!t) return;" +
-            "var tag = (t.tagName || '').toUpperCase();" +
-            "if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !t.isContentEditable) return;" +
+            "if (!editable(e.target)) return;" +
             "if (e.type === 'keydown'){" +
             "var k = e.key || '';" +
             "if (k.length !== 1 && k !== 'Backspace' && k !== 'Delete') return;" +
             "}" +
-            "window.__fluckDirty = 1;" +
+            "window.$DIRTY_FLAG_PROPERTY = 1;" +
             "window.removeEventListener('keydown', mark, true);" +
             "window.removeEventListener('paste', mark, true);" +
             "window.removeEventListener('cut', mark, true);" +
+            "window.removeEventListener('compositionstart', mark, true);" +
             "};" +
             "window.addEventListener('keydown', mark, true);" +
             "window.addEventListener('paste', mark, true);" +
             "window.addEventListener('cut', mark, true);" +
+            "window.addEventListener('compositionstart', mark, true);" +
             "}catch(e){}})()"
 }

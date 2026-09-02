@@ -115,9 +115,10 @@ private val probeJson = Json { ignoreUnknownKeys = true }
 internal fun parseLoginFieldProbe(raw: Any?): LoginFieldProbe {
     // Any?, and normalised before matching. `executeJavaScript` returns Any?, so a wrapper type or
     // a quoted string would collapse every branch to NoLoginField and the feature would simply
-    // never appear, with no log line. Mirrors busyStateFromScriptResult and
-    // middleClickUrlFromScriptResult, which normalise for the same reason.
-    val text = raw?.toString()?.trim()?.trim('"')?.trim() ?: return LoginFieldProbe.NoLoginField
+    // never appear, with no log line. Shares normalizeJsStringResult with
+    // busyStateFromScriptResult and ScrollRestore.parseCapture, which normalise for the same
+    // reason.
+    val text = normalizeJsStringResult(raw) ?: return LoginFieldProbe.NoLoginField
     return when {
         text.isBlank() -> LoginFieldProbe.NoLoginField
         text == PROBE_NONE -> LoginFieldProbe.NoLoginField

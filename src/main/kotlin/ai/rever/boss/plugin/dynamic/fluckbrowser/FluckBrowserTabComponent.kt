@@ -1354,7 +1354,7 @@ internal object TabHibernation {
      * marshalling change nobody would notice. Mirrors `middleClickUrlFromScriptResult` above.
      */
     internal fun busyStateFromScriptResult(result: Any?): BusyState =
-        when (result?.toString()?.trim()?.trim('"')?.lowercase()) {
+        when (normalizeJsStringResult(result)?.lowercase()) {
             "pip" -> BusyState.PICTURE_IN_PICTURE
             "shown" -> BusyState.SHOWN_IN_POP_OUT
             "media" -> BusyState.PLAYING_MEDIA
@@ -1399,7 +1399,7 @@ internal object TabHibernation {
      * `internal` only so the ordering test can read it - it has no other caller outside this
      * object, and the script cannot be tested any other way without a JS engine.
      */
-    internal const val BUSY_SCRIPT =
+    internal val BUSY_SCRIPT =
         "(function(){try{" +
             // Asked first: a PiP window is on screen showing this tab, and neither check below
             // would necessarily notice it.
@@ -1427,9 +1427,11 @@ internal object TabHibernation {
             // This reads a marker; it does NOT inspect the DOM. The DOM heuristic was attempted
             // three times and withdrawn (d1552be) - value-vs-default matching exempted every SPA,
             // and defaultValue cannot tell an autofilled password from a typed one, which
-            // exempted login pages for ~20 hours. The marker is set only by a trusted keystroke;
-            // see DirtyInputMarker for what sets it and the trades.
-            "if (window.__fluckDirty === 1) return 'input';" +
+            // exempted login pages for ~20 hours. The marker is set only by a trusted keystroke
+            // or IME composition start; see DirtyInputMarker for what sets it and the trades.
+            // Shares DirtyInputMarker.DIRTY_FLAG_PROPERTY with the setter rather than a second
+            // hardcoded literal, so a rename cannot desync setter from reader.
+            "if (window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} === 1) return 'input';" +
             // The surface pop-out this app uses reparents the tab's real rendering surface into
             // a floating window, so neither PiP API reports it - the page is simply visible
             // while its tab is backgrounded. Paired with a playing video so a rendering mode
@@ -1552,10 +1554,43 @@ private val browserDisposeExecutor = java.util.concurrent.Executors.newCachedThr
  * cannot delay the dispose it is about to receive anyway. Any failure - timeout, thrown,
  * malformed result - degrades to "nothing to restore", never to a stale or wrong position.
  */
+/**
+ * Installs [DirtyInputMarker.INSTALL_JS] on [handle], off the UI thread.
+ *
+ * One function rather than the identical `coroutineScope.launch { handle.executeJavaScript(...) }`
+ * written twice (on adoption and on every navigation) - a future change to install error handling
+ * or logging only has to land once, where missing one of the two call sites would silently
+ * reintroduce the exact class of bug this feature exists to prevent.
+ *
+ * Dispatchers.IO for the same reason [captureScrollOrNull] is: `executeJavaScript` on
+ * `coroutineScope` (Dispatchers.Main) has no suspension point of its own, so a wedged renderer
+ * would park the app's UI thread rather than a background one. Launched fire-and-forget - a
+ * failed install here degrades to "hibernation treats this tab as never dirty", which is the
+ * existing, already-accepted behaviour for a host with no page-event channel at all.
+ */
+private fun installDirtyMarker(
+    handle: BrowserHandle,
+    coroutineScope: CoroutineScope,
+) {
+    coroutineScope.launch {
+        runCatching { withContext(Dispatchers.IO) { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) } }
+    }
+}
+
 private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Position? =
-    runCatching {
-        withTimeoutOrNull(1_000L) { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }
-    }.getOrNull()?.let { ScrollRestore.parseCapture(it) }
+    try {
+        // Dispatchers.IO, not the caller's Main - same reason busyState() gives for its own
+        // identical call: withTimeoutOrNull can only abandon a call that SUSPENDS, and if
+        // executeJavaScript blocks internally (a wedged renderer) this thread stays parked
+        // until it answers. On Main that parks the whole app UI; on IO it parks one thread.
+        withContext(Dispatchers.IO) {
+            withTimeoutOrNull(1_000L) { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }
+        }?.let { ScrollRestore.parseCapture(it) }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        null
+    }
 
 /**
  * Applies a captured scroll position to a freshly (re)created handle, once the document has
@@ -1565,19 +1600,26 @@ private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.Po
  * A thin binding over [ScrollRestore.awaitSettleAndApply] - see that function's KDoc for why the
  * settle signal is document height rather than `readyState` (which fires well before a JS-heavy
  * page finishes rendering its real content), and for the loop-correctness bug this replaced.
+ *
+ * The whole call runs on Dispatchers.IO, not the caller's Main - same reason as
+ * [captureScrollOrNull]: up to ~24 sequential `executeJavaScript` round trips happen inside
+ * [ScrollRestore.awaitSettleAndApply], and a wedged renderer or a slow-to-hydrate SPA blocking
+ * any one of them must park a background thread, not the app's UI thread.
  */
 private suspend fun restoreScrollOnSettle(
     handle: BrowserHandle,
     target: ScrollRestore.Position,
 ) {
     val settled =
-        ScrollRestore.awaitSettleAndApply(
-            target = target,
-            readHeight = { handle.executeJavaScript("document.documentElement.scrollHeight")?.toString() },
-            applyScroll = { handle.executeJavaScript(ScrollRestore.restoreJs(target)) },
-            readPosition = { handle.executeJavaScript(ScrollRestore.CAPTURE_JS)?.let { ScrollRestore.parseCapture(it) } },
-            delay = { kotlinx.coroutines.delay(it) },
-        )
+        withContext(Dispatchers.IO) {
+            ScrollRestore.awaitSettleAndApply(
+                target = target,
+                readHeight = { handle.executeJavaScript("document.documentElement.scrollHeight")?.toString() },
+                applyScroll = { handle.executeJavaScript(ScrollRestore.restoreJs(target)) },
+                readPosition = { handle.executeJavaScript(ScrollRestore.CAPTURE_JS)?.let { ScrollRestore.parseCapture(it) } },
+                delay = { kotlinx.coroutines.delay(it) },
+            )
+        }
     if (!settled) {
         // Logged for the same reason a skipped hibernation is: "the scroll position didn't
         // restore" is otherwise indistinguishable in the field from "restore is broken" versus
@@ -2675,11 +2717,11 @@ internal fun FluckBrowserTabContent(
                 // with the flag naturally cleared - so submit-and-navigate resets it for free.
                 // Keystroke-based, NOT a DOM diff; see DirtyInputMarker for the three withdrawn
                 // attempts that rule the DOM approach out.
-                coroutineScope.launch { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) }
+                installDirtyMarker(handle, coroutineScope)
 
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
-                    coroutineScope.launch { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) }
+                    installDirtyMarker(handle, coroutineScope)
                     // Only update URL bar if user isn't actively editing
                     // AND sufficient time has passed since last input (300ms buffer for Tab completion)
                     val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
@@ -3263,16 +3305,38 @@ internal fun FluckBrowserTabContent(
                     println("[FluckBrowser] Hibernating idle tab to release its renderer")
                     val handle = hoistedState.releaseBrowserHandle()
                     if (handle != null) {
-                        // MUST complete before dispose is even posted, not run concurrently with
-                        // it - executeJavaScript against a handle that is mid-dispose is
-                        // undefined JxBrowser behaviour, the same uncatchable native-crash class
-                        // the whole ladder plan was built to stay clear of. Sequencing this
-                        // suspend call ahead of disposeBrowserHandleOffThread is what makes that
-                        // true; do not parallelise the two.
-                        hoistedState.savedScroll = captureScrollOrNull(handle)
-                        // Off the UI thread so hibernating a background tab can't hitch
-                        // the foreground UI.
-                        disposeBrowserHandleOffThread(handle)
+                        try {
+                            // MUST complete before dispose is even posted, not run concurrently
+                            // with it - executeJavaScript against a handle that is mid-dispose is
+                            // undefined JxBrowser behaviour, the same uncatchable native-crash
+                            // class the whole ladder plan was built to stay clear of. Sequencing
+                            // this suspend call ahead of dispose in the try body is what makes
+                            // that true; do not parallelise the two. captureScrollOrNull now
+                            // rethrows CancellationException (matching busyState's own
+                            // convention) rather than swallowing it - the `finally` below is what
+                            // guarantees dispose still runs when that happens, rather than
+                            // relying on a swallow-then-fall-through that a future "fix" to match
+                            // that same convention would have quietly turned into a leaked
+                            // Chromium process tree.
+                            //
+                            // Written only if the tab has NOT already woken while this was
+                            // capturing (up to 1s): releaseBrowserHandle() already nulled
+                            // hoistedState.browserHandle, so a re-entry can adopt a brand new one
+                            // before this finishes. If it did, this capture belongs to a session
+                            // already over, and writing it would sit in savedScroll unconsumed
+                            // until the tab's NEXT, unrelated wake - where it would be silently
+                            // applied as if it belonged there.
+                            val captured = captureScrollOrNull(handle)
+                            if (hoistedState.browserHandle == null) {
+                                hoistedState.savedScroll = captured
+                            }
+                        } finally {
+                            // Off the UI thread so hibernating a background tab can't hitch
+                            // the foreground UI. In a finally so cancellation (tab re-entry,
+                            // right above in this same effect) can never skip disposal and leak
+                            // the handle - see the comment above.
+                            disposeBrowserHandleOffThread(handle)
+                        }
                     }
                 }
             }

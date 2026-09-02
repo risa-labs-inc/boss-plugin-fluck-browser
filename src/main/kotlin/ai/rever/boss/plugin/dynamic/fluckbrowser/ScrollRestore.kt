@@ -33,13 +33,14 @@ internal object ScrollRestore {
     }
 
     /**
-     * Parses [CAPTURE_JS]'s return value. Tolerates the same quoting variance
-     * [TabHibernation.busyStateFromScriptResult] does (some hosts wrap a returned string in
-     * `"..."`, some do not), and returns null for anything that is not exactly two integers -
+     * Parses [CAPTURE_JS]'s return value. [normalizeJsStringResult] handles the same quoting
+     * variance [TabHibernation.busyStateFromScriptResult] and [CredentialSuggestions] already
+     * cope with (some hosts wrap a returned string in `"..."`, some do not) - shared rather than
+     * a third independent copy. Returns null for anything that is not exactly two integers -
      * a malformed capture must not silently restore to some OTHER position.
      */
     internal fun parseCapture(result: Any?): Position? {
-        val raw = result?.toString()?.trim()?.trim('"') ?: return null
+        val raw = normalizeJsStringResult(result) ?: return null
         val parts = raw.split(",")
         if (parts.size != 2) return null
         val x = parts[0].trim().toIntOrNull() ?: return null
@@ -67,6 +68,16 @@ internal object ScrollRestore {
      * @return true if height settled within [maxSettlePolls]; false if the cap was hit first
      *   (still worth attempting a restore on whatever the page is now, so this does not itself
      *   abort - the caller decides whether an unsettled restore is worth logging).
+     *
+     * **Known gap this cannot close:** height stability is a proxy for "the page stopped
+     * changing", and it false-positives on a page whose content changes WITHOUT changing
+     * document height - a virtualized list, a fixed-height app shell. There, the settle loop
+     * reports done on the first or second poll, [applyScroll] runs immediately, and a route
+     * change's own scroll-to-top (a common SPA pattern, fired on mount) can overwrite it a
+     * moment later with no signal that it happened - this function still reports `settled: true`
+     * for that outcome, because the height genuinely never moved. Closing this needs a second
+     * proxy (a `MutationObserver` count, say) and was judged not worth the complexity for what
+     * degrades, in the failure case, to a wrong scroll offset rather than lost data.
      */
     internal suspend fun awaitSettleAndApply(
         target: Position,

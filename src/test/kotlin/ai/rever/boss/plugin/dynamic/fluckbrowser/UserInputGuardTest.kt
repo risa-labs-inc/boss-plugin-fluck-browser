@@ -62,15 +62,36 @@ class UserInputGuardTest {
     @Test
     fun `the probe reads the marker and does not inspect the DOM`() {
         val script = TabHibernation.BUSY_SCRIPT
-        assertTrue("__fluckDirty" in script, "the probe reads DirtyInputMarker's flag")
+        assertTrue(DirtyInputMarker.DIRTY_FLAG_PROPERTY in script, "the probe reads DirtyInputMarker's flag")
         assertTrue("defaultValue" !in script, "value-vs-default diffing was withdrawn in d1552be; do not reintroduce it")
         assertTrue("defaultChecked" !in script, "value-vs-default diffing was withdrawn in d1552be; do not reintroduce it")
     }
 
     /**
+     * Setter (INSTALL_JS) and reader (BUSY_SCRIPT) must reference the SAME property name.
+     * Previously two independent hardcoded literals; a rename of one and not the other would
+     * desync them with no compile error and no test failure outside this one - the reader would
+     * simply never see the flag set, and busyStateFromScriptResult treats any unrecognized
+     * result as IDLE, so the whole guard would go silently dead.
+     */
+    @Test
+    fun `setter and reader share one flag name, not two independent literals`() {
+        assertTrue(
+            DirtyInputMarker.INSTALL_JS.contains(DirtyInputMarker.DIRTY_FLAG_PROPERTY),
+            "INSTALL_JS must reference the shared constant",
+        )
+        assertTrue(
+            TabHibernation.BUSY_SCRIPT.contains(DirtyInputMarker.DIRTY_FLAG_PROPERTY),
+            "BUSY_SCRIPT must reference the shared constant",
+        )
+    }
+
+    /**
      * What arms the marker: real keystrokes only, in the capture phase, on editable targets.
      * isTrusted is the load-bearing pin - it is the property that makes autofill and framework
-     * writes (the two documented failure modes) structurally undetectable as typing.
+     * writes (the two documented failure modes) structurally undetectable as typing via those
+     * paths (CDP-level input injection is a separate, accepted, out-of-scope boundary - see
+     * DirtyInputMarker's KDoc rather than this test, which cannot observe that distinction).
      */
     @Test
     fun `the marker arms on trusted keystrokes in the capture phase`() {
@@ -80,7 +101,32 @@ class UserInputGuardTest {
         assertTrue("'keydown', mark, true" in js, "capture phase, so a page stopping propagation cannot hide typing")
         assertTrue("'paste'" in js && "'cut'" in js, "paste and cut are typing by other means")
         assertTrue("'Enter'" !in js, "Enter usually IS the submit; marking dirty on the keystroke that saves the work inverts the guard")
-        assertTrue("typeof window.__fluckDirty !== 'undefined'" in js, "the flag doubles as the install guard - reinstalling must not clear it")
+        assertTrue(
+            "typeof window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} !== 'undefined'" in js,
+            "the flag doubles as the install guard - reinstalling must not clear it",
+        )
+    }
+
+    /**
+     * IME composition (CJK/Korean input methods) reports `key === 'Process'` on every keydown in
+     * the sequence - none of them satisfy the length-1-or-edit-key filter above, so without this
+     * a user composing a whole paragraph through an IME would leave the flag unset and hibernate
+     * mid-draft, silently, for an entire class of users. `compositionstart` is a real, user-driven
+     * signal with no autofill or programmatic-value-assignment equivalent, so adding it does not
+     * reopen the autofill hole the keydown filter exists to avoid.
+     */
+    @Test
+    fun `IME composition start also arms the marker, independently of the keydown filter`() {
+        val js = DirtyInputMarker.INSTALL_JS
+        assertTrue("compositionstart" in js, "IME composition must arm the marker - it fires no matching keydown")
+        assertTrue(
+            "addEventListener('compositionstart', mark, true)" in js,
+            "must go through the same trusted, capture-phase, editable-target checks as keydown",
+        )
+        assertTrue(
+            "removeEventListener('compositionstart', mark, true)" in js,
+            "must be torn down once armed, like every other listener here",
+        )
     }
 
     // endregion
