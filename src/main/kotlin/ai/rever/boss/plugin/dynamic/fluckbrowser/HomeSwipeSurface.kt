@@ -62,15 +62,28 @@ internal fun HomeSwipeSurface(
     // Bumped on every scroll event so the clear below re-arms rather than accumulating.
     var lastEventTick by remember { mutableStateOf(0L) }
 
-    // The affordance's own end-of-gesture timer. The gap check inside advanceHomeSwipe cannot do
-    // this alone: it only runs when a NEXT event arrives, so a swipe abandoned halfway would park
-    // the puck on screen until the user happened to scroll again. Keyed on the tick, so each event
-    // cancels the pending clear and starts a new one.
+    // Ends the gesture and fires the navigation IF it earned one - the only two places that
+    // happen, so onNavigate is called from neither the Scroll nor the Exit handler directly.
+    // Read per gesture, not cached: the host republishes the key the moment the setting changes,
+    // and a relaunch to pick that up would be a poor answer.
+    fun endGesture() {
+        val direction = endHomeSwipe(gesture)
+        gesture = HomeSwipeGesture()
+        shown = null
+        progress = 0f
+        if (direction != null && homeSwipeEnabled()) onNavigate(direction)
+    }
+
+    // The affordance's own end-of-gesture timer, and the ONLY place a swipe held past the commit
+    // distance actually navigates - see endHomeSwipe's KDoc for why that decision waits for here
+    // rather than firing the moment progress reaches 1 inside the Scroll handler below. The gap
+    // check inside advanceHomeSwipe cannot do this alone: it only runs when a NEXT event arrives,
+    // so a swipe held or abandoned would never end on its own. Keyed on the tick, so each event
+    // cancels the pending end and starts a new one.
     LaunchedEffect(lastEventTick) {
         if (shown != null) {
             delay(GESTURE_GAP_MS + 60)
-            shown = null
-            progress = 0f
+            endGesture()
         }
     }
 
@@ -92,21 +105,15 @@ internal fun HomeSwipeSurface(
                         )
                     gesture = step.gesture
                     lastEventTick++
-                    // Read per gesture, not cached: the host republishes the key the moment the
-                    // setting changes, and a relaunch to pick that up would be a poor answer.
                     val enabled = homeSwipeEnabled()
                     shown = step.direction.takeIf { enabled }
                     progress = step.progress
-                    if (enabled) step.navigate?.let(onNavigate)
                 }
-                // A pointer that leaves the surface ends the gesture outright. Compose does report
-                // this one, unlike the page detector's world, so it does not have to be inferred
-                // from silence.
-                .onPointerEvent(PointerEventType.Exit) {
-                    gesture = HomeSwipeGesture()
-                    shown = null
-                    progress = 0f
-                },
+                // A pointer that leaves the surface ends the gesture outright - Compose does
+                // report this one, unlike the page detector's world, so it does not have to be
+                // inferred from silence. Still routed through endGesture(): lifting past the
+                // commit distance is exactly as much a release as the timeout is.
+                .onPointerEvent(PointerEventType.Exit) { endGesture() },
     ) {
         content()
         shown?.let { direction -> HomeSwipeAffordance(direction, progress) }

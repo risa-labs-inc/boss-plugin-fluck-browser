@@ -14,6 +14,11 @@ import kotlin.test.assertTrue
  * constants. The host's page-side detector is covered the same way, by running it
  * (`scripts/test/test-swipe-nav.js` in BossConsole); this is that suite's counterpart for the one
  * surface with no page.
+ *
+ * [advanceHomeSwipe] itself cannot navigate any more - [HomeSwipeStep] has no `navigate` field, so
+ * a mid-gesture step firing early is a compile error, not something a test has to catch. Only
+ * [endHomeSwipe], called once a gesture ends, decides - which is why every test below folds a
+ * whole physical gesture and then ends it, mirroring what [HomeSwipeSurface] actually does.
  */
 class HomeSwipeNavigationTest {
     /** One scroll event, as the surface would see it. */
@@ -24,23 +29,19 @@ class HomeSwipeNavigationTest {
         val atMs: Long = 0,
     )
 
-    /** What a folded stream produced: every navigation, the last step, and the one that fired. */
+    /** What one physical gesture produced: whatever fired at its end, and where it left off. */
     private data class Run(
-        val navigated: List<HomeSwipeDirection>,
+        val navigated: HomeSwipeDirection?,
         val last: HomeSwipeStep,
-        /** The step that navigated. Not the last one - the affordance clears on the next event. */
-        val committing: HomeSwipeStep?,
     )
 
-    /** Fold a stream and report every navigation it produced, plus where it ended up. */
+    /** Fold one continuous physical gesture and end it, exactly as [HomeSwipeSurface] would on a timeout or pointer exit. */
     private fun run(
         events: List<Wheel>,
         canGoBack: Boolean = true,
         canGoForward: Boolean = true,
     ): Run {
         var gesture = HomeSwipeGesture()
-        val navigated = mutableListOf<HomeSwipeDirection>()
-        var committing: HomeSwipeStep? = null
         var last = HomeSwipeStep(gesture)
         events.forEachIndexed { index, event ->
             last =
@@ -56,12 +57,38 @@ class HomeSwipeNavigationTest {
                     canGoForward = canGoForward,
                 )
             gesture = last.gesture
-            last.navigate?.let {
-                navigated += it
-                committing = last
-            }
         }
-        return Run(navigated, last, committing)
+        return Run(endHomeSwipe(gesture), last)
+    }
+
+    /**
+     * Fold several SEPARATE physical gestures through one continuous state and end each in turn -
+     * for the cases that are about the gap between two swipes, not one swipe's own mechanics.
+     * Unlike [run], state is NOT reset to a fresh [HomeSwipeGesture] between calls: the point is
+     * to prove [advanceHomeSwipe]'s own gap check (`continuing`) recognises the second swipe's
+     * first event arrives after [GESTURE_GAP_MS] and starts it clean on its own, the same way
+     * production relies on it rather than on [HomeSwipeSurface] having reset first.
+     */
+    private fun runGestures(vararg physicalGestures: List<Wheel>): List<HomeSwipeDirection> {
+        var gesture = HomeSwipeGesture()
+        val navigated = mutableListOf<HomeSwipeDirection>()
+        physicalGestures.forEach { events ->
+            events.forEach { event ->
+                val step =
+                    advanceHomeSwipe(
+                        gesture = gesture,
+                        deltaX = event.dx,
+                        deltaY = event.dy,
+                        nowMs = event.atMs,
+                        consumed = event.consumed,
+                        canGoBack = true,
+                        canGoForward = true,
+                    )
+                gesture = step.gesture
+            }
+            endHomeSwipe(gesture)?.let { navigated += it }
+        }
+        return navigated
     }
 
     /**
@@ -86,38 +113,57 @@ class HomeSwipeNavigationTest {
 
     @Test
     fun `a real swipe goes back once`() {
-        val (navigated, _) = run(swipe(12, -1f))
-        assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
+        assertEquals(HomeSwipeDirection.BACK, run(swipe(12, -1f)).navigated)
     }
 
     @Test
     fun `the other direction goes forward`() {
-        val (navigated, _) = run(swipe(12, 1f))
-        assertEquals(listOf(HomeSwipeDirection.FORWARD), navigated)
+        assertEquals(HomeSwipeDirection.FORWARD, run(swipe(12, 1f)).navigated)
     }
 
     @Test
     fun `one continuous swipe navigates exactly once`() {
-        val (navigated, _) = run(swipe(40, -1f))
-        assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
+        // There is only one decision point per physical gesture now - endHomeSwipe, called once,
+        // at the end. Overshooting the commit distance by a lot does not create extra decisions.
+        assertEquals(HomeSwipeDirection.BACK, run(swipe(40, -1f)).navigated)
     }
 
     @Test
     fun `two swipes across a gap navigate twice`() {
         val first = swipe(12, -1f, startMs = 1_000L)
         val second = swipe(12, -1f, startMs = 1_000L + 12 + GESTURE_GAP_MS + 40)
-        val (navigated, _) = run(first + second)
-        assertEquals(listOf(HomeSwipeDirection.BACK, HomeSwipeDirection.BACK), navigated)
+        assertEquals(listOf(HomeSwipeDirection.BACK, HomeSwipeDirection.BACK), runGestures(first, second))
     }
 
-    // --- gestures that must not ---------------------------------------------------------------
+    // --- gestures that must not -----------------------------------------------------------------
 
     @Test
     fun `abandoned short of the threshold`() {
-        val (navigated, last) = run(swipe(5, -1f))
-        assertTrue(navigated.isEmpty())
-        assertEquals(HomeSwipeDirection.BACK, last.direction, "the affordance should still be up")
-        assertTrue(last.progress > 0f && last.progress < 1f, "progress ${last.progress}")
+        val out = run(swipe(5, -1f))
+        assertNull(out.navigated)
+        assertEquals(HomeSwipeDirection.BACK, out.last.direction, "the affordance should still be up")
+        assertTrue(out.last.progress > 0f && out.last.progress < 1f, "progress ${out.last.progress}")
+    }
+
+    /**
+     * The heart of the fix this suite exists to pin: reaching the commit distance is not the same
+     * as navigating. Same direction throughout - accumX never crosses back through zero, so this
+     * is NOT the reversal guard below - just letting go before release while short of the line.
+     */
+    @Test
+    fun `easing back below the commit distance before release does not navigate`() {
+        val out = run(swipe(10, -1f) + swipe(4, 1f, startMs = 1_010L))
+        assertNull(out.navigated, "progress dropped back under 1 by the time the gesture ended")
+    }
+
+    /**
+     * The other half of that: reaching the commit distance and STAYING there through release
+     * must navigate - the guard above must not have overcorrected into never firing at all.
+     */
+    @Test
+    fun `reaching the commit distance and holding it through release does navigate`() {
+        val out = run(swipe(10, -1f) + swipe(1, -1f, startMs = 1_010L))
+        assertEquals(HomeSwipeDirection.BACK, out.navigated)
     }
 
     /**
@@ -127,9 +173,9 @@ class HomeSwipeNavigationTest {
      */
     @Test
     fun `an event a scroller already took`() {
-        val (navigated, last) = run(swipe(12, -1f, consumed = true))
-        assertTrue(navigated.isEmpty())
-        assertNull(last.direction, "no affordance over something the page is scrolling")
+        val out = run(swipe(12, -1f, consumed = true))
+        assertNull(out.navigated)
+        assertNull(out.last.direction, "no affordance over something the page is scrolling")
     }
 
     /**
@@ -140,8 +186,8 @@ class HomeSwipeNavigationTest {
      */
     @Test
     fun `a scroller that took the start of a gesture keeps it`() {
-        val (navigated, _) = run(swipe(4, -1f, consumed = true) + swipe(20, -1f, startMs = 1_004L))
-        assertTrue(navigated.isEmpty())
+        val out = run(swipe(4, -1f, consumed = true) + swipe(20, -1f, startMs = 1_004L))
+        assertNull(out.navigated)
     }
 
     /**
@@ -152,8 +198,7 @@ class HomeSwipeNavigationTest {
     fun `and the next gesture is free`() {
         val first = swipe(4, -1f, consumed = true, startMs = 1_000L)
         val second = swipe(12, -1f, startMs = 1_004L + GESTURE_GAP_MS + 40)
-        val (navigated, _) = run(first + second)
-        assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
+        assertEquals(listOf(HomeSwipeDirection.BACK), runGestures(first, second))
     }
 
     /**
@@ -166,8 +211,7 @@ class HomeSwipeNavigationTest {
      */
     @Test
     fun `an honest swipe with slope still commits`() {
-        val (navigated, _) = run(swipe(14, -1f, dySteps = 0.6f))
-        assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
+        assertEquals(HomeSwipeDirection.BACK, run(swipe(14, -1f, dySteps = 0.6f)).navigated)
     }
 
     /**
@@ -178,8 +222,7 @@ class HomeSwipeNavigationTest {
     @Test
     fun `a gesture that starts vertically is refused`() {
         val opening = listOf(Wheel(-0.2f * step, 1.5f * step, false, 1_000L))
-        val (navigated, _) = run(opening + swipe(12, -1f, startMs = 1_001L))
-        assertTrue(navigated.isEmpty())
+        assertNull(run(opening + swipe(12, -1f, startMs = 1_001L)).navigated)
     }
 
     /**
@@ -193,8 +236,7 @@ class HomeSwipeNavigationTest {
     @Test
     fun `a tiny opening flick the wrong way is refused`() {
         val flick = listOf(Wheel(-0.01f * step, 0.05f * step, false, 1_000L))
-        val (navigated, _) = run(flick + swipe(14, -1f, startMs = 1_001L))
-        assertTrue(navigated.isEmpty())
+        assertNull(run(flick + swipe(14, -1f, startMs = 1_001L)).navigated)
     }
 
     /**
@@ -205,21 +247,18 @@ class HomeSwipeNavigationTest {
     @Test
     fun `vertical wobble that nets to zero is still refused`() {
         val events = (0 until 20).map { Wheel(-1f * step, (if (it % 2 == 0) 0.8f else -0.8f) * step, false, 1_000L + it) }
-        val (navigated, _) = run(events)
-        assertTrue(navigated.isEmpty())
+        assertNull(run(events).navigated)
     }
 
     @Test
     fun `a diagonal drag`() {
-        val (navigated, _) = run(swipe(12, -1f, dySteps = -4f))
-        assertTrue(navigated.isEmpty())
+        assertNull(run(swipe(12, -1f, dySteps = -4f)).navigated)
     }
 
     @Test
     fun `a vertical scroll that curls into a horizontal one`() {
         val vertical = swipe(5, 0f, dySteps = -5f, startMs = 1_000L)
-        val (navigated, _) = run(vertical + swipe(12, -1f, startMs = 1_005L))
-        assertTrue(navigated.isEmpty())
+        assertNull(run(vertical + swipe(12, -1f, startMs = 1_005L)).navigated)
     }
 
     /**
@@ -229,21 +268,20 @@ class HomeSwipeNavigationTest {
      */
     @Test
     fun `a swipe reversed halfway`() {
-        val (navigated, _) = run(swipe(3, -1f, startMs = 1_000L) + swipe(14, 1f, startMs = 1_003L))
-        assertTrue(navigated.isEmpty())
+        val out = run(swipe(3, -1f, startMs = 1_000L) + swipe(14, 1f, startMs = 1_003L))
+        assertNull(out.navigated)
     }
 
     @Test
     fun `a direction with no history entry`() {
-        val (navigated, last) = run(swipe(12, -1f), canGoBack = false)
-        assertTrue(navigated.isEmpty())
-        assertNull(last.direction, "no affordance for a direction that cannot be taken")
+        val out = run(swipe(12, -1f), canGoBack = false)
+        assertNull(out.navigated)
+        assertNull(out.last.direction, "no affordance for a direction that cannot be taken")
     }
 
     @Test
     fun `the unavailable direction does not block the other one`() {
-        val (navigated, _) = run(swipe(12, 1f), canGoBack = false)
-        assertEquals(listOf(HomeSwipeDirection.FORWARD), navigated)
+        assertEquals(HomeSwipeDirection.FORWARD, run(swipe(12, 1f), canGoBack = false).navigated)
     }
 
     // --- the switch the host publishes ----------------------------------------------------------
@@ -286,9 +324,9 @@ class HomeSwipeNavigationTest {
 
     @Test
     fun `nothing is drawn until the gesture looks real`() {
-        val (_, last) = run(swipe(MIN_EVENTS - 1, -1f))
-        assertNull(last.direction)
-        assertEquals(0f, last.progress)
+        val out = run(swipe(MIN_EVENTS - 1, -1f))
+        assertNull(out.last.direction)
+        assertEquals(0f, out.last.progress)
     }
 
     @Test
@@ -296,18 +334,7 @@ class HomeSwipeNavigationTest {
         val half = run(swipe(5, -1f)).last
         assertTrue(half.progress in 0.4f..0.7f, "half way was ${half.progress}")
         val full = run(swipe(10, -1f))
-        assertEquals(listOf(HomeSwipeDirection.BACK), full.navigated)
-        assertEquals(1f, full.committing?.progress, "the committing step draws the puck filled in")
-    }
-
-    /**
-     * And it goes away as the navigation starts, rather than sitting over the page that replaces
-     * home. The page detector hides its own chevron at the same moment for the same reason.
-     */
-    @Test
-    fun `and the affordance clears once it has fired`() {
-        val (_, after) = run(swipe(20, -1f))
-        assertNull(after.direction)
-        assertEquals(0f, after.progress)
+        assertEquals(HomeSwipeDirection.BACK, full.navigated)
+        assertEquals(1f, full.last.progress, "the puck is fully filled in by the time the gesture ends")
     }
 }

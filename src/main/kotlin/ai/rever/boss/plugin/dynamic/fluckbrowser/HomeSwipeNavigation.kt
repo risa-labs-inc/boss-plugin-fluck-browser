@@ -130,18 +130,18 @@ internal data class HomeSwipeGesture(
     val lastEventAtMs: Long = 0,
     /** Ruled out; stays ruled out until the fingers lift, so a rejected swipe cannot come back. */
     val rejected: Boolean = false,
-    /** Already navigated, so one continuous swipe navigates exactly once. */
-    val committed: Boolean = false,
     val direction: HomeSwipeDirection? = null,
 )
 
 /**
- * What one scroll event did: the gesture that follows it, whether to navigate now, and how far
- * along the affordance should be drawn (0 when there is nothing to draw).
+ * What one scroll event did: the gesture that follows it, and how far along the affordance
+ * should be drawn (0 when there is nothing to draw).
+ *
+ * No `navigate` field here any more - see [endHomeSwipe] for why the decision moved to gesture
+ * END rather than living in every per-event step.
  */
 internal data class HomeSwipeStep(
     val gesture: HomeSwipeGesture,
-    val navigate: HomeSwipeDirection? = null,
     val direction: HomeSwipeDirection? = null,
     val progress: Float = 0f,
 )
@@ -152,6 +152,10 @@ internal data class HomeSwipeStep(
  * [consumed] is whether a child scroller took the event; a consumed event is the page scrolling
  * something, never a navigation. [canGoBack] and [canGoForward] gate the direction, so an
  * unavailable one shows no affordance rather than an affordance that does nothing.
+ *
+ * Never navigates - see [endHomeSwipe]. This only tracks progress and the two ways a gesture can
+ * be ruled out early (an unwanted scroll chain, too much vertical, a reversal, an unavailable
+ * direction); reaching the commit distance is just a progress value like any other here.
  */
 internal fun advanceHomeSwipe(
     gesture: HomeSwipeGesture,
@@ -170,7 +174,7 @@ internal fun advanceHomeSwipe(
     val base = if (continuing) gesture else HomeSwipeGesture()
     val stamped = base.copy(lastEventAtMs = nowMs)
 
-    if (stamped.committed || stamped.rejected) return HomeSwipeStep(stamped)
+    if (stamped.rejected) return HomeSwipeStep(stamped)
     // Something under the pointer scrolled. That is what the event was for.
     if (consumed) return HomeSwipeStep(stamped.copy(rejected = true))
 
@@ -200,7 +204,10 @@ internal fun advanceHomeSwipe(
                 if (!available) return HomeSwipeStep(moved.copy(rejected = true))
                 moved.copy(direction = heading)
             }
-            // Reversed mid-swipe. An abandon, rather than flipping the navigation under the user.
+            // Reversed mid-swipe. An abandon, rather than flipping the navigation under the user -
+            // this is the gesture's own cancel-by-reversing, independent of [endHomeSwipe]'s
+            // release-time check: a full direction flip rules the gesture out immediately, it does
+            // not wait for the fingers to lift.
             moved.direction != heading -> return HomeSwipeStep(moved.copy(rejected = true))
             else -> moved
         }
@@ -208,13 +215,26 @@ internal fun advanceHomeSwipe(
     if (settled.events < MIN_EVENTS) return HomeSwipeStep(settled)
 
     val progress = (kotlin.math.abs(settled.accumX) / COMMIT_UNITS).coerceAtMost(1f)
-    if (progress < 1f) {
-        return HomeSwipeStep(settled, direction = settled.direction, progress = progress)
-    }
-    return HomeSwipeStep(
-        settled.copy(committed = true),
-        navigate = settled.direction,
-        direction = settled.direction,
-        progress = 1f,
-    )
+    return HomeSwipeStep(settled, direction = settled.direction, progress = progress)
+}
+
+/**
+ * Decide whether a finished gesture navigates.
+ *
+ * Called when the gesture ENDS - a gap in the wheel stream, or the pointer leaving the surface -
+ * never mid-swipe. [advanceHomeSwipe] only tracks progress and the two ways a gesture rules
+ * itself out early (a direction flip, too much vertical); this is the one place "reached the
+ * commit distance" turns into an actual navigation, so:
+ *
+ * - a swipe that crosses the threshold and is still held does not navigate before release
+ * - one that eases back below the threshold before release (same direction, no reversal) does
+ *   not navigate at all - "cancel" does not require a full reversal, just letting go early
+ * - one that reverses direction outright is already `rejected` by [advanceHomeSwipe] and never
+ *   reaches here with a direction to navigate
+ */
+internal fun endHomeSwipe(gesture: HomeSwipeGesture): HomeSwipeDirection? {
+    if (gesture.rejected) return null
+    val direction = gesture.direction ?: return null
+    val progress = kotlin.math.abs(gesture.accumX) / COMMIT_UNITS
+    return direction.takeIf { progress >= 1f }
 }
