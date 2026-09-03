@@ -29,7 +29,7 @@ internal object AddressBarUrlField {
      * takes the claim on a keystroke that types nothing, so "claim it, then click the page"
      * would otherwise stop the URL bar following navigations for the life of the tab.
      *
-     * Bounded rather than released outright, and gated on nothing having been typed, because
+     * Bounded rather than released outright, and gated on nothing having been TYPED, because
      * those are the two things that keep it from undoing the other two rules here: Cmd+L's
      * selection needs protecting for seconds, not a minute, and text the user actually typed is
      * never discarded however long it has sat there.
@@ -50,18 +50,21 @@ internal object AddressBarUrlField {
      *
      * @param msSinceUserEdit now minus the last user edit. Negative or absurd values (a clock
      *   step) simply read as "recent", which errs toward leaving the user's text alone.
-     * @param fieldHoldsUnmodifiedUrl whether the field still reads exactly as the URL the bar was
-     *   last showing, i.e. nothing has been typed into it. Cmd+L selects the text but changes
-     *   none of it, so this stays true through a claim the user has walked away from.
+     * @param typedSinceClaim whether anything has been typed since the current claim was taken.
+     *   Tracked by the caller rather than inferred from the field's contents: "the field still
+     *   reads as the loaded URL" looks like the same question and is not, because the bar
+     *   legitimately shows something else on a home tab (`about:blank` over an empty
+     *   `loadedUrl`) and after an abandoned draft outlives the claim released with it - and in
+     *   exactly those states an inferred version would never let the bound below fire.
      */
     fun navigationMayRewrite(
         isUserEditing: Boolean,
         msSinceUserEdit: Long,
-        fieldHoldsUnmodifiedUrl: Boolean,
+        typedSinceClaim: Boolean,
     ): Boolean =
         when {
             // Nothing typed and nothing touched in a minute: the claim is stale, not active.
-            fieldHoldsUnmodifiedUrl && msSinceUserEdit > UNTYPED_CLAIM_STALE_MS -> true
+            !typedSinceClaim && msSinceUserEdit > UNTYPED_CLAIM_STALE_MS -> true
             isUserEditing -> false
             else -> msSinceUserEdit > USER_EDIT_GRACE_MS
         }
@@ -83,6 +86,9 @@ internal object AddressBarUrlField {
      * one the user could see. Cmd+L claims the field on a keystroke that types nothing, which
      * makes claim-then-Escape reachable in two keys - and while the claim stands,
      * [navigationMayRewrite] is false and the URL bar silently stops following navigations.
+     *
+     * Callers guard on there being something to revert to: `loadedUrl` is deliberately blank on
+     * a home tab, and blanking the field is not reverting it.
      */
     fun restoreTo(loadedUrl: String): TextFieldValue = TextFieldValue(loadedUrl, TextRange(loadedUrl.length))
 }

@@ -2645,6 +2645,13 @@ internal fun FluckBrowserTabContent(
     // Local-only state (not shared across composition) — derived/transient,
     // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
+    // Whether anything has been TYPED since the current claim was taken. Tracked rather than
+    // inferred from "does the field still read as the loaded URL": that comparison is false
+    // whenever the bar legitimately shows something else - a home tab holds "about:blank" while
+    // loadedUrl is deliberately "", and a draft the user abandoned outlives the claim that was
+    // released with it - and in every one of those states the staleness bound below would never
+    // fire, which is the freeze it exists to prevent.
+    var typedSinceClaim by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
 
     // Cmd+L. The chord is a plugin-contributed GLOBAL shortcut, so it arrives with only a window
@@ -2687,6 +2694,8 @@ internal fun FluckBrowserTabContent(
                     // is the predicate that listener asks.
                     isUserEditingUrl = true
                     lastUserEditTime = System.currentTimeMillis()
+                    // A fresh claim, whatever the field happens to be holding.
+                    typedSinceClaim = false
 
                     urlBarText = AddressBarUrlField.selectAll(urlBarText)
                 }
@@ -3064,17 +3073,13 @@ internal fun FluckBrowserTabContent(
                     // handle the tab has given up, changing what the tab wakes onto.
                     if (hoistedState.browserHandle !== handle) return@addNavigationListener
                     installDirtyMarker(handle, coroutineScope, hoistedState)
-                    // Captured BEFORE loadedUrl moves on: "has the user typed anything" is the
-                    // field measured against the URL the bar is currently SHOWING, not against
-                    // the one we are about to navigate to.
-                    val shownUrl = loadedUrl
                     loadedUrl = url
                     // Only update URL bar while the user does not own the field - which is
                     // also what keeps Cmd+L's selection alive on a still-loading page.
                     if (AddressBarUrlField.navigationMayRewrite(
                             isUserEditing = isUserEditingUrl,
                             msSinceUserEdit = System.currentTimeMillis() - lastUserEditTime,
-                            fieldHoldsUnmodifiedUrl = urlBarText.text == shownUrl,
+                            typedSinceClaim = typedSinceClaim,
                         )
                     ) {
                         urlBarText = TextFieldValue(url, TextRange(url.length))
@@ -3828,6 +3833,7 @@ internal fun FluckBrowserTabContent(
             onUrlBarTextChange = { newValue ->
                 isUserEditingUrl = true
                 lastUserEditTime = System.currentTimeMillis()
+                typedSinceClaim = true
                 urlBarText = newValue
                 selectedDropdownIndex = -1
 
@@ -3879,6 +3885,7 @@ internal fun FluckBrowserTabContent(
                 // Clear editing state to allow URL bar updates during navigation
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
+                typedSinceClaim = false
                 showUrlSuggestions = false
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
@@ -3946,6 +3953,7 @@ internal fun FluckBrowserTabContent(
                 urlBarText = TextFieldValue(suggestion.url, TextRange(suggestion.url.length))
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
+                typedSinceClaim = false
                 showUrlSuggestions = false
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
@@ -3962,9 +3970,16 @@ internal fun FluckBrowserTabContent(
                 // Reset explicitly rather than leaning on the 200ms onFocusLost path: that only
                 // runs if a focus-changed event actually arrives, and on Windows/Linux
                 // HARDWARE_ACCELERATED a click into the native page surface may not produce one.
-                urlBarText = AddressBarUrlField.restoreTo(loadedUrl)
+                // Only rewrite when there is something to revert TO. loadedUrl is deliberately
+                // "" on a home tab (about:blank fires no navigation events, so home is the one
+                // surface that has to say "nothing loaded" itself), and blanking the field is not
+                // reverting it. The claim is released either way - that is what fixes the freeze.
+                if (loadedUrl.isNotBlank()) {
+                    urlBarText = AddressBarUrlField.restoreTo(loadedUrl)
+                }
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
+                typedSinceClaim = false
             },
             onAcceptAutocomplete = {
                 if (autocompleteSuggestion != null) {
@@ -3981,7 +3996,12 @@ internal fun FluckBrowserTabContent(
                 coroutineScope.launch {
                     delay(200)
                     showUrlSuggestions = false
+                    // Reset all three together, like every other release path: leaving
+                    // lastUserEditTime behind broke the invariant the other three keep, and this
+                    // is the path most likely to hand a stale claim to the staleness bound.
                     isUserEditingUrl = false
+                    lastUserEditTime = 0L
+                    typedSinceClaim = false
                 }
             }
         )

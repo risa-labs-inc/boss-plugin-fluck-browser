@@ -24,7 +24,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = false,
                 msSinceUserEdit = AddressBarUrlField.USER_EDIT_GRACE_MS + 1,
-                fieldHoldsUnmodifiedUrl = true,
+                typedSinceClaim = false,
             ),
         )
     }
@@ -36,7 +36,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = true,
                 msSinceUserEdit = 10_000,
-                fieldHoldsUnmodifiedUrl = false,
+                typedSinceClaim = true,
             ),
             "a field the user owns must not be rewritten however long ago they last typed",
         )
@@ -50,7 +50,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = false,
                 msSinceUserEdit = AddressBarUrlField.USER_EDIT_GRACE_MS,
-                fieldHoldsUnmodifiedUrl = false,
+                typedSinceClaim = true,
             ),
             "the grace window is exclusive at its own boundary",
         )
@@ -58,7 +58,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = false,
                 msSinceUserEdit = 0,
-                fieldHoldsUnmodifiedUrl = false,
+                typedSinceClaim = true,
             ),
         )
     }
@@ -71,7 +71,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = false,
                 msSinceUserEdit = -5_000,
-                fieldHoldsUnmodifiedUrl = false,
+                typedSinceClaim = true,
             ),
         )
     }
@@ -98,7 +98,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = false,
                 msSinceUserEdit = System.currentTimeMillis(),
-                fieldHoldsUnmodifiedUrl = true,
+                typedSinceClaim = false,
             ),
             "with the claim released and lastUserEditTime reset to 0, navigations track again",
         )
@@ -106,7 +106,9 @@ class AddressBarUrlFieldTest {
 
     @Test
     fun `restoring an unloaded page yields an empty field, not a crash`() {
-        // Escape on the home screen, where nothing has loaded.
+        // The pure function is total. Callers do NOT hand it a blank loadedUrl, though - Escape
+        // on a home tab releases the claim and leaves the text alone, because blanking the field
+        // is not reverting it.
         val restored = AddressBarUrlField.restoreTo("")
 
         assertEquals("", restored.text)
@@ -123,16 +125,46 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = true,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
-                fieldHoldsUnmodifiedUrl = true,
+                typedSinceClaim = false,
             ),
         )
         assertFalse(
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = true,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS,
-                fieldHoldsUnmodifiedUrl = true,
+                typedSinceClaim = false,
             ),
             "exclusive at its own boundary, like the grace window",
+        )
+    }
+
+    @Test
+    fun `a home tab's claim still goes stale`() {
+        // The case an inferred "field still reads as the loaded URL" could not express: a home
+        // tab holds "about:blank" while loadedUrl is deliberately "", so the strings never match
+        // and the bound would never have fired there. Nothing was TYPED, so it fires.
+        assertTrue(
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = true,
+                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
+                typedSinceClaim = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `a claim taken over an abandoned draft still goes stale`() {
+        // The sharper one. Type "goo", click the page: onFocusLost releases the claim but leaves
+        // the text. Press Cmd+L again and the claim is over text that does not match loadedUrl -
+        // so an inferred version would never expire it, and the bar would be frozen for the life
+        // of the tab. Cmd+L resets the flag, so what matters is that nothing was typed under
+        // THIS claim.
+        assertTrue(
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = true,
+                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
+                typedSinceClaim = false,
+            ),
         )
     }
 
@@ -145,7 +177,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = true,
                 msSinceUserEdit = 60L * 60 * 1000,
-                fieldHoldsUnmodifiedUrl = false,
+                typedSinceClaim = true,
             ),
         )
     }
@@ -159,7 +191,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = true,
                 msSinceUserEdit = 5_000,
-                fieldHoldsUnmodifiedUrl = true,
+                typedSinceClaim = false,
             ),
         )
     }

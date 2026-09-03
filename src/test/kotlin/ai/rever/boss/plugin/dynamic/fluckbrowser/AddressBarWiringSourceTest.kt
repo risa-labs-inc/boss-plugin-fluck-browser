@@ -98,22 +98,20 @@ class AddressBarWiringSourceTest {
     }
 
     @Test
-    fun `the navigation listener still measures the field against the shown URL`() {
-        // Both halves matter, in opposite directions: hardcode this true and a redirect collapses
-        // Cmd+L's selection again; hardcode it false and an abandoned claim never expires. It has
-        // to be the real comparison, against the URL the bar was SHOWING rather than the one
-        // being navigated to.
+    fun `the staleness gate is fed the tracked flag, not a literal`() {
+        // Pass a literal here and one of two fixes silently dies: `true` and a redirect collapses
+        // Cmd+L's selection again, `false` and an abandoned claim never expires. The flag also
+        // has to actually be maintained, so something must set it when the user types.
         val code = tabComponentCode()
 
         assertTrue(
-            code.contains(Regex("""fieldHoldsUnmodifiedUrl\s*=\s*urlBarText\.text\s*==\s*shownUrl""")),
-            "the claim-staleness gate is no longer the real comparison - either the selection or " +
-                "the stuck-claim fix is now broken",
+            code.contains(Regex("""typedSinceClaim\s*=\s*typedSinceClaim""")),
+            "the staleness gate is no longer fed the tracked flag - either the selection or the " +
+                "stuck-claim fix is now broken",
         )
         assertTrue(
-            code.contains(Regex("""val\s+shownUrl\s*=\s*loadedUrl""")),
-            "shownUrl is no longer captured before loadedUrl moves on, so the comparison is " +
-                "against the wrong URL",
+            code.contains(Regex("""typedSinceClaim\s*=\s*true""")),
+            "nothing sets typedSinceClaim, so typed text would be treated as an abandoned claim",
         )
     }
 

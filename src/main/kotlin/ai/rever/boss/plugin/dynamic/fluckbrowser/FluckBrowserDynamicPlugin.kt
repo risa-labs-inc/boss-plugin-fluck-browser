@@ -55,9 +55,8 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
      * CONTEXT-scoped so the editor's Go To Line keeps the same chord, which is the whole reason
      * the binding lives in the host presets. The four locally handled chords are the older
      * pattern, not the target; do not "simplify" this into one.
-     */
-    /**
-     * Lazy, not eager, and that is load-bearing rather than a style choice: an eagerly
+     *
+     * **Lazy, not eager, and that is load-bearing rather than a style choice.** An eagerly
      * initialised property is constructed in the CONSTRUCTOR, so a host whose api lacks
      * `ShortcutActionProvider` would fail with `NoClassDefFoundError` at plugin instantiation -
      * outside the runCatching in [register] that exists to keep a keyboard convenience from
