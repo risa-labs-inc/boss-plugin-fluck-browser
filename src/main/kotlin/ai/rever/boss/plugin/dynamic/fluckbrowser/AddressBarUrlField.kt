@@ -97,6 +97,37 @@ internal object AddressBarUrlField {
         next: String,
     ): Boolean = previous != next
 
+    /**
+     * Whether a field change should touch the suggestion dropdown at all.
+     *
+     * The field's `onValueChange` fires for selection-only changes too, and the three outcomes
+     * are genuinely different:
+     *  - **text changed** - recompute or clear, as before. The only case that can change what the
+     *    suggestions ARE.
+     *  - **text unchanged, selection not collapsed** (Cmd+A, shift-arrow, drag-select) - clear,
+     *    as before. Selecting the whole field is not a query, and leaving a stale inline
+     *    completion standing changes what Enter does: it would take the
+     *    `autocompleteSuggestion != null` branch and navigate to a suggestion computed for text
+     *    the user has just selected over, instead of resolving what they typed.
+     *  - **text unchanged, selection collapsed** (a caret move) - leave everything ALONE. This is
+     *    the only new case, and the one worth having: it skips a `getSuggestions()` call per
+     *    arrow key, and it stops Cmd+L then Left from re-opening the dropdown, which would spend
+     *    the next Escape dismissing it rather than releasing the claim.
+     *
+     * Gating on [textChanged] alone was wrong, and the reasoning that justified it was too: it
+     * assumed an arrow key reached the clearing branch, when a collapsed caret move actually took
+     * the recompute branch and simply recomputed the same answer.
+     *
+     * Takes the two strings rather than a pre-computed `textChanged` so this is ONE call at the
+     * call site. The version that took a boolean invited passing [textChanged] on its own, which
+     * is precisely the bug above.
+     */
+    fun suggestionsNeedUpdate(
+        previous: String,
+        next: String,
+        selectionCollapsed: Boolean,
+    ): Boolean = textChanged(previous, next) || !selectionCollapsed
+
     /** What a navigation callback should do to the URL field. */
     sealed interface NavigationWrite {
         /** Leave the field alone: someone is editing it. */

@@ -149,7 +149,10 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // that they exist at the floor. And existing is not the same as not throwing, which is
         // what the runCatching is for.
         runCatching { context.registerShortcutActionProvider(addressBarShortcuts) }
-            .onFailure { println("[FluckBrowser] Cmd+L unavailable: ${it.message}") }
+            // Class name as well as message: the case the laziness exists for is a
+            // NoClassDefFoundError, whose message is the missing symbol but whose TYPE is what
+            // says "this host is too old" rather than "the host rejected the id".
+            .onFailure { println("[FluckBrowser] Cmd+L unavailable (${it::class.simpleName}): ${it.message}") }
     }
 
     override fun dispose() {

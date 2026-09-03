@@ -3931,17 +3931,17 @@ internal fun FluckBrowserTabContent(
                 // Get autocomplete suggestion and dropdown items
                 // Only compute when text is not empty and cursor is not selecting text
                 //
-                // Gated on the text changing because this callback fires for selection-only
-                // changes too, and a caret move cannot change what the suggestions are. Two
-                // things fall out: it skips a getSuggestions() call per arrow key, and it stops
-                // Cmd+L then Left OPENING the dropdown - which would spend the next Escape
-                // dismissing it instead of releasing the claim, breaking the one-press property
-                // the two-stage Escape is documented to have.
-                //
-                // A selection-only change leaves the dropdown state ALONE rather than taking the
-                // else branch: clearing there would close the suggestions every time the user
-                // arrowed through text they had just typed, which is worse than the bug above.
-                if (AddressBarUrlField.textChanged(previousText, newValue.text)) {
+                // Only a CARET MOVE is skipped here - see suggestionsNeedUpdate for the three
+                // cases and why a non-collapsed selection must still clear. Skipping the caret
+                // move is what stops Cmd+L then Left re-opening the dropdown, which would spend
+                // the next Escape dismissing it rather than releasing the claim, and what avoids
+                // a getSuggestions() call per arrow key.
+                if (AddressBarUrlField.suggestionsNeedUpdate(
+                        previous = previousText,
+                        next = newValue.text,
+                        selectionCollapsed = newValue.selection.collapsed,
+                    )
+                ) {
                     if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
                         // distinctBy: the dropdown keys its rows by URL, and a duplicate key
                         // is fatal to a LazyColumn. The current host can't produce one, but

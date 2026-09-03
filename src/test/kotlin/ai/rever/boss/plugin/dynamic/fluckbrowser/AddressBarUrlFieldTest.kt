@@ -175,6 +175,32 @@ class AddressBarUrlFieldTest {
     }
 
     @Test
+    fun `only a caret move leaves the suggestion dropdown alone`() {
+        // All four combinations, because the first version of this gate got one of them wrong:
+        // it skipped EVERY text-unchanged event, so Cmd+A no longer cleared the dropdown, and a
+        // stale inline completion then changed what Enter did - navigating to a suggestion
+        // computed for text the user had just selected over.
+        assertTrue(
+            AddressBarUrlField.suggestionsNeedUpdate(previous = "goo", next = "goog", selectionCollapsed = true),
+            "typing recomputes",
+        )
+        assertTrue(
+            AddressBarUrlField.suggestionsNeedUpdate(previous = "goo", next = "x", selectionCollapsed = false),
+            "typing over a selection recomputes",
+        )
+        assertTrue(
+            AddressBarUrlField.suggestionsNeedUpdate(previous = "goo", next = "goo", selectionCollapsed = false),
+            "Cmd+A / shift-arrow must still clear - selecting the field is not a query, and a " +
+                "stale completion left standing changes what Enter resolves",
+        )
+        assertFalse(
+            AddressBarUrlField.suggestionsNeedUpdate(previous = "goo", next = "goo", selectionCollapsed = true),
+            "a caret move is the one case worth skipping: same answer, and re-opening the " +
+                "dropdown would cost Cmd+L then Escape its one-press release",
+        )
+    }
+
+    @Test
     fun `typing under the claim sets it, and it stays set`() {
         assertTrue(
             AddressBarUrlField.typedUnderClaim(alreadyTyped = false, previous = "goo", next = "goog"),
