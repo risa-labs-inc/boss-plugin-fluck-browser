@@ -44,6 +44,17 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
      *
      * The host unregisters this automatically on disable/unload, after which the chord goes
      * inert; a user rebind under [FOCUS_ADDRESS_BAR_ACTION] persists across plugin reloads.
+     *
+     * **Why this is not a `Key.L` branch in `FluckBrowserTabContent`'s own `onPreviewKeyEvent`,
+     * next to the Cmd+R / Cmd+0 / zoom chords it already serves.** That would be far less code
+     * and would answer "whose address bar" by construction. It is rejected for one reason:
+     * a locally handled chord is INVISIBLE AND UNCHANGEABLE. Going through the host's registry is
+     * what puts "Focus Address Bar" in Settings → Shortcuts, lets a user rebind it to something
+     * their keyboard can actually produce, and keeps that rebind across plugin reloads — none of
+     * which a `when (keyEvent.key)` branch can offer. It is also the layer where Cmd+L can be
+     * CONTEXT-scoped so the editor's Go To Line keeps the same chord, which is the whole reason
+     * the binding lives in the host presets. The four locally handled chords are the older
+     * pattern, not the target; do not "simplify" this into one.
      */
     internal val addressBarShortcuts =
         object : ShortcutActionProvider {
@@ -109,9 +120,20 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // Contribute browser_get_url/navigate/run_js MCP tools; auto-removed on disable/unload.
         context.registerMcpToolProvider(FluckBrowserMcpToolProvider(pluginId, context.activeTabsProvider))
 
-        // Cmd+L. The address bar belongs to this plugin, not the host, so the chord does too —
-        // the host has no URL field to focus and every other keymap action it owns acts on a
-        // BrowserHandle rather than on our toolbar.
+        // Co-browse tab sharing: store context. The embedded server binds lazily on
+        // the first share() call. Approval is surfaced BossTerm-style — the in-tab
+        // ShareRequestToast banner + the Share window's PendingRequestsList — so no
+        // host notification toast is posted (it duplicated those and looked off-style).
+        BrowserShareManager.start(context)
+
+        // Cmd+L, LAST and in a runCatching, both deliberately. The address bar belongs to this
+        // plugin, not the host, so the chord does too — the host has no URL field to focus and
+        // every other keymap action it owns acts on a BrowserHandle rather than on our toolbar.
+        // But it is a convenience, and this is a systemPlugin that IS the browser tab: the host
+        // rejects a malformed action id and can reject a duplicate provider id on a reload race,
+        // and an exception escaping register() here would cost the tab type and the share server
+        // for a keyboard shortcut. Ordering alone would leave dispose() to unwind a half-built
+        // plugin, so it is both.
         //
         // Safe at the declared api floor: registerShortcutActionProvider /
         // unregisterShortcutActionProvider / ShortcutActionProvider / PluginShortcutSpec all
@@ -119,13 +141,9 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // — all at or below plugin.json's minApiVersion 1.0.73, so no host that loads this jar
         // can be missing them. That check is the point of PageEventChannelSourceTest; see its
         // floor rationale for why getting it wrong costs the whole plugin rather than the chord.
-        context.registerShortcutActionProvider(addressBarShortcuts)
-
-        // Co-browse tab sharing: store context. The embedded server binds lazily on
-        // the first share() call. Approval is surfaced BossTerm-style — the in-tab
-        // ShareRequestToast banner + the Share window's PendingRequestsList — so no
-        // host notification toast is posted (it duplicated those and looked off-style).
-        BrowserShareManager.start(context)
+        // Existing is not the same as not throwing, which is what the runCatching is for.
+        runCatching { context.registerShortcutActionProvider(addressBarShortcuts) }
+            .onFailure { println("[FluckBrowser] Cmd+L unavailable: ${it.message}") }
     }
 
     override fun dispose() {
@@ -138,7 +156,11 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
 
         // Tear down the share server (stops any active capture) before unregistering.
         BrowserShareManager.shutdown()
-        pluginContext?.unregisterShortcutActionProvider(addressBarShortcuts.providerId)
+        // Guarded for the same reason the registration is: everything below this line matters
+        // more than the shortcut, and an unload that stops here leaves the tab type registered
+        // against dead plugin code.
+        runCatching { pluginContext?.unregisterShortcutActionProvider(addressBarShortcuts.providerId) }
+            .onFailure { println("[FluckBrowser] could not unregister the Cmd+L provider: ${it.message}") }
         // Symmetric with the registrations the tab compositions make. Nothing can invoke them
         // once the provider is gone, so this is hygiene rather than a fix, but it stops entries
         // holding torn-down compositions across a disable/re-enable on the same classloader.

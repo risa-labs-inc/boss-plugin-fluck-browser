@@ -1,7 +1,6 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -50,12 +49,29 @@ internal object AddressBarFocusRegistry {
     private val entries = ConcurrentHashMap<String, Entry>()
     private val sequencer = AtomicLong(0)
 
-    // One-shot, because the miss paths are diagnostics for a misconfiguration, not per-keypress
-    // telemetry: under the BROWSER-context preset binding a miss is rare, but a user who rebinds
-    // this action to a GLOBAL chord would otherwise get a line every time they pressed it
-    // anywhere in the app. First occurrence is the one worth having.
-    private val loggedNoWindowId = AtomicBoolean(false)
-    private val loggedNoToolbar = AtomicBoolean(false)
+    /**
+     * Last time each miss reason was logged, keyed by reason AND window.
+     *
+     * Throttled rather than one-shot: a user who rebinds this action to a GLOBAL chord would get
+     * a line every time they pressed it anywhere in the app, but a latch that never reopens keeps
+     * only the FIRST miss for the life of the JVM — and since the message names the window, that
+     * one line would be about whichever window happened to miss first. Neither extreme is any use
+     * for diagnosing "Cmd+L did nothing" from a user's log. Per-window keys plus a window of
+     * silence keep one line per distinct problem.
+     */
+    private val lastMissLogged = ConcurrentHashMap<String, Long>()
+
+    private const val MISS_LOG_THROTTLE_MS = 30_000L
+
+    /** Whether this miss is far enough from the last one of its kind to be worth a line. */
+    private fun shouldLogMiss(key: String): Boolean {
+        val now = System.currentTimeMillis()
+        val previous = lastMissLogged[key]
+        // Also true when the clock steps backwards, which errs toward logging.
+        if (previous != null && now - previous in 0 until MISS_LOG_THROTTLE_MS) return false
+        lastMissLogged[key] = now
+        return true
+    }
 
     /**
      * Record that [tabId]'s address bar is composed in [windowId].
@@ -103,14 +119,14 @@ internal object AddressBarFocusRegistry {
         if (windowId == null) {
             // The host could not attribute the keypress to a window. Focusing "whatever we can
             // find" would be worse than doing nothing.
-            if (loggedNoWindowId.compareAndSet(false, true)) {
+            if (shouldLogMiss("no-window-id")) {
                 println("[FluckBrowser] Cmd+L ignored: no window id")
             }
             return false
         }
         val target = selectFocusTarget(entries.values, windowId)
         if (target == null) {
-            if (loggedNoToolbar.compareAndSet(false, true)) {
+            if (shouldLogMiss("no-toolbar:$windowId")) {
                 println("[FluckBrowser] Cmd+L ignored: no browser toolbar in the active panel of $windowId")
             }
             return false
@@ -133,13 +149,12 @@ internal object AddressBarFocusRegistry {
      * it leaks entries into whatever runs next — `AddressBarFocusRegistryTest` and
      * `AddressBarShortcutProviderTest` both do, in `@BeforeTest`/`@AfterTest`. Safe because the
      * build runs test classes sequentially (no `maxParallelForks`); a parallel runner would need
-     * the registry injected rather than reached as a singleton. Resets the one-shot log latches
-     * for the same reason.
+     * the registry injected rather than reached as a singleton. Clears the miss-log throttle for
+     * the same reason.
      */
     fun clear() {
         entries.clear()
-        loggedNoWindowId.set(false)
-        loggedNoToolbar.set(false)
+        lastMissLogged.clear()
     }
 
     /**

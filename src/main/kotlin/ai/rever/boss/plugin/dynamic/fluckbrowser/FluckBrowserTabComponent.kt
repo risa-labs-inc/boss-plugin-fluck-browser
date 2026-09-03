@@ -2655,6 +2655,10 @@ internal fun FluckBrowserTabContent(
     // Placed BELOW isUserEditingUrl/lastUserEditTime deliberately: the focus callback has to set
     // them, so it cannot be declared above them.
     val addressBarFocusRequester = remember { FocusRequester() }
+    // A plain call, not a snapshot state read, and used as a DisposableEffect key: a window id
+    // that changed WITHOUT a recomposition would leave a stale entry. Safe only because a tab
+    // changing windows rebuilds this composition (the same fact the registry's stale-token
+    // handling is built on), which is where that assumption is cashed.
     val addressBarWindowId = LocalWindowIdProvider.current?.getWindowId()
     val addressBarPanelActive = LocalIsPanelActive.current
     if (tabId.isNotEmpty() && addressBarWindowId != null) {
@@ -2666,10 +2670,16 @@ internal fun FluckBrowserTabContent(
                     panelActive = addressBarPanelActive,
                 ) {
                     // Not wrapped in runCatching: requestFocus throws when the requester is not
-                    // attached to a node (a hibernated tab, or a toolbar hidden in fullscreen),
-                    // and the registry's own catch turns that into the `false` its caller reads.
-                    // Catching it here as well made that false unreachable in production and left
-                    // the failure silent.
+                    // attached to a node, and the registry's own catch turns that into the
+                    // `false` its caller reads. Catching it here as well made that false
+                    // unreachable in production and left the failure silent.
+                    //
+                    // Registered is very nearly the same as focusable here, because BrowserToolbar
+                    // is composed UNCONDITIONALLY alongside this effect - fullscreen and the boot
+                    // spinner replace only the weighted Box below the toolbar, not the toolbar
+                    // itself. What is left is attach timing (the effect runs before the field is
+                    // laid out on the first frame) and any future change that gates the toolbar,
+                    // which is why the throw is caught rather than assumed away.
                     addressBarFocusRequester.requestFocus()
 
                     // Claim the field BEFORE selecting it, or the navigation listener below
@@ -5902,9 +5912,11 @@ internal fun BrowserToolbar(
     isSharing: Boolean = false,
     /**
      * Attached to the URL field so Cmd+L can focus it from outside the composition
-     * (see [AddressBarFocusRegistry]). Null in previews and tests, which do not need it.
+     * (see [AddressBarFocusRegistry]). Defaulted rather than nullable so the modifier chain
+     * below stays a plain `.focusRequester(...)`; a caller that omits it - a preview - gets a
+     * live requester nothing ever asks to focus.
      */
-    addressBarFocusRequester: FocusRequester? = null
+    addressBarFocusRequester: FocusRequester = remember { FocusRequester() }
 ) {
     val coroutineScope = rememberCoroutineScope()
     // Auto-scroll to selected suggestion when using arrow keys
@@ -6046,7 +6058,7 @@ internal fun BrowserToolbar(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(28.dp)
-                    .then(addressBarFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
+                    .focusRequester(addressBarFocusRequester)
                     .onFocusChanged { focusState ->
                         if (!focusState.isFocused) {
                             onFocusLost()

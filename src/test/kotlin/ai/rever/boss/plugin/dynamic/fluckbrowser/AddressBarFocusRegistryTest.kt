@@ -121,10 +121,11 @@ class AddressBarFocusRegistryTest {
 
     @Test
     fun `a throwing focus callback is contained and reported as unhandled`() {
-        // requestFocus throws when the requester is not attached to a node: a hibernated tab, or
-        // a toolbar hidden by fullscreen. That must not escape into the host's event dispatch,
-        // and the registry is the only place that catches it - the real callback deliberately
-        // does not wrap itself, or this `false` would be unreachable in production.
+        // requestFocus throws when the requester is not attached to a node - attach timing on the
+        // first frame, or a future change that gates the toolbar (it is composed unconditionally
+        // today). That must not escape into the host's event dispatch, and the registry is the
+        // only place that catches it - the real callback deliberately does not wrap itself, or
+        // this `false` would be unreachable in production.
         AddressBarFocusRegistry.register("tab-1", "window-1", panelActive = true) {
             error("not attached to the composition")
         }
