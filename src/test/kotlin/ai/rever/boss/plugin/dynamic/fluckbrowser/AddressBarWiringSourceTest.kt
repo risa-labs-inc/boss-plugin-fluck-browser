@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -36,6 +37,22 @@ class AddressBarWiringSourceTest {
             .replace(Regex("""/\*.*?\*/""", RegexOption.DOT_MATCHES_ALL), " ")
             .lines()
             .joinToString(" ") { line -> line.split(Regex("(?<!:)//")).first() }
+
+    /**
+     * Every right-hand side assigned to [name] in [code], as written.
+     *
+     * A capture rather than a negative lookahead: `\s*` backtracks, so `(?!true|false)` placed
+     * after it matches ` false` perfectly happily - which is how the first version of these
+     * assertions passed against a hardcoded literal.
+     */
+    private fun argumentsPassedTo(
+        name: String,
+        code: String,
+    ): List<String> =
+        Regex(Regex.escape(name) + """\s*=\s*([A-Za-z0-9_.]+)""")
+            .findAll(code)
+            .map { it.groupValues[1] }
+            .toList()
 
     private fun tabComponentCode(): String {
         val root = assertNotNull(repoRoot(), "could not locate the plugin root")
@@ -74,9 +91,14 @@ class AddressBarWiringSourceTest {
             code.contains(Regex("""LocalIsPanelActive\s*\.\s*current""")),
             "panel-active is no longer read from the host - a background split could answer Cmd+L",
         )
-        assertTrue(
-            code.contains(Regex("""panelActive\s*=\s*addressBarPanelActive""")),
-            "the registration no longer passes the real panel-active value",
+        // "not a literal" rather than a pinned variable name: a local rename changes nothing
+        // about the behaviour, and hardcoding true/false is the edit that breaks it. Captured
+        // and compared rather than expressed as a negative lookahead, because `\s*` backtracks -
+        // `(?!true|false)` after it happily matches ` false`.
+        assertEquals(
+            emptyList(),
+            argumentsPassedTo("panelActive", code).filter { it == "true" || it == "false" },
+            "panelActive is passed a literal - a background split could answer Cmd+L",
         )
     }
 
@@ -104,14 +126,42 @@ class AddressBarWiringSourceTest {
         // has to actually be maintained, so something must set it when the user types.
         val code = tabComponentCode()
 
+        // The gate has to be fed something computed - `true` and a redirect collapses Cmd+L's
+        // selection again, `false` and an abandoned claim never expires. The assignments that
+        // MAINTAIN the flag are literals by nature, so this asserts that at least one
+        // non-literal is passed, plus that something still sets it.
+        val passed = argumentsPassedTo("typedSinceClaim", code)
         assertTrue(
-            code.contains(Regex("""typedSinceClaim\s*=\s*typedSinceClaim""")),
-            "the staleness gate is no longer fed the tracked flag - either the selection or the " +
-                "stuck-claim fix is now broken",
+            passed.any { it != "true" && it != "false" },
+            "the staleness gate is only ever fed literals ($passed) - either the selection or " +
+                "the stuck-claim fix is now broken",
         )
         assertTrue(
-            code.contains(Regex("""typedSinceClaim\s*=\s*true""")),
+            passed.contains("true"),
             "nothing sets typedSinceClaim, so typed text would be treated as an abandoned claim",
+        )
+    }
+
+    @Test
+    fun `the delayed focus-loss release still checks it owns the claim`() {
+        // onFocusLost releases from a coroutine after 200ms and nothing cancels that job. Without
+        // the generation check, a Cmd+L pressed inside that window has its fresh claim wiped by
+        // the previous one's release, and the next navigation collapses the selection it just
+        // made - the claim-before-select ordering undone from behind.
+        val code = tabComponentCode()
+
+        assertTrue(
+            code.contains(Regex("""val\s+releasing\s*=\s*claimGeneration\.get\(\)""")),
+            "the focus-loss release no longer captures the claim it was scheduled for",
+        )
+        assertTrue(
+            code.contains(Regex("""claimGeneration\.get\(\)\s*!=\s*releasing""")),
+            "the delayed release no longer checks it still owns the claim - a fresh Cmd+L can be " +
+                "wiped by the previous claim's release",
+        )
+        assertTrue(
+            code.contains(Regex("""claimGeneration\.incrementAndGet\(\)""")),
+            "nothing bumps the claim generation, so the check above can never fire",
         )
     }
 

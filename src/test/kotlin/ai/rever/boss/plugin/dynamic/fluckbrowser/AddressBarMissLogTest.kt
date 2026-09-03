@@ -24,14 +24,24 @@ class AddressBarMissLogTest {
         val start = 1_000_000L
 
         assertFalse(AddressBarFocusRegistry.missLogDue(previous = start, now = start))
-        assertFalse(AddressBarFocusRegistry.missLogDue(previous = start, now = start + 29_999))
+        assertFalse(
+            AddressBarFocusRegistry.missLogDue(
+                previous = start,
+                now = start + AddressBarFocusRegistry.MISS_LOG_THROTTLE_MS - 1,
+            ),
+        )
     }
 
     @Test
     fun `the window reopens`() {
         val start = 1_000_000L
 
-        assertTrue(AddressBarFocusRegistry.missLogDue(previous = start, now = start + 30_000))
+        assertTrue(
+            AddressBarFocusRegistry.missLogDue(
+                previous = start,
+                now = start + AddressBarFocusRegistry.MISS_LOG_THROTTLE_MS,
+            ),
+        )
     }
 
     @Test

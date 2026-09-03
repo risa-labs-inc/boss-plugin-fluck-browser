@@ -73,7 +73,7 @@ internal object AddressBarFocusRegistry {
      */
     private val lastMissLogged = ConcurrentHashMap<String, Long>()
 
-    private const val MISS_LOG_THROTTLE_MS = 30_000L
+    internal const val MISS_LOG_THROTTLE_MS = 30_000L
 
     /**
      * Whether this miss is far enough from the last one of its kind to be worth a line.
@@ -173,6 +173,22 @@ internal object AddressBarFocusRegistry {
         return runCatching { target.focus() }
             .onFailure { println("[FluckBrowser] Cmd+L could not focus the address bar: ${it.message}") }
             .isSuccess
+    }
+
+    /**
+     * A tab whose toolbar could NOT be registered, so "Cmd+L does nothing in this tab, ever" is
+     * distinguishable in a log from "no toolbar in the active panel" - the two look identical
+     * otherwise, and only one of them is a configuration problem.
+     *
+     * Throttled on the same terms as the miss paths, because tab compositions come and go.
+     */
+    fun noteUnregisterable(
+        tabId: String,
+        reason: String,
+    ) {
+        if (shouldLogMiss("unregisterable:$tabId:$reason")) {
+            println("[FluckBrowser] Cmd+L unavailable for tab ${tabId.ifEmpty { "<no id>" }}: $reason")
+        }
     }
 
     /** Test seam: how many toolbars are currently registered. */

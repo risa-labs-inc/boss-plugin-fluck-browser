@@ -127,6 +127,7 @@ import java.awt.Window
 import java.awt.datatransfer.StringSelection
 import java.net.URI
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicLong
 import javax.swing.BorderFactory
 import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
@@ -2652,6 +2653,13 @@ internal fun FluckBrowserTabContent(
     // released with it - and in every one of those states the staleness bound below would never
     // fire, which is the freeze it exists to prevent.
     var typedSinceClaim by remember { mutableStateOf(false) }
+    // Bumped every time the field is CLAIMED. onFocusLost releases the claim from a delayed
+    // coroutine, and nothing cancels that job if the field is re-claimed inside its 200ms - so
+    // Cmd+L pressed just after a click into the page would have its fresh claim wiped by the
+    // previous one's release, and the next navigation would collapse the selection it had just
+    // made. Deliberately NOT snapshot state: nothing composes off it, and it must be readable
+    // from a coroutine without invalidating anything.
+    val claimGeneration = remember { AtomicLong(0) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
 
     // Cmd+L. The chord is a plugin-contributed GLOBAL shortcut, so it arrives with only a window
@@ -2696,10 +2704,21 @@ internal fun FluckBrowserTabContent(
                     lastUserEditTime = System.currentTimeMillis()
                     // A fresh claim, whatever the field happens to be holding.
                     typedSinceClaim = false
+                    claimGeneration.incrementAndGet()
 
                     urlBarText = AddressBarUrlField.selectAll(urlBarText)
                 }
             onDispose { AddressBarFocusRegistry.unregister(token) }
+        }
+    } else {
+        // Say so once, rather than leaving this tab silently unable to answer Cmd+L. An
+        // effect, not a bare call: the composable body re-runs on every recomposition.
+        DisposableEffect(tabId, addressBarWindowId) {
+            AddressBarFocusRegistry.noteUnregisterable(
+                tabId = tabId,
+                reason = if (addressBarWindowId == null) "the host reported no window id" else "the tab has no id",
+            )
+            onDispose {}
         }
     }
     val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
@@ -3834,6 +3853,7 @@ internal fun FluckBrowserTabContent(
                 isUserEditingUrl = true
                 lastUserEditTime = System.currentTimeMillis()
                 typedSinceClaim = true
+                claimGeneration.incrementAndGet()
                 urlBarText = newValue
                 selectedDropdownIndex = -1
 
@@ -3993,15 +4013,23 @@ internal fun FluckBrowserTabContent(
             onSuggestionDeleted = onDeleteSuggestion,
             onFocusLost = {
                 // Hide dropdown when focus is lost (with delay to allow click events)
+                val releasing = claimGeneration.get()
                 coroutineScope.launch {
                     delay(200)
                     showUrlSuggestions = false
-                    // Reset all three together, like every other release path: leaving
-                    // lastUserEditTime behind broke the invariant the other three keep, and this
-                    // is the path most likely to hand a stale claim to the staleness bound.
+                    // Only release the claim this job was scheduled for. Cmd+L (or a keystroke)
+                    // inside the 200ms takes a NEW claim, and clearing that one would undo the
+                    // claim-before-select ordering: the next navigation would rewrite the field
+                    // with a collapsed selection while it still held focus.
+                    if (claimGeneration.get() != releasing) return@launch
                     isUserEditingUrl = false
-                    lastUserEditTime = 0L
                     typedSinceClaim = false
+                    // lastUserEditTime is deliberately LEFT ALONE, unlike the other release
+                    // paths. It is what keeps USER_EDIT_GRACE_MS reachable: this is the one
+                    // release where the user may come straight back mid-Tab-completion, and
+                    // zeroing it here made a navigation landing in that window overwrite what
+                    // they were assembling. Resetting all three "for consistency" is what
+                    // quietly retired the 300ms buffer.
                 }
             }
         )
@@ -4849,6 +4877,7 @@ internal fun FluckBrowserTabContent(
                                     selectedDropdownIndex = -1
                                     isUserEditingUrl = false
                                     lastUserEditTime = 0L
+                                    typedSinceClaim = false
                                     coroutineScope.launch {
                                         browserHandle.onBrowser("loadUrl") { it.loadUrl(entry.url) }
                                     }
