@@ -9,11 +9,17 @@ import kotlin.test.assertTrue
 /**
  * The Compose half of Cmd+L, which no unit test can reach.
  *
- * Deliberately SMALL. A source-text assertion fails when code is reformatted or extracted - i.e.
- * on improvements - so it earns its place only where deleting a line would silently break
- * behaviour and nothing else would notice. Assertions that could instead be a unit test have been
- * moved to one: the Escape revert condition now lives in `AddressBarUrlField.shouldRestore`, and
- * this class no longer asserts on it.
+ * Deliberately SMALL, and weaker than it looks. A source-text assertion fails when code is
+ * reformatted or extracted - i.e. on improvements - so it earns its place only where deleting a
+ * line would silently break behaviour and nothing else would notice. Anything that could be a
+ * unit test has been moved to one: the Escape revert condition lives in
+ * `AddressBarUrlField.shouldRestore`, and this class no longer asserts on it.
+ *
+ * What these assertions do NOT prove, so nobody over-trusts them: the argument checks scan the
+ * whole file, so they pass while SOME non-literal is passed to SOME assignment of that name, not
+ * specifically the one that matters; and the requester check is textual, so it would still pass
+ * if that modifier moved to a different composable in this file. They catch deletion, which is
+ * the failure mode with no other witness. They do not verify wiring.
  *
  * [AddressBarFocusRegistryTest] proves the registry focuses the right toolbar, and
  * [AddressBarUrlFieldTest] proves the selection survives a navigation - but both talk to a

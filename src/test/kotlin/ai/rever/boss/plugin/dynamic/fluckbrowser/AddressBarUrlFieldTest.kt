@@ -20,8 +20,9 @@ import kotlin.test.assertTrue
 class AddressBarUrlFieldTest {
     @Test
     fun `a navigation may rewrite a field nobody is editing`() {
-        assertTrue(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.CollapseCaret,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = false,
                 msSinceUserEdit = AddressBarUrlField.USER_EDIT_GRACE_MS + 1,
                 typedSinceClaim = false,
@@ -32,8 +33,9 @@ class AddressBarUrlFieldTest {
     @Test
     fun `claiming the field stops the navigation rewrite`() {
         // What the Cmd+L focus callback sets, and the whole reason it sets it BEFORE selecting.
-        assertFalse(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.Skip,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = 10_000,
                 typedSinceClaim = true,
@@ -46,16 +48,18 @@ class AddressBarUrlFieldTest {
     fun `a recent edit stops the rewrite even once the flag is clear`() {
         // The Tab-completion buffer: onFocusLost clears the flag after a delay, and a navigation
         // landing inside the grace window must still leave the text alone.
-        assertFalse(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.Skip,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = false,
                 msSinceUserEdit = AddressBarUrlField.USER_EDIT_GRACE_MS,
                 typedSinceClaim = true,
             ),
             "the grace window is exclusive at its own boundary",
         )
-        assertFalse(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.Skip,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = false,
                 msSinceUserEdit = 0,
                 typedSinceClaim = true,
@@ -67,8 +71,9 @@ class AddressBarUrlFieldTest {
     fun `a clock step backwards reads as a recent edit`() {
         // System.currentTimeMillis() is wall-clock and can move; erring toward "the user was just
         // typing" only ever declines to overwrite their text.
-        assertFalse(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.Skip,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = false,
                 msSinceUserEdit = -5_000,
                 typedSinceClaim = true,
@@ -88,14 +93,15 @@ class AddressBarUrlFieldTest {
     fun `Escape after Cmd+L hands the field back`() {
         // The whole point of restoreTo + clearing the claim. Cmd+L claims the field without the
         // user typing, so before this existed, Cmd+L then Escape left isUserEditingUrl true and
-        // navigationMayRewrite false - the URL bar silently stopped following navigations for
+        // navigationWrite returning Skip - the URL bar silently stopped following navigations for
         // the life of the tab. These are the two values onCancelUrlEditing writes.
         val restored = AddressBarUrlField.restoreTo("https://example.com/page")
 
         assertEquals("https://example.com/page", restored.text)
         assertEquals(TextRange(24), restored.selection, "caret at the end, nothing selected")
-        assertTrue(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.CollapseCaret,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = false,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
                 typedSinceClaim = false,
@@ -121,15 +127,17 @@ class AddressBarUrlFieldTest {
         // into the page is the other, and that only releases the claim if a focus-changed event
         // arrives, which Windows/Linux HARDWARE_ACCELERATED may not produce. Without this bound
         // the URL bar silently stops following navigations for the life of the tab.
-        assertTrue(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.KeepSelection,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
                 typedSinceClaim = false,
             ),
         )
-        assertFalse(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.Skip,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS,
                 typedSinceClaim = false,
@@ -143,8 +151,9 @@ class AddressBarUrlFieldTest {
         // The case an inferred "field still reads as the loaded URL" could not express: a home
         // tab holds "about:blank" while loadedUrl is deliberately "", so the strings never match
         // and the bound would never have fired there. Nothing was TYPED, so it fires.
-        assertTrue(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.KeepSelection,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
                 typedSinceClaim = false,
@@ -159,8 +168,9 @@ class AddressBarUrlFieldTest {
         // so an inferred version would never expire it, and the bar would be frozen for the life
         // of the tab. Cmd+L resets the flag, so what matters is that nothing was typed under
         // THIS claim.
-        assertTrue(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.KeepSelection,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
                 typedSinceClaim = false,
@@ -178,8 +188,9 @@ class AddressBarUrlFieldTest {
         // CURRENT claim", so pressing Cmd+L over a draft starts a fresh one and makes that draft
         // staleable - deliberately, because Cmd+L selects the whole field, which is the user
         // saying they are about to replace it.
-        assertFalse(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.Skip,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = 60L * 60 * 1000,
                 typedSinceClaim = true,
@@ -192,8 +203,9 @@ class AddressBarUrlFieldTest {
         // The bound must not undo the rule it sits next to. A redirect landing a few seconds
         // after Cmd+L is the original bug: the field is claimed, unmodified, and must keep its
         // selection. Seconds, not a minute, is the window that matters here.
-        assertFalse(
-            AddressBarUrlField.navigationMayRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.Skip,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = 5_000,
                 typedSinceClaim = false,
@@ -241,8 +253,9 @@ class AddressBarUrlFieldTest {
         // Otherwise the staleness bound just defers the original bug by a minute: the page URL
         // lands with a collapsed caret while the field is still claimed and may still hold
         // focus, so the user comes back, types, and appends instead of replacing.
-        assertTrue(
-            AddressBarUrlField.keepSelectionOnRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.KeepSelection,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
                 typedSinceClaim = false,
@@ -254,16 +267,18 @@ class AddressBarUrlFieldTest {
     fun `an ordinary rewrite collapses the caret, as every browser does`() {
         // The USER_EDIT_GRACE_MS path - nobody is editing, so there is no selection worth
         // keeping and a caret at the end is the normal behaviour.
-        assertFalse(
-            AddressBarUrlField.keepSelectionOnRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.CollapseCaret,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = false,
                 msSinceUserEdit = 10_000,
                 typedSinceClaim = false,
             ),
         )
         // And a typed claim never reaches the staleness branch at all, so it never gets here.
-        assertFalse(
-            AddressBarUrlField.keepSelectionOnRewrite(
+        assertEquals(
+            AddressBarUrlField.NavigationWrite.Skip,
+            AddressBarUrlField.navigationWrite(
                 isUserEditing = true,
                 msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
                 typedSinceClaim = true,

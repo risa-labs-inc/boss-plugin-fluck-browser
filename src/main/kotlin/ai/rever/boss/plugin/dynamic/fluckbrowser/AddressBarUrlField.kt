@@ -8,7 +8,7 @@ import androidx.compose.ui.text.input.TextFieldValue
  *
  * Extracted from the composable so both can be tested, the way the visible-page-url and
  * suggestion-delete logic are (`VisiblePageUrlTest`, `SuggestionDeleteTest`): the interesting one
- * is [navigationMayRewrite], whose interaction with Cmd+L is a timing race no Compose test in
+ * is [navigationWrite], whose interaction with Cmd+L is a timing race no Compose test in
  * this repo could reach anyway.
  */
 internal object AddressBarUrlField {
@@ -58,17 +58,42 @@ internal object AddressBarUrlField {
      */
     const val UNTYPED_CLAIM_STALE_MS = 60_000L
 
+    /** What a navigation callback should do to the URL field. */
+    sealed interface NavigationWrite {
+        /** Leave the field alone: someone is editing it. */
+        data object Skip : NavigationWrite
+
+        /** Write the page's URL with the caret at the end, the ordinary case. */
+        data object CollapseCaret : NavigationWrite
+
+        /** Write the page's URL but keep the whole thing selected. */
+        data object KeepSelection : NavigationWrite
+    }
+
     /**
-     * Whether a navigation callback may replace the field's contents with the page's URL.
+     * What a navigation callback should do to the field, as one decision.
      *
-     * False while the user owns the field, which is what Cmd+L relies on. The focus callback sets
-     * `isUserEditingUrl` BEFORE it selects the text, so on a still-loading or redirecting page a
-     * navigation landing a beat later cannot rewrite `urlBarText` with a COLLAPSED selection while
-     * the field keeps focus — which would leave the next keystroke appending to the URL instead of
-     * replacing it, exactly what selecting it exists to prevent.
+     * ONE function rather than a "may I write" predicate plus a "how" predicate, because the two
+     * take the same arguments and one is a refinement of the other - so they have to agree, and
+     * two calls means two clock reads and a correctness argument that lives in neither of them.
      *
-     * The one way through a standing claim is [UNTYPED_CLAIM_STALE_MS]: an old claim over text the
-     * user never changed is an abandoned one, not an active edit.
+     * The rules, in the order they resolve:
+     *  1. **A stale untyped claim is not an active edit.** Nothing has been typed under it and
+     *     nothing has touched it in [UNTYPED_CLAIM_STALE_MS], so the write goes through. If the
+     *     field is still claimed the SELECTION IS KEPT: writing a collapsed caret into a field
+     *     the user may still be focused in is the original bug, deferred a minute rather than
+     *     fixed - they come back, type, and append instead of replacing.
+     *  2. **Otherwise a claimed field is untouchable.** This is what Cmd+L relies on: the focus
+     *     callback sets the claim BEFORE it selects, so a navigation landing a beat later on a
+     *     still-loading or redirecting page cannot wipe the selection.
+     *  3. **Otherwise the [USER_EDIT_GRACE_MS] buffer**, so a navigation landing mid-Tab-completion
+     *     does not overwrite what the user is assembling.
+     *
+     * Note that rule 1 does not RELEASE the claim, only bypass it - so once a claim goes stale,
+     * every later navigation in that tab keeps taking rule 1 and re-selecting the URL. That is
+     * deliberate rather than overlooked: releasing would put the next navigation on rule 3, which
+     * collapses the caret, and the user who wandered off mid-Cmd+L would be back to appending.
+     * An invisible selection on an unfocused field costs nothing; the append does.
      *
      * @param msSinceUserEdit now minus the last user edit. Negative or absurd values (a clock
      *   step) simply read as "recent", which errs toward leaving the user's text alone.
@@ -77,38 +102,21 @@ internal object AddressBarUrlField {
      *   reads as the loaded URL" looks like the same question and is not, because the bar
      *   legitimately shows something else on a home tab (`about:blank` over an empty
      *   `loadedUrl`) and after an abandoned draft outlives the claim released with it - and in
-     *   exactly those states an inferred version would never let the bound below fire.
+     *   exactly those states an inferred version would never let rule 1 fire.
      */
-    fun navigationMayRewrite(
+    fun navigationWrite(
         isUserEditing: Boolean,
         msSinceUserEdit: Long,
         typedSinceClaim: Boolean,
-    ): Boolean =
+    ): NavigationWrite =
         when {
-            // Nothing typed and nothing touched in a minute: the claim is stale, not active.
-            !typedSinceClaim && msSinceUserEdit > UNTYPED_CLAIM_STALE_MS -> true
-            isUserEditing -> false
-            else -> msSinceUserEdit > USER_EDIT_GRACE_MS
-        }
+            !typedSinceClaim && msSinceUserEdit > UNTYPED_CLAIM_STALE_MS ->
+                if (isUserEditing) NavigationWrite.KeepSelection else NavigationWrite.CollapseCaret
 
-    /**
-     * Whether a navigation rewrite should KEEP the field's selection rather than collapse it.
-     *
-     * True in exactly one case: the staleness branch of [navigationMayRewrite] is what let the
-     * write through while the field is still claimed. Without this, an abandoned Cmd+L that goes
-     * stale gets the page URL written in with a collapsed caret while the field may still hold
-     * focus - so the user comes back, types, and appends to the URL instead of replacing it.
-     * That is the original selection bug, deferred by [UNTYPED_CLAIM_STALE_MS] rather than fixed.
-     *
-     * Deliberately narrow: an unclaimed field has no selection worth preserving, and a rewrite
-     * allowed by [USER_EDIT_GRACE_MS] is the ordinary "nobody is editing" path, where a caret at
-     * the end is what every browser does.
-     */
-    fun keepSelectionOnRewrite(
-        isUserEditing: Boolean,
-        msSinceUserEdit: Long,
-        typedSinceClaim: Boolean,
-    ): Boolean = isUserEditing && !typedSinceClaim && msSinceUserEdit > UNTYPED_CLAIM_STALE_MS
+            isUserEditing -> NavigationWrite.Skip
+            msSinceUserEdit > USER_EDIT_GRACE_MS -> NavigationWrite.CollapseCaret
+            else -> NavigationWrite.Skip
+        }
 
     /**
      * [current] with its whole text selected, the way every browser's Cmd+L leaves the field.
@@ -126,7 +134,7 @@ internal object AddressBarUrlField {
      * existed, "claimed" implied the user had TYPED, so the only way into the claimed state was
      * one the user could see. Cmd+L claims the field on a keystroke that types nothing, which
      * makes claim-then-Escape reachable in two keys - and while the claim stands,
-     * [navigationMayRewrite] is false and the URL bar silently stops following navigations.
+     * [navigationWrite] returns Skip and the URL bar silently stops following navigations.
      *
      * Callers guard on there being something to revert to: `loadedUrl` is deliberately blank on
      * a home tab, and blanking the field is not reverting it.

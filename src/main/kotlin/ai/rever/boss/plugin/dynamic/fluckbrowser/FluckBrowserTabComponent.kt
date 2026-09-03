@@ -2808,8 +2808,8 @@ internal fun FluckBrowserTabContent(
         focusRequester = addressBarFocusRequester,
     ) {
         // Claim the field BEFORE selecting it, or the navigation listener below wipes the
-        // selection - see AddressBarUrlField.navigationMayRewrite, which is the predicate that
-        // listener asks.
+        // selection - see AddressBarUrlField.navigationWrite, which is the decision that
+        // listener asks for.
         isUserEditingUrl = true
         lastUserEditTime = System.currentTimeMillis()
         // Cmd+L is an explicit "I am replacing this" gesture - it selects the whole field - so
@@ -3142,30 +3142,21 @@ internal fun FluckBrowserTabContent(
                     if (hoistedState.browserHandle !== handle) return@addNavigationListener
                     installDirtyMarker(handle, coroutineScope, hoistedState)
                     loadedUrl = url
-                    // Only update URL bar while the user does not own the field - which is
-                    // also what keeps Cmd+L's selection alive on a still-loading page.
-                    if (AddressBarUrlField.navigationMayRewrite(
+                    // ONE decision, one clock read: whether to write and how to leave the
+                    // selection are the same question asked of the same state, and asking twice
+                    // meant two reads that had to agree across the staleness boundary.
+                    when (
+                        AddressBarUrlField.navigationWrite(
                             isUserEditing = isUserEditingUrl,
                             msSinceUserEdit = System.currentTimeMillis() - lastUserEditTime,
                             typedSinceClaim = typedSinceClaim,
                         )
                     ) {
-                        // Caret at the end normally; whole-text selected when it was the
-                        // staleness branch that allowed this and the field is still claimed -
-                        // otherwise an abandoned Cmd+L gets its selection collapsed under it and
-                        // the user's next keystroke appends to the URL.
-                        val selection =
-                            if (AddressBarUrlField.keepSelectionOnRewrite(
-                                    isUserEditing = isUserEditingUrl,
-                                    msSinceUserEdit = System.currentTimeMillis() - lastUserEditTime,
-                                    typedSinceClaim = typedSinceClaim,
-                                )
-                            ) {
-                                TextRange(0, url.length)
-                            } else {
-                                TextRange(url.length)
-                            }
-                        urlBarText = TextFieldValue(url, selection)
+                        AddressBarUrlField.NavigationWrite.Skip -> Unit
+                        AddressBarUrlField.NavigationWrite.CollapseCaret ->
+                            urlBarText = TextFieldValue(url, TextRange(url.length))
+                        AddressBarUrlField.NavigationWrite.KeepSelection ->
+                            urlBarText = TextFieldValue(url, TextRange(0, url.length))
                     }
 
                     canGoBack = handle.canGoBack()
