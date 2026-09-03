@@ -147,33 +147,43 @@ class AddressBarUrlFieldTest {
     }
 
     @Test
-    fun `a home tab's claim still goes stale`() {
-        // The case an inferred "field still reads as the loaded URL" could not express: a home
-        // tab holds "about:blank" while loadedUrl is deliberately "", so the strings never match
-        // and the bound would never have fired there. Nothing was TYPED, so it fires.
-        assertEquals(
-            AddressBarUrlField.NavigationWrite.KeepSelection,
-            AddressBarUrlField.navigationWrite(
-                isUserEditing = true,
-                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
-                typedSinceClaim = false,
+    fun `moving the caret is not typing`() {
+        // Two keystrokes used to defeat the staleness bound entirely: Cmd+L takes the claim with
+        // nothing typed, then Left arrow collapses the selection - and because BasicTextField's
+        // TextFieldValue overload reports selection-only changes through onValueChange, the flag
+        // was set with nothing typed. From there the bound could never fire and the URL bar
+        // stopped following navigations for the life of the tab.
+        assertFalse(
+            AddressBarUrlField.typedUnderClaim(
+                alreadyTyped = false,
+                previous = "https://example.com",
+                next = "https://example.com",
             ),
         )
     }
 
     @Test
-    fun `a claim taken over an abandoned draft still goes stale`() {
-        // The sharper one. Type "goo", click the page: onFocusLost releases the claim but leaves
-        // the text. Press Cmd+L again and the claim is over text that does not match loadedUrl -
-        // so an inferred version would never expire it, and the bar would be frozen for the life
-        // of the tab. Cmd+L resets the flag, so what matters is that nothing was typed under
-        // THIS claim.
-        assertEquals(
-            AddressBarUrlField.NavigationWrite.KeepSelection,
-            AddressBarUrlField.navigationWrite(
-                isUserEditing = true,
-                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
-                typedSinceClaim = false,
+    fun `typing under the claim sets it, and it stays set`() {
+        assertTrue(
+            AddressBarUrlField.typedUnderClaim(alreadyTyped = false, previous = "goo", next = "goog"),
+        )
+        // Sticky: only taking a fresh claim resets it, which is what makes "under the CURRENT
+        // claim" the scope. A backspace back to the original text is still typing.
+        assertTrue(
+            AddressBarUrlField.typedUnderClaim(alreadyTyped = true, previous = "goo", next = "goo"),
+        )
+    }
+
+    @Test
+    fun `a home tab's field is not typing either`() {
+        // The case an inferred "does the field read as the loaded URL" could not express: a home
+        // tab holds "about:blank" while loadedUrl is deliberately "". Nothing typed is nothing
+        // typed, whatever the field happens to hold.
+        assertFalse(
+            AddressBarUrlField.typedUnderClaim(
+                alreadyTyped = false,
+                previous = "about:blank",
+                next = "about:blank",
             ),
         )
     }

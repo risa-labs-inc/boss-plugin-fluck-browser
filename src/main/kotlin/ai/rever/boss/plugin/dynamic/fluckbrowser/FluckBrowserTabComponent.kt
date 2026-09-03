@@ -3907,7 +3907,19 @@ internal fun FluckBrowserTabContent(
             onUrlBarTextChange = { newValue ->
                 isUserEditingUrl = true
                 lastUserEditTime = System.currentTimeMillis()
-                typedSinceClaim = true
+                // Compared, not set to true: this fires for selection-only changes too (caret
+                // moves, Home/End, click-to-place), and the staleness bound is gated on this
+                // flag - see AddressBarUrlField.typedUnderClaim. Read before the assignment
+                // below, which is what makes `previous` the previous text.
+                typedSinceClaim =
+                    AddressBarUrlField.typedUnderClaim(
+                        alreadyTyped = typedSinceClaim,
+                        previous = urlBarText.text,
+                        next = newValue.text,
+                    )
+                // Unconditional, unlike the flag above: the user is interacting either way, and
+                // a stale onFocusLost release landing on a caret move is the same hazard the
+                // generation stamp exists for.
                 claimGeneration.incrementAndGet()
                 urlBarText = newValue
                 selectedDropdownIndex = -1
@@ -4059,6 +4071,11 @@ internal fun FluckBrowserTabContent(
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
                 typedSinceClaim = false
+                // Uniform with submit, suggestion-selected and history-click, which all clear
+                // this. Unreachable today - the Escape branch only gets here when the dropdown
+                // is closed or empty - but "the one release path that doesn't" is how the last
+                // three of these became reachable.
+                showUrlSuggestions = false
             },
             onAcceptAutocomplete = {
                 if (autocompleteSuggestion != null) {

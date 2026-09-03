@@ -196,9 +196,13 @@ class AddressBarWiringSourceTest {
             "the staleness gate is only ever fed literals ($passed) - either the selection or " +
                 "the stuck-claim fix is now broken",
         )
+        // NOT `passed.contains("true")`: that was satisfied by the unconditional assignment this
+        // replaced, which set the flag on caret moves too and defeated the staleness bound. What
+        // has to hold is that the flag is MAINTAINED by comparing text, not by assertion.
         assertTrue(
-            passed.contains("true"),
-            "nothing sets typedSinceClaim, so typed text would be treated as an abandoned claim",
+            code.contains(Regex("""typedUnderClaim\(""")),
+            "typedSinceClaim is no longer computed from a text comparison - a caret move would " +
+                "count as typing and the staleness bound could never fire",
         )
     }
 

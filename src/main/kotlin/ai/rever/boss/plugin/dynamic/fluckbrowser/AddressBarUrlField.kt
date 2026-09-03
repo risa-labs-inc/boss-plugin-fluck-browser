@@ -58,6 +58,29 @@ internal object AddressBarUrlField {
      */
     const val UNTYPED_CLAIM_STALE_MS = 60_000L
 
+    /**
+     * Whether anything has been TYPED under the current claim, after a field change.
+     *
+     * The distinction this exists for: `BasicTextField`'s `TextFieldValue` overload calls
+     * `onValueChange` whenever the VALUE changes, which includes selection-only changes - a caret
+     * move, Home/End, click-to-place-caret, shift-selection. Setting the flag unconditionally
+     * there made it mean "the value changed", and the staleness bound in [navigationWrite] is
+     * gated on it, so two keystrokes defeated the bound entirely: Cmd+L (claim, nothing typed),
+     * Left arrow (selection collapses, flag set), then a click into the page on a platform where
+     * no focus-changed event arrives - and the URL bar stops following navigations for the life
+     * of the tab.
+     *
+     * That is distinct from the typed-claim freeze [UNTYPED_CLAIM_STALE_MS] deliberately does not
+     * close. This path discards nothing: the user pressed Cmd+L and moved the caret.
+     *
+     * Sticky once set, because the claim is what resets it - see the Cmd+L focus callback.
+     */
+    fun typedUnderClaim(
+        alreadyTyped: Boolean,
+        previous: String,
+        next: String,
+    ): Boolean = alreadyTyped || previous != next
+
     /** What a navigation callback should do to the URL field. */
     sealed interface NavigationWrite {
         /** Leave the field alone: someone is editing it. */
