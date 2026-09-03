@@ -115,6 +115,25 @@ private const val CANCEL_MIXED_RATIO = 1.3f
 private val CANCEL_VERTICAL_LOW get() = COMMIT_UNITS * 0.125f
 private val CANCEL_VERTICAL_HIGH get() = COMMIT_UNITS * 3f
 
+/**
+ * Chrome's three tiers, applied to a gesture's totals. Shared by both paths through
+ * [advanceHomeSwipe]: an event with a horizontal component, and one without.
+ *
+ * Both, because on macOS AWT splits a diagonal swipe into separate horizontal and vertical
+ * events, so the vertical half of "swipe sideways, then drift into a vertical scroll" arrives
+ * entirely through the branch that has no `deltaX`. Checking only the horizontal path meant that
+ * drift accumulated `verticalPath` without ever being weighed against it - and since the commit
+ * decision moved to release, a gesture could cross the commit distance, turn into a plain
+ * vertical scroll, and still navigate when the fingers lifted.
+ */
+private fun cancelledByVertical(gesture: HomeSwipeGesture): Boolean {
+    val yDelta = gesture.verticalPath
+    val xDelta = kotlin.math.abs(gesture.accumX)
+    return yDelta > CANCEL_STRONG_RATIO * xDelta ||
+        (yDelta * CANCEL_MIXED_RATIO > xDelta && yDelta > CANCEL_VERTICAL_LOW) ||
+        yDelta > CANCEL_VERTICAL_HIGH
+}
+
 /** One gesture in progress. Immutable; [advanceHomeSwipe] returns the next one. */
 internal data class HomeSwipeGesture(
     val accumX: Float = 0f,
@@ -130,20 +149,35 @@ internal data class HomeSwipeGesture(
     val lastEventAtMs: Long = 0,
     /** Ruled out; stays ruled out until the fingers lift, so a rejected swipe cannot come back. */
     val rejected: Boolean = false,
-    /** Already navigated, so one continuous swipe navigates exactly once. */
-    val committed: Boolean = false,
     val direction: HomeSwipeDirection? = null,
 )
 
 /**
- * What one scroll event did: the gesture that follows it, whether to navigate now, and how far
- * along the affordance should be drawn (0 when there is nothing to draw).
+ * What one scroll event did: the gesture that follows it, and how far along the affordance
+ * should be drawn (0 when there is nothing to draw).
+ *
+ * No `navigate` field here - see [endHomeSwipe] for why the decision moved to gesture END rather
+ * than living in every per-event step. [ended] is not that field coming back: it hands the caller
+ * a gesture to DECIDE about, it does not decide.
  */
 internal data class HomeSwipeStep(
     val gesture: HomeSwipeGesture,
-    val navigate: HomeSwipeDirection? = null,
     val direction: HomeSwipeDirection? = null,
     val progress: Float = 0f,
+    /**
+     * The gesture this event RETIRED, when its own arrival is what ended it - set only when the
+     * event fell outside [GESTURE_GAP_MS] of a gesture that had already started.
+     *
+     * Not the same thing as [gesture], which is the fresh one this event begins. It exists because
+     * the two ways a gesture can end run on different clocks: [advanceHomeSwipe] retires one after
+     * [GESTURE_GAP_MS], while [HomeSwipeSurface]'s timer fires at `GESTURE_GAP_MS + 60`. An event
+     * landing in that 60ms window cancels the pending timer AND discards the gesture here, so a
+     * swipe that had already earned a navigation was silently thrown away - reachable without a
+     * second physical swipe, since a trackpad emits nothing while the fingers are still: swipe
+     * past the threshold, hold ~150ms, nudge before releasing. Handing the retired gesture back
+     * lets the caller run it through [endHomeSwipe] instead of losing it.
+     */
+    val ended: HomeSwipeGesture? = null,
 )
 
 /**
@@ -152,6 +186,13 @@ internal data class HomeSwipeStep(
  * [consumed] is whether a child scroller took the event; a consumed event is the page scrolling
  * something, never a navigation. [canGoBack] and [canGoForward] gate the direction, so an
  * unavailable one shows no affordance rather than an affordance that does nothing.
+ *
+ * Never navigates - see [endHomeSwipe]. This only tracks progress and the two ways a gesture can
+ * be ruled out early (an unwanted scroll chain, too much vertical, a reversal, an unavailable
+ * direction); reaching the commit distance is just a progress value like any other here. When
+ * this event's own lateness is what ends the previous gesture, that gesture comes back on
+ * [HomeSwipeStep.ended] for the caller to run through [endHomeSwipe] - still not a decision made
+ * here.
  */
 internal fun advanceHomeSwipe(
     gesture: HomeSwipeGesture,
@@ -162,34 +203,58 @@ internal fun advanceHomeSwipe(
     canGoBack: Boolean,
     canGoForward: Boolean,
 ): HomeSwipeStep {
-    // A gap in the stream is the end of the previous gesture. Unlike the page detector there is
-    // no timer companion to this: a Compose surface can also be told the pointer left, and the
-    // caller ends the gesture on exit, which covers the lifted finger that never sends another
-    // event.
+    // A gap in the stream is the end of the previous gesture, and the gesture it ends comes back
+    // on HomeSwipeStep.ended rather than being dropped. This is not the only thing that ends a
+    // gesture - HomeSwipeSurface runs a quiescence timer too, and the two cover different cases:
+    // this one only fires when a NEXT event arrives, so a gesture that simply stops needs the
+    // timer. Pointer exit is neither; it cancels outright.
     val continuing = gesture.lastEventAtMs != 0L && nowMs - gesture.lastEventAtMs <= GESTURE_GAP_MS
     val base = if (continuing) gesture else HomeSwipeGesture()
     val stamped = base.copy(lastEventAtMs = nowMs)
+    // A gesture that had actually started and is not being continued is retired by this event,
+    // not discarded - see HomeSwipeStep.ended for the window that made the difference visible.
+    val retired = gesture.takeIf { !continuing && it.events > 0 }
 
-    if (stamped.committed || stamped.rejected) return HomeSwipeStep(stamped)
+    if (stamped.rejected) return HomeSwipeStep(stamped, ended = retired)
     // Something under the pointer scrolled. That is what the event was for.
-    if (consumed) return HomeSwipeStep(stamped.copy(rejected = true))
+    if (consumed) return HomeSwipeStep(stamped.copy(rejected = true), ended = retired)
 
     // Vertical travel counts from the first event of the gesture, including events with no
     // horizontal component, or a plain vertical scroll that curls sideways at the end would
     // arrive here looking like a fresh clean swipe.
     val withY = stamped.copy(verticalPath = stamped.verticalPath + kotlin.math.abs(deltaY))
-    if (deltaX == 0f) return HomeSwipeStep(withY)
+    if (deltaX == 0f) {
+        // Weighed against the gesture's horizontal travel, exactly as an event WITH a horizontal
+        // component would be - see [cancelledByVertical]. Only once a gesture is actually
+        // underway: with no horizontal event yet there is nothing to cancel, and the vertical
+        // still accumulates, so a plain vertical scroll that curls sideways at the end is
+        // rejected by the horizontal path on its first `deltaX` just as before.
+        if (withY.events > 0 && cancelledByVertical(withY)) {
+            return HomeSwipeStep(withY.copy(rejected = true), ended = retired)
+        }
+        // A vertical-only event advances nothing, but it must not LOOK like the gesture ended
+        // either: it carries the gesture's existing direction and progress straight through.
+        //
+        // Load-bearing, not tidiness. AWT delivers horizontal and vertical wheel deltas as
+        // SEPARATE MouseWheelEvents on macOS, so roughly half the stream of any slightly sloped
+        // two-finger swipe has `deltaX == 0` - including, often, the last event of the gesture.
+        // Returning a bare step there reported `direction = null, progress = 0f`, which made
+        // [HomeSwipeSurface] blank the affordance mid-swipe and - because its end-of-gesture
+        // timer only arms while something is shown - drop the gesture without ever asking
+        // [endHomeSwipe] whether it had earned a navigation. That was invisible while the commit
+        // decision still lived in this function, because it fired on the horizontal event that
+        // crossed the threshold and never depended on which axis the LAST event carried.
+        //
+        // Mirrors the same MIN_EVENTS gate the horizontal path applies below, so a vertical
+        // event cannot draw an affordance the horizontal ones would not have.
+        if (withY.events < MIN_EVENTS) return HomeSwipeStep(withY, ended = retired)
+        val carried = (kotlin.math.abs(withY.accumX) / COMMIT_UNITS).coerceAtMost(1f)
+        return HomeSwipeStep(withY, direction = withY.direction, progress = carried, ended = retired)
+    }
 
     val moved = withY.copy(accumX = withY.accumX + deltaX, events = withY.events + 1)
 
-    // Chrome's three tiers, in its order.
-    val yDelta = moved.verticalPath
-    val xDelta = kotlin.math.abs(moved.accumX)
-    val cancelled =
-        yDelta > CANCEL_STRONG_RATIO * xDelta ||
-            (yDelta * CANCEL_MIXED_RATIO > xDelta && yDelta > CANCEL_VERTICAL_LOW) ||
-            yDelta > CANCEL_VERTICAL_HIGH
-    if (cancelled) return HomeSwipeStep(moved.copy(rejected = true))
+    if (cancelledByVertical(moved)) return HomeSwipeStep(moved.copy(rejected = true), ended = retired)
 
     val heading = if (moved.accumX < 0f) HomeSwipeDirection.BACK else HomeSwipeDirection.FORWARD
     val settled =
@@ -197,24 +262,48 @@ internal fun advanceHomeSwipe(
             // Decided once per gesture and latched: which way it goes, and whether that way exists.
             moved.direction == null -> {
                 val available = if (heading == HomeSwipeDirection.BACK) canGoBack else canGoForward
-                if (!available) return HomeSwipeStep(moved.copy(rejected = true))
+                if (!available) return HomeSwipeStep(moved.copy(rejected = true), ended = retired)
                 moved.copy(direction = heading)
             }
-            // Reversed mid-swipe. An abandon, rather than flipping the navigation under the user.
-            moved.direction != heading -> return HomeSwipeStep(moved.copy(rejected = true))
+            // Reversed mid-swipe. An abandon, rather than flipping the navigation under the user -
+            // this is the gesture's own cancel-by-reversing, independent of [endHomeSwipe]'s
+            // release-time check: a full direction flip rules the gesture out immediately, it does
+            // not wait for the fingers to lift.
+            moved.direction != heading -> return HomeSwipeStep(moved.copy(rejected = true), ended = retired)
             else -> moved
         }
 
-    if (settled.events < MIN_EVENTS) return HomeSwipeStep(settled)
+    if (settled.events < MIN_EVENTS) return HomeSwipeStep(settled, ended = retired)
 
     val progress = (kotlin.math.abs(settled.accumX) / COMMIT_UNITS).coerceAtMost(1f)
-    if (progress < 1f) {
-        return HomeSwipeStep(settled, direction = settled.direction, progress = progress)
-    }
-    return HomeSwipeStep(
-        settled.copy(committed = true),
-        navigate = settled.direction,
-        direction = settled.direction,
-        progress = 1f,
-    )
+    return HomeSwipeStep(settled, direction = settled.direction, progress = progress, ended = retired)
+}
+
+/**
+ * Decide whether a finished gesture navigates.
+ *
+ * Called when the gesture ENDS - a gap in the wheel stream, or the pointer leaving the surface -
+ * never mid-swipe. [advanceHomeSwipe] only tracks progress and the two ways a gesture rules
+ * itself out early (a direction flip, too much vertical); this is the one place "reached the
+ * commit distance" turns into an actual navigation, so:
+ *
+ * - a swipe that crosses the threshold and is still held does not navigate before release
+ * - one that eases back below the threshold before release (same direction, no reversal) does
+ *   not navigate at all - "cancel" does not require a full reversal, just letting go early
+ * - one that reverses direction outright is already `rejected` by [advanceHomeSwipe] and never
+ *   reaches here with a direction to navigate
+ * - one built from fewer than [MIN_EVENTS] events does not navigate, matching the affordance:
+ *   a stray delta pair that happens to clear the commit distance is not a swipe
+ */
+internal fun endHomeSwipe(gesture: HomeSwipeGesture): HomeSwipeDirection? {
+    if (gesture.rejected) return null
+    // [MIN_EVENTS] gates committing, not just drawing. It used to gate both for free, because
+    // the commit decision lived inside [advanceHomeSwipe] AFTER its own `events < MIN_EVENTS`
+    // early return; moving the decision here separated the two, and without this line a
+    // two-event flick past [COMMIT_UNITS] navigates. Restated rather than inherited, since the
+    // two functions no longer share a control path.
+    if (gesture.events < MIN_EVENTS) return null
+    val direction = gesture.direction ?: return null
+    val progress = kotlin.math.abs(gesture.accumX) / COMMIT_UNITS
+    return direction.takeIf { progress >= 1f }
 }

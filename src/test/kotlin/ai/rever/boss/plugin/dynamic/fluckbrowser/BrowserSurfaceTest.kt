@@ -200,7 +200,7 @@ class BrowserSurfaceTest {
         // exists. Same argument as the fullscreen state this function already clears.
         val state = FluckBrowserTabState().apply { isLoading = true }
 
-        state.releaseBrowserHandle()
+        state.releaseBrowserHandle().handle
 
         assertFalse(state.isLoading, "a load cannot still be running on a handle the tab let go of")
     }

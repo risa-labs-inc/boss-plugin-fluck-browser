@@ -62,15 +62,45 @@ internal fun HomeSwipeSurface(
     // Bumped on every scroll event so the clear below re-arms rather than accumulating.
     var lastEventTick by remember { mutableStateOf(0L) }
 
-    // The affordance's own end-of-gesture timer. The gap check inside advanceHomeSwipe cannot do
-    // this alone: it only runs when a NEXT event arrives, so a swipe abandoned halfway would park
-    // the puck on screen until the user happened to scroll again. Keyed on the tick, so each event
-    // cancels the pending clear and starts a new one.
+    // Drops the gesture and its affordance without deciding anything. The abandon path.
+    fun cancelGesture() {
+        gesture = HomeSwipeGesture()
+        shown = null
+        progress = 0f
+    }
+
+    // Runs one finished gesture through the decision and navigates if it earned it. The ONE
+    // place onNavigate is called, so neither pointer handler below calls it directly.
+    // homeSwipeEnabled() is read per gesture, not cached: the host republishes the key the moment
+    // the setting changes, and a relaunch to pick that up would be a poor answer.
+    fun decide(finished: HomeSwipeGesture) {
+        val direction = endHomeSwipe(finished)
+        if (direction != null && homeSwipeEnabled()) onNavigate(direction)
+    }
+
+    // Ends the CURRENT gesture: decide, then clear.
+    fun endGesture() {
+        val finished = gesture
+        cancelGesture()
+        decide(finished)
+    }
+
+    // The affordance's own end-of-gesture timer, and the ONLY place a swipe held past the commit
+    // distance actually navigates - see endHomeSwipe's KDoc for why that decision waits for here
+    // rather than firing the moment progress reaches 1 inside the Scroll handler below. The gap
+    // check inside advanceHomeSwipe cannot do this alone: it only runs when a NEXT event arrives,
+    // so a swipe held or abandoned would never end on its own. Keyed on the tick, so each event
+    // cancels the pending end and starts a new one.
+    // Gated on the GESTURE, not on the affordance. Gating on `shown` made ending the gesture
+    // depend on what the most recent event happened to look like: one event the detector had
+    // nothing to draw for (see advanceHomeSwipe's vertical-only branch) left the timer unarmed
+    // and nothing else ever ends a gesture, so the swipe died silently. `events > 0` is true for
+    // the whole life of any gesture that has seen a horizontal delta, which is every gesture
+    // endHomeSwipe could possibly say yes to.
     LaunchedEffect(lastEventTick) {
-        if (shown != null) {
+        if (gesture.events > 0) {
             delay(GESTURE_GAP_MS + 60)
-            shown = null
-            progress = 0f
+            endGesture()
         }
     }
 
@@ -90,23 +120,27 @@ internal fun HomeSwipeSurface(
                             canGoBack = canGoBack,
                             canGoForward = canGoForward,
                         )
+                    // A gesture retired by THIS event's lateness has to be decided here: the
+                    // timer that would otherwise have ended it is about to be cancelled by the
+                    // tick below, and advanceHomeSwipe has already replaced it with a fresh one.
+                    // The window is real - advanceHomeSwipe retires at GESTURE_GAP_MS while the
+                    // timer fires 60ms later - and a trackpad emits nothing while the fingers are
+                    // still, so "swipe past the threshold, hold, nudge before releasing" lands in
+                    // it without any second physical swipe.
+                    step.ended?.let { decide(it) }
                     gesture = step.gesture
                     lastEventTick++
-                    // Read per gesture, not cached: the host republishes the key the moment the
-                    // setting changes, and a relaunch to pick that up would be a poor answer.
                     val enabled = homeSwipeEnabled()
                     shown = step.direction.takeIf { enabled }
                     progress = step.progress
-                    if (enabled) step.navigate?.let(onNavigate)
                 }
-                // A pointer that leaves the surface ends the gesture outright. Compose does report
-                // this one, unlike the page detector's world, so it does not have to be inferred
-                // from silence.
-                .onPointerEvent(PointerEventType.Exit) {
-                    gesture = HomeSwipeGesture()
-                    shown = null
-                    progress = 0f
-                },
+                // A pointer that leaves the surface CANCELS the gesture; it does not end it.
+                // Exit is not a release: a macOS two-finger scroll moves no cursor, so the events
+                // that actually raise Exit mid-swipe are the cursor drifting off the home surface
+                // (onto the toolbar, under an overlay) - none of which mean the user let go. The
+                // GESTURE_GAP_MS timer above already covers every real release, so treating Exit
+                // as one only adds navigations nobody asked for.
+                .onPointerEvent(PointerEventType.Exit) { cancelGesture() },
     ) {
         content()
         shown?.let { direction -> HomeSwipeAffordance(direction, progress) }

@@ -77,7 +77,7 @@ class FluckBrowserFullscreenStateTest {
         state.adoptBrowserHandle(handle)
         state.enterFullscreen()
 
-        assertSame(handle, state.releaseBrowserHandle())
+        assertSame(handle, state.releaseBrowserHandle().handle)
         assertNull(state.browserHandle)
         assertFalse(state.isInFullscreen)
         assertEquals(1, exitRequests)
@@ -89,7 +89,7 @@ class FluckBrowserFullscreenStateTest {
         var exitRequests = 0
         state.adoptBrowserHandle(fakeHandle(onExitFullscreen = { exitRequests++ }))
 
-        state.releaseBrowserHandle()
+        state.releaseBrowserHandle().handle
 
         assertEquals(0, exitRequests)
     }
@@ -106,7 +106,7 @@ class FluckBrowserFullscreenStateTest {
         )
         state.enterFullscreen()
 
-        state.releaseBrowserHandle()
+        state.releaseBrowserHandle().handle
 
         assertEquals(0, exitRequests)
         assertFalse(state.isInFullscreen)
@@ -117,10 +117,10 @@ class FluckBrowserFullscreenStateTest {
         val state = FluckBrowserTabState()
         state.adoptBrowserHandle(fakeHandle())
         state.enterFullscreen()
-        assertNotNull(state.releaseBrowserHandle())
+        assertNotNull(state.releaseBrowserHandle().handle)
 
         // Second release: fullscreen already cleared, handle already gone.
-        assertNull(state.releaseBrowserHandle())
+        assertNull(state.releaseBrowserHandle().handle)
         assertFalse(state.isInFullscreen)
     }
 
@@ -176,7 +176,7 @@ class FluckBrowserFullscreenStateTest {
 
         // Hibernation or crash recovery takes the handle, and the enter callback the host
         // queued before that lands afterwards on the Component scope.
-        state.releaseBrowserHandle()
+        state.releaseBrowserHandle().handle
         state.enterFullscreen()
 
         assertFalse(state.isInFullscreen)
@@ -242,7 +242,7 @@ class FluckBrowserFullscreenStateTest {
         state.adoptBrowserHandle(handle)
         state.enterFullscreen()
 
-        assertSame(handle, state.releaseBrowserHandle(), "the caller must still get it to dispose")
+        assertSame(handle, state.releaseBrowserHandle().handle, "the caller must still get it to dispose")
         assertNull(state.browserHandle)
         assertFalse(state.isInFullscreen)
     }
@@ -417,7 +417,7 @@ class FluckBrowserFullscreenStateTest {
         runCurrent()
         assertEquals(FullscreenExitPhase.FAILED, state.fullscreenExitPhase)
 
-        state.releaseBrowserHandle()
+        state.releaseBrowserHandle().handle
 
         assertEquals(FullscreenExitPhase.IDLE, state.fullscreenExitPhase)
     }
@@ -582,7 +582,7 @@ class FluckBrowserFullscreenStateTest {
         assertTrue(state.requestExitFullscreen(this))
 
         // Tab closed while the exit was still in flight.
-        state.releaseBrowserHandle()
+        state.releaseBrowserHandle().handle
         advanceTimeBy(FULLSCREEN_EXIT_FALLBACK_MS * 2 + 1)
         runCurrent()
 

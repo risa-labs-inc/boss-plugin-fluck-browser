@@ -51,9 +51,18 @@ never ran.
   gap, deliberate: a tab whose exit from fullscreen failed twice is allowed to hibernate rather
   than stay exempt for the rest of its life, since disposing the browser is what detaches the
   stuck window. That one costs a reload.
-- **It does reload the page.** Anything the page has not saved - a half-written form, scroll
-  position, in-page state - is discarded, the same way Chrome's own memory saver behaves. If that
-  matters for how you work, turn it off with the variable below.
+- **It never discards unsaved typing.** A tab where you have typed, pasted, cut, or started an
+  IME composition since the last submit is not hibernated. This is a keystroke listener, not an
+  inspection of the page's fields: autofill and a framework writing into its own inputs both look
+  nothing like typing, so neither exempts a tab. Known gaps: typing inside an iframe or a
+  shadow-DOM editor, and edits made by mouse alone (a checkbox, a drag-and-drop) are not seen.
+- **Scroll position survives.** Returning to a hibernated tab restores where you were, once the
+  page has finished loading and stopped resizing. Known gap: app-shell sites that scroll an inner
+  container rather than the window (Gmail- and Jira-shaped apps) report no window scroll, so
+  nothing is restored for them.
+- **It does still reload the page.** In-page state the page itself did not save is discarded, the
+  same way Chrome's own memory saver behaves. If that matters for how you work, turn it off with
+  the variable below.
 
 ### Configuration
 

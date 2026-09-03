@@ -136,9 +136,9 @@ internal object CredentialCapture {
         //
         // Nothing replaced it, because a duplicate evaluation costs nothing here: both posts carry
         // identical values, the channel is CONFLATED and the policy holds one pending capture, so
-        // two posts and one produce the same single prompt. (The host was briefly documented as
-        // deduping instead; that guarantee was withdrawn as unimplementable on its side. This
-        // comment used to assert it, two paragraphs after the KDoc said it was gone.)
+        // two posts and one produce the same single prompt. Do not reintroduce a dedupe here on
+        // the strength of a host-side one: the host's was withdrawn as unimplementable on its
+        // side, so this script cannot assume any.
         $FIELD_ELIGIBILITY_JS
 
         function isPassword(el) {

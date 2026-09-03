@@ -177,9 +177,9 @@ class FluckBrowserTabComponent(
                     BrowserShareManager.unregisterTab(config.id)
                     // Also asks the host to leave fullscreen, so closing a tab mid-video
                     // cannot leave its detached fullscreen window on screen.
-                    val handle = state.releaseBrowserHandle()
-                    // Off the UI thread so closing a tab never hitches the app.
-                    if (handle != null) disposeBrowserHandleOffThread(handle)
+                    // Off the UI thread so closing a tab never hitches the app, and awaiting
+                    // whatever was still running against the handle - see [ReleasedHandle].
+                    disposeReleasedHandle(state.releaseBrowserHandle())
                     // Adopt any in-flight (or completed-but-unconsumed) creation:
                     // it runs on the never-cancelled browserCreationScope precisely
                     // so its result stays retrievable here — dispose whatever it
@@ -625,6 +625,33 @@ internal const val HOME_TITLE = "Home"
 
 internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:blank"
 
+/**
+ * The URL of the page the user is looking at, as opposed to [draft] - whatever is currently in
+ * the URL bar.
+ *
+ * The affordances that act on "the page I am on" (copy link, bookmark) must not act on a
+ * half-typed string. `urlBarText` is not a loaded-URL field - it is an editable text box that
+ * merely happens to hold the loaded URL most of the time - so [loaded] is tracked separately, off
+ * the navigation listener, which reports the committed URL whether or not the box is being
+ * edited.
+ *
+ * **No "is the user editing" flag.** An earlier shape took one, and it was not a sound gate:
+ * `onFocusLost` clears editing state after 200ms WITHOUT restoring the box, so typing `htt` and
+ * then clicking into the page leaves a stale draft with editing already false - the exact case the
+ * flag was supposed to exclude. Preferring [loaded] unconditionally has no downside to trade
+ * against that: when nothing is being edited the two agree anyway, except in the window where
+ * `onNavigate` optimistically writes the resolved URL into the bar before the load commits, and
+ * there the page the user is on is still the old one.
+ *
+ * Falls back to [draft] when [loaded] is blank, which is home (see [isHomeUrl] - `about:blank`
+ * fires no navigation events, so home is represented here as "nothing loaded") and the state
+ * before a brand-new tab's first navigation commits.
+ */
+internal fun visiblePageUrl(
+    draft: String,
+    loaded: String,
+): String = if (loaded.isNotBlank()) loaded else draft
+
 /** What the starting surface says for the first stretch of a boot. */
 internal const val INITIALIZING_MESSAGE = "Initializing browser..."
 
@@ -1051,6 +1078,34 @@ internal object TabHibernation {
          * what the host flag exists for.
          */
         SHOWN_IN_POP_OUT("tab still on screen in a pop-out"),
+
+        /**
+         * The user has typed into this document since it loaded, and nothing has navigated since.
+         *
+         * This state exists because hibernation's own justification ("the cost of being wrong is
+         * a reload on return, not lost work") is false for exactly one class of tab: one where
+         * the user has typed something and not submitted it. A reload there IS lost work - a
+         * half-written order form, text typed and abandoned for twenty minutes. Every other
+         * guard in this enum protects something the user is passively consuming; this one
+         * protects something they made.
+         *
+         * Detected by [DirtyInputMarker]'s trusted-keystroke listener, NOT by inspecting the DOM.
+         * The DOM heuristic was attempted three times and withdrawn (d1552be): value-vs-default
+         * matching exempted every SPA that writes into its own fields, and `defaultValue` cannot
+         * tell an autofilled password from a typed one, which exempted login pages for ~20
+         * hours. A trusted keystroke answers "has a human typed here" directly - autofill and
+         * framework writes fire no trusted keydown, so both failure modes are structurally
+         * impossible rather than patched. The re-added mapping deliberately reverses the
+         * "'input' must not linger" pin that d1552be left behind; the predicate it buried is not
+         * the one that returned.
+         *
+         * Unlike [PLAYING_MEDIA], typing does not drain on its own, so this routinely reaches
+         * the [MAX_RECHECKS] "left alone" ending rather than the "waited out" one - the same
+         * bounded trade [SHOWN_IN_POP_OUT] makes for calls. A leaked process tree costs memory
+         * until the next visit; a discarded draft costs the user's work, and those are not the
+         * same mistake.
+         */
+        USER_INPUT("tab holds unsubmitted typing"),
     }
 
     /**
@@ -1216,13 +1271,15 @@ internal object TabHibernation {
      * covered by any of them, because the DOM does not answer "has a human typed here" by
      * enumeration.
      *
-     * A page-load `input` listener setting a dirty flag would answer it properly, and is the right
-     * follow-up; it needs an injection point at navigation, and getting that wrong fails toward
-     * losing the work it is meant to protect. Not something to land at the end of a review series.
+     * A page-load `input` listener setting a dirty flag answers this properly and has since
+     * landed - see [DirtyInputMarker] and its own read of `BUSY_SCRIPT` below, ordered after
+     * this function's 'media' answer for the same reason media is checked first here: neither
+     * answer may skip ahead of the other.
      *
-     * So the shipped guarantee is narrow and true: **hibernation never cuts audio**, and a
-     * backgrounded tab may be reloaded, which discards unsaved input the same way Chrome's own
-     * memory saver does. That is documented in the README next to the opt-out.
+     * So the shipped guarantee is narrow and true: **hibernation never cuts audio**, and (before
+     * [DirtyInputMarker]) a backgrounded tab could be reloaded, discarding unsaved input the same
+     * way Chrome's own memory saver does. That was documented in the README next to the opt-out;
+     * the guard now narrows how often the reload case is actually reached.
      *
      * Done in JavaScript because `BrowserHandle` exposes no audio state; JxBrowser's
      * `browser.audio()` is not surfaced through plugin-api, and adding it means an api release,
@@ -1324,12 +1381,20 @@ internal object TabHibernation {
      * and no log line. `executeJavaScript` returns `Any?`, so a wrapper type or a quoted JSON
      * string would otherwise collapse every branch. Normalising first is cheap insurance against a
      * marshalling change nobody would notice. Mirrors `middleClickUrlFromScriptResult` above.
+     *
+     * Sharing [normalizeJsStringResult] moved this onto its trailing trim (recovering whitespace
+     * *inside* the quotes, e.g. `"' pip '"`), which this function's own inline logic never had -
+     * such a value used to fall through to [BusyState.IDLE] and now resolves to
+     * [BusyState.PICTURE_IN_PICTURE]. An improvement, but a real change to this decision path
+     * from the host's actual `executeJavaScript` marshalling, not the pure deduplication the rest
+     * of that refactor is.
      */
     internal fun busyStateFromScriptResult(result: Any?): BusyState =
-        when (result?.toString()?.trim()?.trim('"')?.lowercase()) {
+        when (normalizeJsStringResult(result)?.lowercase()) {
             "pip" -> BusyState.PICTURE_IN_PICTURE
             "shown" -> BusyState.SHOWN_IN_POP_OUT
             "media" -> BusyState.PLAYING_MEDIA
+            "input" -> BusyState.USER_INPUT
             else -> BusyState.IDLE
         }
 
@@ -1389,6 +1454,20 @@ internal object TabHibernation {
             "return !m.paused && !m.ended && !m.muted && m.volume > 0 && m.currentTime > 0;" +
             "});" +
             "if (media) return 'media';" +
+            // Unsubmitted typing, answered AFTER 'media' (the audible-first guarantee the
+            // ordering comment below leans on is untouched) but BEFORE 'shown', deliberately:
+            // busyStateFor downgrades 'shown' to IDLE when the host answers "not popped out",
+            // and a page that is both shown-inferred and dirty must report 'input' so that
+            // downgrade can never hibernate a tab holding the user's typing.
+            //
+            // This reads a marker; it does NOT inspect the DOM. The DOM heuristic was attempted
+            // three times and withdrawn (d1552be) - value-vs-default matching exempted every SPA,
+            // and defaultValue cannot tell an autofilled password from a typed one, which
+            // exempted login pages for ~20 hours. The marker is set only by a trusted keystroke
+            // or IME composition start; see DirtyInputMarker for what sets it and the trades.
+            // Shares DirtyInputMarker.DIRTY_FLAG_PROPERTY with the setter rather than a second
+            // hardcoded literal, so a rename cannot desync setter from reader.
+            "if (window.${DirtyInputMarker.DIRTY_FLAG_PROPERTY} === 1) return 'input';" +
             // The surface pop-out this app uses reparents the tab's real rendering surface into
             // a floating window, so neither PiP API reports it - the page is simply visible
             // while its tab is backgrounded. Paired with a playing video so a rendering mode
@@ -1504,10 +1583,208 @@ private val browserDisposeExecutor = java.util.concurrent.Executors.newCachedThr
     Thread(r, "fluck-browser-dispose").apply { isDaemon = true }
 }
 
+/**
+ * Installs [DirtyInputMarker.INSTALL_JS] on [handle], off the UI thread.
+ *
+ * One function rather than the identical `coroutineScope.launch { handle.executeJavaScript(...) }`
+ * written twice (on adoption and on every navigation) - a future change to install error handling
+ * or logging only has to land once, where missing one of the two call sites would silently
+ * reintroduce the exact class of bug this feature exists to prevent.
+ *
+ * Dispatchers.IO for the same reason [captureScrollOrNull] is: `executeJavaScript` on
+ * `coroutineScope` (Dispatchers.Main) has no suspension point of its own, so a wedged renderer
+ * would park the app's UI thread rather than a background one. A failed install here degrades to
+ * "hibernation treats this tab as never dirty", which is the existing, already-accepted
+ * behaviour for a host with no page-event channel at all.
+ *
+ * Not truly fire-and-forget any more: the launched Job is stored on [hoistedState] so
+ * [disposeBrowserHandleOffThread] can await it before disposing the handle this call is running
+ * against - without tracking it, an install landing mid-flight during ANY dispose (tab close,
+ * retry, hibernation) would be an untracked, unfenced race against `executeJavaScript` on a
+ * handle about to be disposed.
+ */
+private fun installDirtyMarker(
+    handle: BrowserHandle,
+    coroutineScope: CoroutineScope,
+    hoistedState: FluckBrowserTabState,
+) {
+    // A rapid second navigation can call this again before the first install's job has finished;
+    // cancelling the outgoing one before overwriting the field is what keeps "tracked so dispose
+    // can await/cancel it" true for every install, not just the most recent.
+    hoistedState.dirtyMarkerInstallJob?.cancel()
+    val job =
+        coroutineScope.launch {
+            // Rethrows CancellationException rather than swallowing it, matching captureScrollOrNull
+            // and every runCatching inside ScrollRestore: runCatching is Throwable-wide, so a
+            // cancelled install caught here would complete this job NORMALLY. Nothing runs after
+            // the runCatching today, so today that only mislabels the job's completion - but it is
+            // the same shape that would silently keep going the moment anything is added below it.
+            runCatching { withContext(Dispatchers.IO) { handle.executeJavaScript(DirtyInputMarker.INSTALL_JS) } }
+                .onFailure { if (it is CancellationException) throw it }
+        }
+    hoistedState.dirtyMarkerInstallJob = job
+    // Identity-checked so a completion callback firing late (after a NEWER install already
+    // replaced this field, e.g. the rapid-navigation case above) cannot null out a job that isn't
+    // this one any more.
+    job.invokeOnCompletion { if (hoistedState.dirtyMarkerInstallJob === job) hoistedState.dirtyMarkerInstallJob = null }
+}
+
+/**
+ * Reads [ScrollRestore.CAPTURE_JS] AND the current URL off a still-live handle, right before it
+ * is disposed - bundled together (via [ScrollRestore.SavedScroll]) because comparing the
+ * RESTORING handle's URL against itself verifies nothing; the URL that actually needs verifying
+ * is the one this OLD handle is on right now, at capture time.
+ *
+ * `getCurrentUrl()` is documented as a plain synchronous getter, and this reads it INSIDE the IO
+ * offload anyway. The caller here is the hibernation job, which runs on `Dispatchers.Main`, and
+ * this is the last thing to touch the handle before it is disposed; the point of moving five
+ * `executeJavaScript` call sites to IO in this file was to stop taking the app's UI thread on
+ * trust about what does and does not reach native code. One line inside the block it was already
+ * next to costs nothing and removes the last unbounded, un-offloaded call on the capture path.
+ *
+ * 1 second is generous for a synchronous DOM read and short enough that a wedged renderer
+ * cannot delay the dispose it is about to receive anyway. Any failure - timeout, thrown,
+ * malformed result - degrades to "nothing to restore", never to a stale or wrong position.
+ */
+private suspend fun captureScrollOrNull(handle: BrowserHandle): ScrollRestore.SavedScroll? =
+    try {
+        // Dispatchers.IO, not the caller's Main - same reason busyState() gives for its own
+        // identical call: withTimeoutOrNull can only abandon a call that SUSPENDS, and if
+        // executeJavaScript blocks internally (a wedged renderer) this thread stays parked
+        // until it answers. On Main that parks the whole app UI; on IO it parks one thread.
+        withContext(Dispatchers.IO) {
+            val url = handle.getCurrentUrl()
+            withTimeoutOrNull(1_000L) { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }
+                ?.let { ScrollRestore.parseCapture(it) }
+                ?.let { ScrollRestore.SavedScroll(it, url) }
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        null
+    }
+
+/** Bound to [captureScrollOrNull]'s own 1s capture timeout - these are meant to be sub-millisecond DOM ops on a healthy page. */
+private const val RESTORE_CALL_TIMEOUT_MS = 1_000L
+
+/** Wrapped the same way [ScrollRestore.CAPTURE_JS] is, so a thrown exception and a genuine `null` height stay distinguishable through the `runCatching` inside [ScrollRestore.awaitSettleAndApply]'s poll loop. */
+private const val READ_HEIGHT_JS =
+    "(function(){try{return document.documentElement.scrollHeight;}catch(e){return null;}})()"
+
+/**
+ * Applies a captured scroll position to a freshly (re)created handle, once the document has
+ * settled - not at `DOMContentLoaded`, which loses a race with any page that re-renders after
+ * load (an SPA's own hydration undoing the very scroll this just applied).
+ *
+ * A thin binding over [ScrollRestore.awaitSettleAndApply] - see that function's KDoc for why the
+ * settle signal is document height rather than `readyState`, for the loop-correctness bug this
+ * replaced, and for why it waits for [saved]'s URL to actually load before touching height at all
+ * (a freshly created handle starts on `about:blank` while its own navigation is still in flight).
+ *
+ * The whole call runs on Dispatchers.IO, not the caller's Main - same reason as
+ * [captureScrollOrNull]: up to several sequential `executeJavaScript` round trips happen inside
+ * [ScrollRestore.awaitSettleAndApply], and a wedged renderer or a slow-to-hydrate SPA blocking
+ * any one of them must park a background thread, not the app's UI thread.
+ *
+ * Each individual call is also wrapped in `bounded` ([RESTORE_CALL_TIMEOUT_MS]), but this does
+ * NOT actually cap a wedged call's wall-clock time - see [captureScrollOrNull]'s KDoc (and
+ * `busyState()`'s own identical admission) for why `withTimeoutOrNull` can only abandon OUR wait,
+ * never a call that blocks without suspending. What it caps is the well-behaved case: on a healthy
+ * renderer this keeps one slow-but-not-wedged call from running unbounded, rather than adding a
+ * comment that promises a guarantee the code cannot give. [ScrollRestore.awaitSettleAndApply]'s
+ * own caps are poll COUNTS, not wall-clock - the two do not compose into a hard deadline, and
+ * `disposeBrowserHandleOffThread`'s 2s join is a best-effort wait on top of both, not a bound
+ * either of them enforces. Tracked with the pre-existing renderer-timeout gap as BossConsole#300.
+ */
+private suspend fun restoreScrollOnSettle(
+    handle: BrowserHandle,
+    saved: ScrollRestore.SavedScroll,
+) {
+    if (!ScrollRestore.shouldAttemptRestore(saved.position, saved.url)) return
+
+    suspend fun <T> bounded(block: suspend () -> T): T? =
+        withTimeoutOrNull(RESTORE_CALL_TIMEOUT_MS) { block() }
+
+    val settled =
+        withContext(Dispatchers.IO) {
+            ScrollRestore.awaitSettleAndApply(
+                target = saved.position,
+                expectedUrl = saved.url,
+                readUrl = { bounded { handle.getCurrentUrl() } },
+                readHeight = { bounded { handle.executeJavaScript(READ_HEIGHT_JS)?.toString() } },
+                applyScroll = { bounded { handle.executeJavaScript(ScrollRestore.restoreJs(saved.position)) } },
+                readPosition = { bounded { handle.executeJavaScript(ScrollRestore.CAPTURE_JS) }?.let { ScrollRestore.parseCapture(it) } },
+                delay = { kotlinx.coroutines.delay(it) },
+            )
+        }
+    if (!settled) {
+        // Logged for the same reason a skipped hibernation is: "the scroll position didn't
+        // restore" is otherwise indistinguishable in the field from "restore is broken". Names
+        // all three endings rather than only the first - awaitSettleAndApply collapses them to
+        // one boolean deliberately (the caller's response to each is identical), so the log line
+        // is the only place the distinction can still be read.
+        println(
+            "[FluckBrowser] Scroll restore did not land: the page never reached the captured URL, " +
+                "redirected away mid-restore, or every reapply clamped short of the saved position",
+        )
+    }
+}
+
+/**
+ * A handle released from [FluckBrowserTabState], together with the jobs that were still pending
+ * against it at the moment of release.
+ *
+ * The two travel together because they are only correct together. The jobs have to be read BEFORE
+ * the cancellation inside `releaseBrowserHandle` completes - each nulls its own field via
+ * `invokeOnCompletion`, usually within microseconds - so a caller reading them afterwards gets an
+ * empty list and an await that looks like protection and is not. That was a rule enforced by a
+ * comment at one call site out of six; bundling them makes the wrong order unrepresentable
+ * instead, which is the same reason `browserHandle` has a `private set`.
+ */
+internal data class ReleasedHandle(
+    val handle: BrowserHandle?,
+    val pendingJobs: List<kotlinx.coroutines.Job>,
+)
+
+/**
+ * Dispose a released handle off the UI thread, awaiting whatever was pending against it.
+ *
+ * The one-liner every release-then-dispose site uses, so all of them get the await rather than
+ * only the site that remembered to ask for it.
+ */
+internal fun disposeReleasedHandle(released: ReleasedHandle) {
+    released.handle?.let { disposeBrowserHandleOffThread(it, awaitJobs = released.pendingJobs) }
+}
+
 /** Dispose a handle off the UI thread — dispose() ends in a blocking Chromium IPC round-trip. */
-internal fun disposeBrowserHandleOffThread(handle: BrowserHandle) {
+internal fun disposeBrowserHandleOffThread(
+    handle: BrowserHandle,
+    awaitJobs: List<kotlinx.coroutines.Job> = emptyList(),
+) {
     browserDisposeExecutor.execute {
         try {
+            // installDirtyMarker and restoreScrollOnSettle run executeJavaScript against this
+            // handle; joining them first is what stops one landing mid-dispose. Callers get the
+            // list from [ReleasedHandle] rather than assembling it, so every dispose site is
+            // covered rather than only the one that remembered to ask.
+            //
+            // What a join CANNOT tell us: a job wrapping `withTimeoutOrNull { executeJavaScript }`
+            // completes the instant that timeout gives up, which is not when the underlying native
+            // call returns if the renderer is wedged. That orphaned call can still be running
+            // after this returns - a pre-existing limitation this plugin cannot close alone
+            // (busyState admits the identical gap), tracked as BossConsole#300.
+            //
+            // runBlocking is safe here because this already runs on browserDisposeExecutor, a
+            // background thread whose only job is this dispose. Bounded, not indefinite: a wedged
+            // renderer must not delay a dispose that exists partly to recover FROM one. ONE
+            // timeout around the whole list, not one per job - a job parked in a non-suspending
+            // executeJavaScript is the one cancellation cannot shorten, so it is also the one
+            // most likely to pay a per-job bound in full, twice.
+            kotlinx.coroutines.runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(2_000L) {
+                    awaitJobs.forEach { job -> job.join() }
+                }
+            }
             handle.dispose()
         } catch (t: Throwable) {
             println("[FluckBrowser] Browser dispose failed: ${t.message}")
@@ -1856,8 +2133,68 @@ internal class FluckBrowserTabState {
     var lateAdoptNudged: Deferred<BrowserHandle?>? = null
     // Pending idle-hibernation timer (armed when the tab is backgrounded, cancelled if it returns).
     var hibernationJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Scroll position (bundled with the URL it was captured from - see [ScrollRestore.SavedScroll])
+     * captured the instant before a hibernation dispose, consumed (set back to null) the moment
+     * it is applied on wake. Plain var, not `mutableStateOf` - like [hibernationJob], nothing in
+     * the UI reads this; it exists purely for the wake effect to hand off to itself across the
+     * dispose/recreate boundary.
+     *
+     * **Known gap: a restore that fails to land is not distinguished from one that never ran.**
+     * [restoreScrollOnSettle] does not write back here on failure - there is nothing to write,
+     * the whole point of this field is being consumed once - so a wake that lands short (see
+     * [ScrollRestore.awaitSettleAndApply]'s `@return` KDoc for why that happens on a
+     * lazy-loading page) leaves the tab sitting wherever the failed apply left it. If the user
+     * does not manually scroll back before the NEXT hibernation, that wrong position is what
+     * gets captured and overwrites the original good one - a transient restore failure becomes
+     * permanent. Narrow in practice (the idle window before hibernation is 10-30 minutes, so the
+     * two events are normally far apart) and not fixed here: closing it means [captureScrollOrNull]
+     * threading through "did the last restore actually land" from a whole prior wake, which is
+     * more state than this field carries today.
+     */
+    var savedScroll: ScrollRestore.SavedScroll? = null
+
+    /**
+     * The two fire-and-forget jobs [installDirtyMarker] and the wake-time [restoreScrollOnSettle]
+     * launch against the current handle. Tracked so [disposeBrowserHandleOffThread] can await
+     * them before disposing - see its KDoc. Both nulled by whichever function set them once that
+     * job actually completes, is not required for correctness (a completed Job's `join()` returns
+     * immediately either way) but keeps this from holding a reference to a finished job forever.
+     *
+     * `@Volatile`, because not every writer is on `Dispatchers.Main` and an earlier version of
+     * this doc claimed otherwise. `invokeOnCompletion` runs on whichever thread completes the job,
+     * and cancelling a job suspended inside `withContext(Dispatchers.IO)` completes it on an IO
+     * thread - so the `= null` write genuinely happens off Main. The identity check at each of
+     * those handlers is what makes the write harmless; `@Volatile` is what makes it visible.
+     *
+     * Volatile gives visibility, not atomicity, and the read-then-cancel and check-then-null pairs
+     * here are still not atomic. They do not need to be: cancelling an already-finished job is a
+     * no-op, and the identity check means a late completion can only ever null out its own
+     * reference. What it must not do is read a stale one, which is what this prevents.
+     */
+    @Volatile
+    var dirtyMarkerInstallJob: kotlinx.coroutines.Job? = null
+
+    @Volatile
+    var scrollRestoreJob: kotlinx.coroutines.Job? = null
     var isLoading: Boolean by mutableStateOf(false)
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
+
+    /**
+     * The URL the browser last committed to, as opposed to [urlBarText]'s editable draft. Written
+     * unconditionally from the navigation listener - which that listener deliberately does NOT do
+     * for [urlBarText] while the user is editing - and cleared by `applyHomeTabIdentity`, since
+     * `about:blank` fires no navigation events and so cannot announce its own arrival. See
+     * [visiblePageUrl].
+     *
+     * Hoisted, not `remember`ed in the composable. A tab switch disposes the composition (that is
+     * what arms the hibernation timer) while `browserHandle` survives, so the handle-creation
+     * effect - and with it the navigation listener's registration - does not re-run. A local
+     * `remember` would leave the new composition's copy at `""` forever, with the old listener
+     * closure writing into a dead `MutableState`.
+     */
+    var loadedUrl: String by mutableStateOf("")
     var pageTitle: String by mutableStateOf("New Tab")
     var zoomLevel: Double by mutableStateOf(1.0)
 
@@ -2018,12 +2355,26 @@ internal class FluckBrowserTabState {
      * BossConsole#36 (merged) additionally detaches a matching fullscreen view from `BrowserHandle`
      * disposal, which is what covers the invalid-handle case this cannot reach.
      */
-    fun releaseBrowserHandle(): BrowserHandle? {
+    fun releaseBrowserHandle(): ReleasedHandle {
         val handle = browserHandle
         if (isInFullscreen) {
             requestHostExitFullscreen(handle)
         }
         browserHandle = null
+        // Read BEFORE the cancel below, and returned to the caller rather than left for it to go
+        // and fetch: cancellation completes almost immediately and each job nulls its own field
+        // via invokeOnCompletion, so a list built from these fields afterwards is empty nearly
+        // every time. See [ReleasedHandle].
+        val pending = listOfNotNull(dirtyMarkerInstallJob, scrollRestoreJob)
+        // Cancel AND hand the jobs back, which are two different protections. Cancellation cannot
+        // retroactively stop a call already blocked in native code (see captureScrollOrNull's
+        // KDoc for why not), but it DOES stop the job from starting its NEXT round trip - e.g.
+        // restoreScrollOnSettle's reapply loop, between attempts. The returned list is what lets
+        // every dispose site actually WAIT for a job already in flight. Each job nulls its own
+        // reference in [installDirtyMarker] / the wake effect via `invokeOnCompletion`, so a
+        // cancel here on an already-finished job is a harmless no-op, not a double-cancel.
+        dirtyMarkerInstallJob?.cancel()
+        scrollRestoreJob?.cancel()
         clearFullscreenState()
         // For the same reason fullscreen state is cleared here rather than at each call site:
         // isLoading describes THIS handle's navigation, and the listener that would flip it goes
@@ -2032,7 +2383,7 @@ internal class FluckBrowserTabState {
         // exists - the "the tab says it is doing something it isn't" family this file is being
         // cleaned of. Adoption re-seeds it from the replacement.
         isLoading = false
-        return handle
+        return ReleasedHandle(handle, pending)
     }
 
     /**
@@ -2274,6 +2625,7 @@ internal fun FluckBrowserTabContent(
     val browserHandle by hoistedState::browserHandle
     var isLoading by hoistedState::isLoading
     var urlBarText by hoistedState::urlBarText
+    var loadedUrl by hoistedState::loadedUrl
     var pageTitle by hoistedState::pageTitle
     var zoomLevel by hoistedState::zoomLevel
     var error by hoistedState::error
@@ -2456,10 +2808,18 @@ internal fun FluckBrowserTabContent(
 
     // Show dashboard for about:blank pages - matches bundled browser exactly
     val currentUrl = urlBarText.text
+    // What "the page I am on" means for copy-link and bookmarking. Equal to currentUrl whenever
+    // the box holds the loaded URL, which is almost always; see [visiblePageUrl]. Deliberately NOT
+    // substituted for currentUrl wholesale - showDashboard and isSecure below answer "what is this
+    // composable rendering", which is the box's question, not the loaded page's.
+    val pageUrl = visiblePageUrl(urlBarText.text, loadedUrl)
     val showDashboard = isHomeUrl(currentUrl)
 
-    // Security indicator derived from current URL
-    val isSecure = currentUrl.startsWith("https://")
+    // Security indicator derived from the LOADED page, not the box. showDashboard above asks what
+    // this composable is rendering, which is the draft's question; the padlock is a claim about
+    // the document the user is actually on, and typing "https://…" over an http page must not
+    // put a lock on it.
+    val isSecure = pageUrl.startsWith("https://")
 
     // Lazily created provider - by the time LaunchedEffect runs, the tab should be registered
     var tabUpdateProvider by remember { mutableStateOf<TabUpdateProvider?>(null) }
@@ -2500,13 +2860,40 @@ internal fun FluckBrowserTabContent(
             // the URL captured when it was launched: it exists only while a boot is
             // already in flight, and the browser it produces reports its real
             // location through the navigation listener anyway.
+            // Resolved ONCE, and used both to create the browser and to seed loadedUrl at
+            // adoption below - the two were computed separately and could disagree on a wake
+            // whose captured URL is the post-redirect one, leaving loadedUrl briefly wrong until
+            // the navigation listener corrected it.
+            val creationUrl =
+                (hoistedState.savedScroll?.url ?: visiblePageUrl(urlBarText.text, hoistedState.loadedUrl))
+                    .ifBlank { initialUrl }
             val creation = hoistedState.browserCreation
                 ?: browserCreationScope.async {
                     // urlBarText is Compose state read here on an IO thread — safe
                     // (snapshot reads are thread-consistent), and deliberately
                     // snapshotted at launch time per the comment above.
+                    //
+                    // Through visiblePageUrl, so a tab backgrounded MID-EDIT wakes onto the page
+                    // it was actually showing rather than onto a half-typed draft. Scroll restore
+                    // makes that visible: savedScroll.url comes from getCurrentUrl() on the old
+                    // handle, so a recreation seeded from the draft never matches, and the restore
+                    // spends its whole navigation-wait cap polling for a URL that will not arrive.
+                    // Same reason the loading listener reads the committed URL rather than the box.
                     browserService.createBrowser(
-                        BrowserConfig(url = urlBarText.text.ifBlank { initialUrl })
+                        BrowserConfig(
+                            // savedScroll's URL wins when there is one (see creationUrl above),
+                            // so the recreated handle lands on exactly the URL
+                            // awaitSettleAndApply is waiting for. Those are two different reads
+                            // otherwise - savedScroll.url comes from getCurrentUrl() on the OLD
+                            // handle, loadedUrl from the navigation listener - and any URL the
+                            // listener does not report (an in-page fragment navigation, if the
+                            // host's NavigationFinished does not fire for one) or that the server
+                            // normalises on reload leaves the restore polling its full cap for a
+                            // URL that never arrives. That is the fragment case
+                            // shouldAttemptRestore goes out of its way to preserve, lost one
+                            // layer down. Self-consistent by construction now.
+                            url = creationUrl,
+                        )
                     )
                 }.also { hoistedState.browserCreation = it }
             var handle = withTimeoutOrNull(BROWSER_CREATION_TIMEOUT_MS) { creation.await() }
@@ -2552,6 +2939,30 @@ internal fun FluckBrowserTabContent(
                     initMessage = it.initMessage
                 }
 
+                // Consumed once: a plain retry or crash-recovery on the SAME creation must not
+                // re-apply a scroll position from a previous life of this tab. Launched on
+                // coroutineScope (not this LaunchedEffect's own scope) so a tab switch away
+                // mid-restore does not cancel it - awaitSettleAndApply's own poll counts bound
+                // the navigation-wait and settle phases regardless, and RESTORE_CALL_TIMEOUT_MS
+                // bounds every individual call within them.
+                //
+                // Job stored on hoistedState so disposeBrowserHandleOffThread can await it before
+                // disposing this same handle - restore can run several seconds, and nothing
+                // previously stopped a fast-enough re-hibernation from disposing mid-restore.
+                hoistedState.savedScroll?.let { saved ->
+                    hoistedState.savedScroll = null
+                    // Cancel-before-overwrite, symmetric with installDirtyMarker and for the same
+                    // reason: a field that still has a job in it is a job nothing would join or
+                    // cancel again once the reference is gone. Hard to reach here (savedScroll is
+                    // consumed once, and releaseBrowserHandle cancels on the way out), so this is
+                    // the invariant made structural rather than a live bug being fixed.
+                    hoistedState.scrollRestoreJob?.cancel()
+                    val job = coroutineScope.launch { restoreScrollOnSettle(handle, saved) }
+                    hoistedState.scrollRestoreJob = job
+                    // See installDirtyMarker's identical pattern for why this is identity-checked.
+                    job.invokeOnCompletion { if (hoistedState.scrollRestoreJob === job) hoistedState.scrollRestoreJob = null }
+                }
+
                 // Register this tab+handle so the co-browse share server can enumerate
                 // and stream it. Re-registers under the same tabId on a recovery re-init.
                 if (tabId.isNotEmpty()) BrowserShareManager.registerTab(tabId, handle)
@@ -2563,14 +2974,46 @@ internal fun FluckBrowserTabContent(
                     pageTitle = HOME_TITLE
                     tabUpdateProvider?.updateTitle(HOME_TITLE)
                     tabUpdateProvider?.updateFavicon(null)
+                    // Home is "nothing loaded" as far as visiblePageUrl is concerned. This is the
+                    // only place that can say so: about:blank fires no navigation events, so
+                    // arriving at home cannot announce itself the way every other URL does, and
+                    // loadedUrl would otherwise keep pointing at the page before it.
+                    loadedUrl = ""
                 }
 
                 // A tab that opens directly on home (e.g. a restored dashboard tab)
                 // may never fire navigation events for about:blank — apply up front.
-                if (isHomeUrl(urlBarText.text)) applyHomeTabIdentity()
+                if (isHomeUrl(urlBarText.text)) {
+                    applyHomeTabIdentity()
+                } else if (loadedUrl.isBlank()) {
+                    // Seed for the same reason: the initial loadUrl is issued inside the handle's
+                    // constructor, so the navigation listener below can be registered after that
+                    // first navigation already finished and never hear about it. From the same
+                    // creationUrl the browser was actually given, not a second reading of the box.
+                    loadedUrl = creationUrl
+                }
+
+                // The dirty-typing marker rides navigation: installed now for the document already
+                // committed, and re-installed on every navigation event below. Idempotent per
+                // document (the property doubles as the install guard), and a new document arrives
+                // with the flag naturally cleared - so submit-and-navigate resets it for free.
+                // Keystroke-based, NOT a DOM diff; see DirtyInputMarker for the three withdrawn
+                // attempts that rule the DOM approach out.
+                installDirtyMarker(handle, coroutineScope, hoistedState)
 
                 // Add listeners - matches bundled browser exactly
                 handle.addNavigationListener { url ->
+                    // This handle may already have been released - hibernation nulls
+                    // browserHandle and then SUSPENDS in captureScrollOrNull, leaving Main free
+                    // while the old handle is still alive with this listener attached. A late
+                    // redirect or meta-refresh landing in that window would otherwise launch a
+                    // fresh installDirtyMarker job that is not in the released bundle, so nothing
+                    // joins it and its executeJavaScript can land during dispose() - the exact
+                    // race the job tracking exists to close. It would also write loadedUrl for a
+                    // handle the tab has given up, changing what the tab wakes onto.
+                    if (hoistedState.browserHandle !== handle) return@addNavigationListener
+                    installDirtyMarker(handle, coroutineScope, hoistedState)
+                    loadedUrl = url
                     // Only update URL bar if user isn't actively editing
                     // AND sufficient time has passed since last input (300ms buffer for Tab completion)
                     val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
@@ -2844,8 +3287,14 @@ internal fun FluckBrowserTabContent(
                         recoveryAttempts++
                         println("[FluckBrowser] Browser invalid, triggering recovery (attempt $recoveryAttempts/$maxRecoveryAttempts)")
 
-                        // Save current URL for recovery
-                        val currentUrl = urlBarText.text
+                        // The page the tab was ON, not the URL-bar draft. Deliberate, and worth
+                        // stating because visiblePageUrl changes what this line used to mean: a
+                        // renderer that crashes WHILE loading B now recovers to A rather than to
+                        // B, since loadedUrl only advances on NavigationFinished. Recovering onto
+                        // the page that was actually rendering is the safer of the two - the load
+                        // that crashed is the one least worth immediately repeating - and
+                        // recovery re-seeds loadedUrl below so the recreation agrees with it.
+                        val currentUrl = pageUrl
 
                         // Reset state to trigger reinitialization. Dispose the
                         // invalid handle too — even a crashed/stale handle still
@@ -2857,8 +3306,7 @@ internal fun FluckBrowserTabContent(
                         // so a stale `true` would strand the tab on FullscreenPlaceholder
                         // with an exit button that can't do anything. releaseBrowserHandle
                         // makes that structural rather than a line to remember here.
-                        hoistedState.releaseBrowserHandle()
-                        disposeBrowserHandleOffThread(handle)
+                        disposeReleasedHandle(hoistedState.releaseBrowserHandle())
                         // A recovery in progress belongs on the starting surface, not the error
                         // one: the tab is about to rebuild its browser by itself, and the retry
                         // below is what makes that true. `error` stays null so the rebuild can
@@ -2869,6 +3317,9 @@ internal fun FluckBrowserTabContent(
                         delay(100)
                         if (!isHomeUrl(currentUrl)) {
                             urlBarText = TextFieldValue(currentUrl, TextRange(currentUrl.length))
+                            // Both, so the recreation below resolves to this same URL rather than
+                            // to whatever loadedUrl held before the crash.
+                            loadedUrl = currentUrl
                         }
 
                         // Increment retry count to trigger LaunchedEffect
@@ -2876,8 +3327,7 @@ internal fun FluckBrowserTabContent(
                     } else {
                         // Max recovery attempts reached
                         error = "Browser recovery failed after $maxRecoveryAttempts attempts. Please close and reopen this tab."
-                        hoistedState.releaseBrowserHandle()
-                        disposeBrowserHandleOffThread(handle)
+                        disposeReleasedHandle(hoistedState.releaseBrowserHandle())
                     }
                     break
                 }
@@ -3152,10 +3602,53 @@ internal fun FluckBrowserTabContent(
                         return@launch
                     }
                     println("[FluckBrowser] Hibernating idle tab to release its renderer")
-                    val handle = hoistedState.releaseBrowserHandle()
-                    // Off the UI thread so hibernating a background tab can't hitch
-                    // the foreground UI.
-                    if (handle != null) disposeBrowserHandleOffThread(handle)
+                    // The jobs come back WITH the handle - see [ReleasedHandle] for why they
+                    // cannot correctly be fetched separately afterwards. This site cannot use
+                    // disposeReleasedHandle because it has to capture scroll off the live handle
+                    // first; it disposes by hand in the `finally` below, with the same list.
+                    val released = hoistedState.releaseBrowserHandle()
+                    val handle = released.handle
+                    if (handle != null) {
+                        try {
+                            // Sequenced ahead of dispose, not run concurrently with it in OUR
+                            // bookkeeping - executeJavaScript against a handle that is mid-dispose
+                            // is undefined JxBrowser behaviour. This ordering guarantees no
+                            // overlap ONLY when captureScrollOrNull's executeJavaScript call
+                            // returns within its own 1s timeout. withTimeoutOrNull abandons OUR
+                            // wait, not the underlying call - if the renderer is genuinely wedged
+                            // past 1s, the native call may still be running when
+                            // disposeBrowserHandleOffThread posts dispose() on a different thread.
+                            // busyState()'s own comment already admits the identical limitation
+                            // for its own executeJavaScript-with-timeout call, so this is a
+                            // pre-existing gap this diff participates in, not one it introduces or
+                            // worsens - fully closing it needs a host-side capability (an
+                            // abortable executeJavaScript, or a way to ask "no native call pending
+                            // on this handle") that this plugin cannot build alone.
+                            // captureScrollOrNull rethrows CancellationException (matching
+                            // busyState's own convention) rather than swallowing it - the `finally`
+                            // below is what guarantees dispose still runs when that happens.
+                            //
+                            // Written only if the tab has NOT already woken while this was
+                            // capturing (up to 1s): releaseBrowserHandle() already nulled
+                            // hoistedState.browserHandle, so a re-entry can adopt a brand new one
+                            // before this finishes. If it did, this capture belongs to a session
+                            // already over, and writing it would sit in savedScroll unconsumed
+                            // until the tab's NEXT, unrelated wake - where it would be silently
+                            // applied as if it belonged there.
+                            val captured = captureScrollOrNull(handle)
+                            if (hoistedState.browserHandle == null) {
+                                hoistedState.savedScroll = captured
+                            }
+                        } finally {
+                            // Off the UI thread so hibernating a background tab can't hitch
+                            // the foreground UI. In a finally so cancellation (tab re-entry,
+                            // right above in this same effect) can never skip disposal and leak
+                            // the handle - see the comment above. Awaits the jobs snapshotted
+                            // before release, not whatever hoistedState holds now - see
+                            // disposeBrowserHandleOffThread's KDoc for why that distinction matters.
+                            disposeBrowserHandleOffThread(handle, awaitJobs = released.pendingJobs)
+                        }
+                    }
                 }
             }
         }
@@ -3163,12 +3656,12 @@ internal fun FluckBrowserTabContent(
     // Keep the URL-bar star in sync with external collection edits — e.g. when the
     // user removes a bookmark from the bookmarks panel, isBookmarked must reflect that.
     val bookmarkCollections = bookmarkDataProvider?.collections?.collectAsState(initial = emptyList())?.value
-    LaunchedEffect(bookmarkCollections, currentUrl, pageTitle, bookmarkDataProvider) {
+    LaunchedEffect(bookmarkCollections, pageUrl, pageTitle, bookmarkDataProvider) {
         bookmarkDataProvider?.let { provider ->
             val tabConfig = ai.rever.boss.plugin.workspace.TabConfig(
                 type = "browser",
                 title = pageTitle,
-                url = currentUrl
+                url = pageUrl
             )
             isBookmarked = provider.isTabBookmarked(tabConfig)
         }
@@ -3262,6 +3755,7 @@ internal fun FluckBrowserTabContent(
         // system property (read inline so a recompose after toggling reflects it).
         val shareButtonEnabled = System.getProperty("boss.fluck.showShareButton") == "true"
         BrowserToolbar(
+            pageUrl = pageUrl,
             onShare = if (shareButtonEnabled) {
                 {
                     BrowserShareManager.share(tabId, shareMaskInputs)
@@ -3352,7 +3846,7 @@ internal fun FluckBrowserTabContent(
                     val tabConfig = TabConfig(
                         type = "browser",
                         title = pageTitle,
-                        url = currentUrl
+                        url = pageUrl
                     )
                     if (isBookmarked) {
                         // Remove bookmark
@@ -3448,7 +3942,7 @@ internal fun FluckBrowserTabContent(
             // with `if (browserHandle != null) return`. That was reachable - the old code could
             // show an error over a working browser - and it left Reset Tab as the only way out.
             // Dropping the handle here makes the button mean what it says in every state.
-            hoistedState.releaseBrowserHandle()?.let { disposeBrowserHandleOffThread(it) }
+            disposeReleasedHandle(hoistedState.releaseBrowserHandle())
             error = null
             initMessage = INITIALIZING_MESSAGE
             retryCount = 0
@@ -3690,7 +4184,7 @@ internal fun FluckBrowserTabContent(
                                     val tabConfig = TabConfig(
                                         type = "browser",
                                         title = pageTitle,
-                                        url = currentUrl
+                                        url = pageUrl
                                     )
                                     if (isBookmarked) {
                                         // Remove bookmark
@@ -5330,6 +5824,10 @@ private fun ShareLinkRow(label: String, url: String) {
 @Composable
 internal fun BrowserToolbar(
     urlBarText: TextFieldValue,
+    // The loaded page's URL, which equals urlBarText except while the user is mid-edit. Only the
+    // copy-link button reads it - everything else here is about the text box itself. See
+    // visiblePageUrl.
+    pageUrl: String,
     onUrlBarTextChange: (TextFieldValue) -> Unit,
     onNavigate: (String) -> Unit,
     canGoBack: Boolean,
@@ -5446,6 +5944,48 @@ internal fun BrowserToolbar(
                 tint = BossThemeColors.TextPrimary,
                 modifier = Modifier.size(18.dp)
             )
+        }
+
+        // Copy-link button, left of the URL bar. Mirrors ShareLinkRow's copy-feedback pattern
+        // (swap to a checkmark, revert after ~1.6s) so copying a link feels the same everywhere
+        // in this file. Copies pageUrl, not urlBarText.text: a copy-LINK affordance means "the
+        // page I am on", and mid-edit the text box holds a half-typed string instead. The
+        // bookmark paths at the call site read the same value, so the two agree.
+        run {
+            val clipboardManager = LocalClipboardManager.current
+            var urlCopied by remember { mutableStateOf(false) }
+            // Home has no link to copy - the dashboard is a surface, not a page, and its URL is
+            // blank or about:blank. Disabled rather than copying an empty string and showing the
+            // same green check-mark the successful case does, which would report a copy that did
+            // not happen. Greyed the way Back/Forward are, since an explicit tint overrides the
+            // content alpha IconButton would otherwise dim it with.
+            val copyable = !isHomeUrl(pageUrl)
+            LaunchedEffect(urlCopied) {
+                if (urlCopied) {
+                    delay(1600)
+                    urlCopied = false
+                }
+            }
+            IconButton(
+                onClick = {
+                    clipboardManager.setText(AnnotatedString(pageUrl))
+                    urlCopied = true
+                },
+                enabled = copyable,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = if (urlCopied) Icons.Filled.Check else Icons.Filled.Link,
+                    contentDescription = if (urlCopied) "Copied" else "Copy link",
+                    tint =
+                        when {
+                            urlCopied -> BossThemeColors.SuccessColor
+                            copyable -> BossThemeColors.TextPrimary
+                            else -> BossThemeColors.TextMuted
+                        },
+                    modifier = Modifier.size(18.dp)
+                )
+            }
         }
 
         // URL text field with bookmark star, zoom indicator, and autocomplete dropdown
