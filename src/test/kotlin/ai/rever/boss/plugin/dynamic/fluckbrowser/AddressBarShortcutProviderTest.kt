@@ -31,32 +31,27 @@ class AddressBarShortcutProviderTest {
     ) = AddressBarFocusRegistry.register(tabId, windowId, panelActive = true) { focused.add(tabId) }
 
     @Test
-    fun `the action id matches what the host requires of it`() {
+    fun `the action id has the shape the host requires`() {
         // Must be exactly "plugin.<pluginId>.<name>" or the host rejects the registration and the
-        // shortcut is silently lost. The id is a const and the plugin id is a separate literal,
-        // so this is what stops the two drifting. The host's keymap preset spells the same string
-        // out by hand (KeymapPresets.FLUCK_FOCUS_ADDRESS_BAR_ACTION) because it does not compile
-        // against this plugin, so a drift here also costs the binding.
+        // shortcut is silently lost. Drift between the id and the plugin id is now impossible -
+        // FOCUS_ADDRESS_BAR_ACTION is a const template over PLUGIN_ID - so this asserts the
+        // SHAPE, which the compiler cannot. The host's keymap preset spells the same string out
+        // by hand (KeymapPresets.FLUCK_FOCUS_ADDRESS_BAR_ACTION) because it does not compile
+        // against this plugin; that duplication is the one a test still has to carry.
         val plugin = FluckBrowserDynamicPlugin()
 
         assertEquals(
             "plugin.${plugin.pluginId}.focus_address_bar",
             FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION,
         )
-        assertTrue(FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION.startsWith("plugin."))
+        assertEquals(FluckBrowserDynamicPlugin.PLUGIN_ID, plugin.pluginId)
     }
 
     @Test
     fun `the action ships with no default binding, deliberately`() {
-        // A plugin default is GLOBAL in the host's v1 contract and is consumed whenever a
-        // provider owns the action, so a Cmd+L default here would shadow the host's
-        // EDITOR_GO_TO_LINE (also Cmd+L) and swallow it - the editor plugin opens Go To Line from
-        // its own key handling, so the chord has to reach it.
-        //
-        // The chord therefore lives in the host's keymap presets, bound to this action id with
-        // BROWSER context, which is the only layer where a context can be expressed. A host too
-        // old to carry that entry leaves Cmd+L alone rather than breaking Go To Line, which is
-        // what makes this safe to ship independently of the host.
+        // A GLOBAL Cmd+L default would swallow the editor's Go To Line; the chord lives in the
+        // host's keymap presets instead. The reasoning is spelled out once, on
+        // FluckBrowserDynamicPlugin.addressBarShortcuts - this pins the outcome.
         val spec = FluckBrowserDynamicPlugin().addressBarShortcuts.shortcuts().single()
 
         assertEquals(FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION, spec.actionId)

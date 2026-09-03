@@ -86,12 +86,24 @@ internal object AddressBarFocusRegistry {
         val now = System.currentTimeMillis()
         var log = false
         lastMissLogged.compute(key) { _, previous ->
-            // A clock stepping backwards errs toward logging.
-            log = previous == null || now - previous !in 0 until MISS_LOG_THROTTLE_MS
+            log = missLogDue(previous, now)
             if (log) now else previous
         }
         return log
     }
+
+    /**
+     * The throttle decision, split out of [shouldLogMiss] so it is assertable: the map access
+     * around it is only observable through `println`, and the rule inside it is not obvious.
+     *
+     * A never-logged key is always due. A clock stepping backwards (so the elapsed time is
+     * negative) reads as due rather than as "half a century of silence", which errs toward
+     * logging - the direction that costs a line rather than a diagnosis.
+     */
+    internal fun missLogDue(
+        previous: Long?,
+        now: Long,
+    ): Boolean = previous == null || now - previous !in 0 until MISS_LOG_THROTTLE_MS
 
     /**
      * Record that [tabId]'s address bar is composed in [windowId].
@@ -190,13 +202,16 @@ internal object AddressBarFocusRegistry {
      *
      * It does NOT hand the chord back. The host consumes it whenever a provider owns the action
      * (`onAction` returns Unit, so `dispatch` reports success however this answers), so declining
-     * makes Cmd+L a no-op there rather than an editor's Go To Line. What actually protects Go To
-     * Line is the host preset binding this action with `context = BROWSER`, so the chord is not
-     * dispatched to us at all while the user is in an editor — see [focusActiveIn]. This refusal
-     * is what covers the case that scoping cannot: an action rebound to a globally-scoped chord.
+     * makes Cmd+L a no-op there rather than an editor's Go To Line. What protects the editor is
+     * the host preset's `context = BROWSER` — see `FluckBrowserDynamicPlugin.addressBarShortcuts`
+     * for why the binding lives there, which is the one place that reasoning is spelled out. This
+     * refusal covers the case scoping cannot: the action rebound to a globally-scoped chord.
      *
-     * Among the remaining candidates the most recently composed wins: the browser tab the user
-     * most recently brought to the front.
+     * Among the remaining candidates the highest [Entry.sequence] wins. That is "most recently
+     * registered", which is not quite "most recently composed": the registration effect is keyed
+     * on panel-active too, so a panel gaining or losing focus re-registers with a fresh sequence.
+     * Both orderings answer "the toolbar the user most recently brought to the front", which is
+     * the question — and the panel filter above has already removed everything else.
      *
      * **Why `panelActive` alone is enough, though the host's equivalent registry needed a
      * main-panel rank above it.** `LocalIsPanelActive` defaults to `true`, so a surface composed

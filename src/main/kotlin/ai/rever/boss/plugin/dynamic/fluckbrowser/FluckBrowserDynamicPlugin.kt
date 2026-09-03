@@ -17,7 +17,7 @@ import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
  * PRIVATE: This plugin is proprietary and not open source.
  */
 class FluckBrowserDynamicPlugin : DynamicPlugin {
-    override val pluginId: String = "ai.rever.boss.plugin.dynamic.fluckbrowser"
+    override val pluginId: String = PLUGIN_ID
     override val displayName: String = "Fluck Browser"
     override val version: String = "1.0.16"
     override val description: String = "Full-featured embedded web browser tab with zoom, downloads, and secret integration"
@@ -56,7 +56,14 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
      * the binding lives in the host presets. The four locally handled chords are the older
      * pattern, not the target; do not "simplify" this into one.
      */
-    internal val addressBarShortcuts =
+    /**
+     * Lazy, not eager, and that is load-bearing rather than a style choice: an eagerly
+     * initialised property is constructed in the CONSTRUCTOR, so a host whose api lacks
+     * `ShortcutActionProvider` would fail with `NoClassDefFoundError` at plugin instantiation -
+     * outside the runCatching in [register] that exists to keep a keyboard convenience from
+     * costing the tab type. First touched inside that guard, the guard is real.
+     */
+    internal val addressBarShortcuts: ShortcutActionProvider by lazy {
         object : ShortcutActionProvider {
             override val providerId: String = pluginId
 
@@ -108,6 +115,7 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
                 AddressBarFocusRegistry.focusActiveIn(windowId)
             }
         }
+    }
 
     override fun register(context: PluginContext) {
         pluginContext = context
@@ -168,7 +176,16 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
     }
 
     companion object {
-        /** Must be `plugin.<pluginId>.<name>`; the host rejects anything else. */
-        const val FOCUS_ADDRESS_BAR_ACTION = "plugin.ai.rever.boss.plugin.dynamic.fluckbrowser.focus_address_bar"
+        const val PLUGIN_ID = "ai.rever.boss.plugin.dynamic.fluckbrowser"
+
+        /**
+         * Must be `plugin.<pluginId>.<name>`; the host rejects anything else.
+         *
+         * Built from [PLUGIN_ID] rather than spelled out, so the two cannot drift - a `const`
+         * template over another `const` is still a compile-time constant, which is what the host
+         * and the annotation-free api need it to be. The host's keymap preset duplicates this
+         * string by hand and genuinely cannot be compiled against; that one stays a test.
+         */
+        const val FOCUS_ADDRESS_BAR_ACTION = "plugin.$PLUGIN_ID.focus_address_bar"
     }
 }

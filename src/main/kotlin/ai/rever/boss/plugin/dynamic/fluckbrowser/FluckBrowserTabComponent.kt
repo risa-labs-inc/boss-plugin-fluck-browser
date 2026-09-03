@@ -63,7 +63,6 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -3065,12 +3064,17 @@ internal fun FluckBrowserTabContent(
                     // handle the tab has given up, changing what the tab wakes onto.
                     if (hoistedState.browserHandle !== handle) return@addNavigationListener
                     installDirtyMarker(handle, coroutineScope, hoistedState)
+                    // Captured BEFORE loadedUrl moves on: "has the user typed anything" is the
+                    // field measured against the URL the bar is currently SHOWING, not against
+                    // the one we are about to navigate to.
+                    val shownUrl = loadedUrl
                     loadedUrl = url
                     // Only update URL bar while the user does not own the field - which is
                     // also what keeps Cmd+L's selection alive on a still-loading page.
                     if (AddressBarUrlField.navigationMayRewrite(
                             isUserEditing = isUserEditingUrl,
                             msSinceUserEdit = System.currentTimeMillis() - lastUserEditTime,
+                            fieldHoldsUnmodifiedUrl = urlBarText.text == shownUrl,
                         )
                     ) {
                         urlBarText = TextFieldValue(url, TextRange(url.length))
@@ -5934,9 +5938,6 @@ internal fun BrowserToolbar(
     addressBarFocusRequester: FocusRequester = remember { FocusRequester() }
 ) {
     val coroutineScope = rememberCoroutineScope()
-    // Escape hands the field back; there is nowhere better to send focus, since the page is a
-    // native surface the plugin cannot focus directly.
-    val focusManager = LocalFocusManager.current
     // Auto-scroll to selected suggestion when using arrow keys
     LaunchedEffect(selectedDropdownIndex) {
         if (selectedDropdownIndex >= 0 && urlSuggestions.isNotEmpty()) {
@@ -6161,9 +6162,16 @@ internal fun BrowserToolbar(
                                 // field claimed (isUserEditingUrl), and a claimed field stops the
                                 // navigation listener updating the bar until focus happens to move
                                 // away. Cmd+L made that reachable without typing anything.
+                                //
+                                // Focus deliberately STAYS in the field, which is what Chrome and
+                                // Firefox do - Escape reverts the text and leaves you able to
+                                // retype. Clearing it would also send focus nowhere in particular
+                                // (the page is a native surface this plugin cannot focus), and the
+                                // tab's own onPreviewKeyEvent hangs off a non-focusable Column, so
+                                // dropping focus to the root risks taking Cmd+R and the zoom
+                                // chords out of the dispatch path.
                                 onDismissSuggestions()
                                 onCancelUrlEditing()
-                                focusManager.clearFocus()
                                 true
                             }
                             else -> false

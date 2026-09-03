@@ -21,6 +21,22 @@ internal object AddressBarUrlField {
     const val USER_EDIT_GRACE_MS = 300L
 
     /**
+     * How long an UNTYPED claim survives before a navigation may write through it.
+     *
+     * The claim has no other expiry. Enter, picking a suggestion, and Escape all release it, and
+     * so does losing focus - but only if a focus-changed event actually arrives, which a click
+     * into the native page surface may not produce on Windows/Linux HARDWARE_ACCELERATED. Cmd+L
+     * takes the claim on a keystroke that types nothing, so "claim it, then click the page"
+     * would otherwise stop the URL bar following navigations for the life of the tab.
+     *
+     * Bounded rather than released outright, and gated on nothing having been typed, because
+     * those are the two things that keep it from undoing the other two rules here: Cmd+L's
+     * selection needs protecting for seconds, not a minute, and text the user actually typed is
+     * never discarded however long it has sat there.
+     */
+    const val UNTYPED_CLAIM_STALE_MS = 60_000L
+
+    /**
      * Whether a navigation callback may replace the field's contents with the page's URL.
      *
      * False while the user owns the field, which is what Cmd+L relies on. The focus callback sets
@@ -29,13 +45,26 @@ internal object AddressBarUrlField {
      * the field keeps focus — which would leave the next keystroke appending to the URL instead of
      * replacing it, exactly what selecting it exists to prevent.
      *
+     * The one way through a standing claim is [UNTYPED_CLAIM_STALE_MS]: an old claim over text the
+     * user never changed is an abandoned one, not an active edit.
+     *
      * @param msSinceUserEdit now minus the last user edit. Negative or absurd values (a clock
      *   step) simply read as "recent", which errs toward leaving the user's text alone.
+     * @param fieldHoldsUnmodifiedUrl whether the field still reads exactly as the URL the bar was
+     *   last showing, i.e. nothing has been typed into it. Cmd+L selects the text but changes
+     *   none of it, so this stays true through a claim the user has walked away from.
      */
     fun navigationMayRewrite(
         isUserEditing: Boolean,
         msSinceUserEdit: Long,
-    ): Boolean = !isUserEditing && msSinceUserEdit > USER_EDIT_GRACE_MS
+        fieldHoldsUnmodifiedUrl: Boolean,
+    ): Boolean =
+        when {
+            // Nothing typed and nothing touched in a minute: the claim is stale, not active.
+            fieldHoldsUnmodifiedUrl && msSinceUserEdit > UNTYPED_CLAIM_STALE_MS -> true
+            isUserEditing -> false
+            else -> msSinceUserEdit > USER_EDIT_GRACE_MS
+        }
 
     /**
      * [current] with its whole text selected, the way every browser's Cmd+L leaves the field.

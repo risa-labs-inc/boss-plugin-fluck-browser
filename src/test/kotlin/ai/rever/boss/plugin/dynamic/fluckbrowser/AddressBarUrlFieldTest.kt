@@ -24,6 +24,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = false,
                 msSinceUserEdit = AddressBarUrlField.USER_EDIT_GRACE_MS + 1,
+                fieldHoldsUnmodifiedUrl = true,
             ),
         )
     }
@@ -35,6 +36,7 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = true,
                 msSinceUserEdit = 10_000,
+                fieldHoldsUnmodifiedUrl = false,
             ),
             "a field the user owns must not be rewritten however long ago they last typed",
         )
@@ -48,11 +50,16 @@ class AddressBarUrlFieldTest {
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = false,
                 msSinceUserEdit = AddressBarUrlField.USER_EDIT_GRACE_MS,
+                fieldHoldsUnmodifiedUrl = false,
             ),
             "the grace window is exclusive at its own boundary",
         )
         assertFalse(
-            AddressBarUrlField.navigationMayRewrite(isUserEditing = false, msSinceUserEdit = 0),
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = false,
+                msSinceUserEdit = 0,
+                fieldHoldsUnmodifiedUrl = false,
+            ),
         )
     }
 
@@ -61,7 +68,11 @@ class AddressBarUrlFieldTest {
         // System.currentTimeMillis() is wall-clock and can move; erring toward "the user was just
         // typing" only ever declines to overwrite their text.
         assertFalse(
-            AddressBarUrlField.navigationMayRewrite(isUserEditing = false, msSinceUserEdit = -5_000),
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = false,
+                msSinceUserEdit = -5_000,
+                fieldHoldsUnmodifiedUrl = false,
+            ),
         )
     }
 
@@ -84,7 +95,11 @@ class AddressBarUrlFieldTest {
         assertEquals("https://example.com/page", restored.text)
         assertEquals(TextRange(24), restored.selection, "caret at the end, nothing selected")
         assertTrue(
-            AddressBarUrlField.navigationMayRewrite(isUserEditing = false, msSinceUserEdit = System.currentTimeMillis()),
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = false,
+                msSinceUserEdit = System.currentTimeMillis(),
+                fieldHoldsUnmodifiedUrl = true,
+            ),
             "with the claim released and lastUserEditTime reset to 0, navigations track again",
         )
     }
@@ -96,6 +111,57 @@ class AddressBarUrlFieldTest {
 
         assertEquals("", restored.text)
         assertEquals(TextRange(0), restored.selection)
+    }
+
+    @Test
+    fun `an untyped claim nobody has touched in a minute stops blocking navigations`() {
+        // Escape is not the only way out of a Cmd+L the user changed their mind about: clicking
+        // into the page is the other, and that only releases the claim if a focus-changed event
+        // arrives, which Windows/Linux HARDWARE_ACCELERATED may not produce. Without this bound
+        // the URL bar silently stops following navigations for the life of the tab.
+        assertTrue(
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = true,
+                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
+                fieldHoldsUnmodifiedUrl = true,
+            ),
+        )
+        assertFalse(
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = true,
+                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS,
+                fieldHoldsUnmodifiedUrl = true,
+            ),
+            "exclusive at its own boundary, like the grace window",
+        )
+    }
+
+    @Test
+    fun `text the user actually typed is never discarded, however stale`() {
+        // The gate that keeps the staleness bound from becoming a data-loss bug: someone who
+        // types a long URL and is interrupted for an hour still finds it there, because the
+        // bound only ever releases a claim over text nothing has changed.
+        assertFalse(
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = true,
+                msSinceUserEdit = 60L * 60 * 1000,
+                fieldHoldsUnmodifiedUrl = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `Cmd+L's selection still survives a navigation seconds later`() {
+        // The bound must not undo the rule it sits next to. A redirect landing a few seconds
+        // after Cmd+L is the original bug: the field is claimed, unmodified, and must keep its
+        // selection. Seconds, not a minute, is the window that matters here.
+        assertFalse(
+            AddressBarUrlField.navigationMayRewrite(
+                isUserEditing = true,
+                msSinceUserEdit = 5_000,
+                fieldHoldsUnmodifiedUrl = true,
+            ),
+        )
     }
 
     @Test
