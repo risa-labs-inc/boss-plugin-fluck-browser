@@ -166,7 +166,9 @@ private fun AddressBarRegistration(
     if (windowId == null) {
         // Say so once per reason, rather than leaving this tab silently unable to answer Cmd+L.
         // An effect, not a bare call: a composable body re-runs on every recomposition.
-        DisposableEffect(windowId) {
+        // Unit, not windowId: it is statically null in this branch, so keying on it would imply
+        // a variation that cannot happen.
+        DisposableEffect(Unit) {
             AddressBarFocusRegistry.noteUnregisterable(tabId, "the host reported no window id")
             onDispose {}
         }
@@ -4069,12 +4071,16 @@ internal fun FluckBrowserTabContent(
                 val releasing = claimGeneration.get()
                 coroutineScope.launch {
                     delay(200)
-                    showUrlSuggestions = false
-                    // Only release the claim this job was scheduled for. Cmd+L (or a keystroke)
-                    // inside the 200ms takes a NEW claim, and clearing that one would undo the
-                    // claim-before-select ordering: the next navigation would rewrite the field
-                    // with a collapsed selection while it still held focus.
+                    // Only release the claim this job was scheduled for, and that covers the
+                    // DROPDOWN too - the check used to sit one line below, so a user who clicked
+                    // away and came straight back to type had the freshly computed dropdown
+                    // blanked by the outgoing job before it noticed the claim was no longer its
+                    // own. Cmd+L (or a keystroke) inside the 200ms takes a NEW claim, and
+                    // clearing that one would also undo the claim-before-select ordering: the
+                    // next navigation would rewrite the field with a collapsed selection while it
+                    // still held focus.
                     if (claimGeneration.get() != releasing) return@launch
+                    showUrlSuggestions = false
                     isUserEditingUrl = false
                     typedSinceClaim = false
                     // lastUserEditTime is deliberately LEFT ALONE, unlike the other release

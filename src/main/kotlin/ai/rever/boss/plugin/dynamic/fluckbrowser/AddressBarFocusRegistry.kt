@@ -72,14 +72,16 @@ internal object AddressBarFocusRegistry {
     private val sequencer = AtomicLong(0)
 
     /**
-     * Last time each miss reason was logged, keyed by reason AND window, on [System.nanoTime].
+     * Last time each miss reason was logged, keyed by reason alone, on [System.nanoTime].
      *
      * Throttled rather than one-shot: a user who rebinds this action to a GLOBAL chord would get
      * a line every time they pressed it anywhere in the app, but a latch that never reopens keeps
      * only the FIRST miss for the life of the JVM — and since the message names the window, that
      * one line would be about whichever window happened to miss first. Neither extreme is any use
-     * for diagnosing "Cmd+L did nothing" from a user's log. Per-window keys plus a window of
-     * silence keep one line per distinct problem.
+     * for diagnosing "Cmd+L did nothing" from a user's log. A key per REASON plus a window of
+     * silence keeps one line per distinct problem without an unbounded key space: this object
+     * outlives every tab and window (`canUnload: false`), so anything keyed on one accumulates
+     * for the life of the process. The specific tab or window is named in the message instead.
      */
     private val lastMissLogged = ConcurrentHashMap<String, Long>()
 
@@ -172,7 +174,10 @@ internal object AddressBarFocusRegistry {
         }
         val target = selectFocusTarget(entries, windowId)
         if (target == null) {
-            if (shouldLogMiss("no-toolbar:$windowId")) {
+            // Keyed on the reason, not the window - one permanent entry per window id ever seen
+            // is the same shape noteUnregisterable rejects for tabs, only slower to accumulate.
+            // The window is still named in the line.
+            if (shouldLogMiss("no-toolbar")) {
                 println("[FluckBrowser] Cmd+L ignored: no browser toolbar in the active panel of $windowId")
             }
             return false

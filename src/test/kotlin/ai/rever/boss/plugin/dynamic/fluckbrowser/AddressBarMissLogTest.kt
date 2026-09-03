@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -15,6 +17,15 @@ import kotlin.test.assertTrue
  * first, since the message names one).
  */
 class AddressBarMissLogTest {
+    // The same hooks AddressBarFocusRegistryTest and AddressBarShortcutProviderTest use. The
+    // registry is a process-global singleton, so a class that touches it and does not reset is
+    // relying on being the only one - cheap insurance for whenever maxParallelForks shows up.
+    @BeforeTest
+    @AfterTest
+    fun reset() {
+        AddressBarFocusRegistry.clear()
+    }
+
     @Test
     fun `a miss never logged before is always due`() {
         assertTrue(AddressBarFocusRegistry.missLogDue(previous = null, now = 0))
@@ -50,15 +61,12 @@ class AddressBarMissLogTest {
         // The path that makes "Cmd+L never works in this tab" diagnosable. Keyed on the reason
         // rather than the tab so a long session cannot accumulate one permanent throttle entry
         // per tab - this plugin has canUnload:false, so permanent means the whole process.
-        AddressBarFocusRegistry.clear()
-
         AddressBarFocusRegistry.noteUnregisterable("tab-1", "the host reported no window id")
         AddressBarFocusRegistry.noteUnregisterable("tab-2", "the host reported no window id")
         AddressBarFocusRegistry.noteUnregisterable("", "the tab has no id")
 
         // Two distinct reasons, however many tabs hit them.
         assertEquals(2, AddressBarFocusRegistry.throttleKeyCount())
-        AddressBarFocusRegistry.clear()
     }
 
     @Test

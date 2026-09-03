@@ -57,6 +57,39 @@ class AddressBarWiringSourceTest {
     /** [code] with every run of whitespace squeezed to one space, so layout stops mattering. */
     private fun normalised(code: String): String = code.replace(Regex("""\s+"""), " ")
 
+    /**
+     * The braced block that follows [anchor], found by counting braces to the match.
+     *
+     * Neither `substringBefore("},")` nor a character budget: the first is coupled to ktlint's
+     * brace placement rather than to the code, and the second silently reads into whatever comes
+     * next when a block grows. Returns "" if the anchor is absent, so the assertion fails on its
+     * own message rather than on an exception.
+     */
+    private fun blockAfter(
+        anchor: String,
+        code: String,
+    ): String {
+        // The first occurrence is not necessarily the one wanted: `AddressBarRegistration(`
+        // matches its own `private fun` declaration before it matches the call. Skip declarations
+        // rather than trusting declaration order, which is exactly the fragility this replaced.
+        val at =
+            generateSequence(code.indexOf(anchor)) { previous ->
+                code.indexOf(anchor, previous + 1).takeIf { it >= 0 }
+            }.takeWhile { it >= 0 }
+                .firstOrNull { !code.substring(maxOf(0, it - 40), it).contains("fun ") }
+                ?: return ""
+        val open = code.indexOf('{', at)
+        if (open < 0) return ""
+        var depth = 0
+        for (i in open until code.length) {
+            when (code[i]) {
+                '{' -> depth++
+                '}' -> if (--depth == 0) return code.substring(open + 1, i)
+            }
+        }
+        return ""
+    }
+
     private fun tabComponentCode(): String {
         val root = assertNotNull(repoRoot(), "could not locate the plugin root")
         val file = File(root, "src/main/kotlin/ai/rever/boss/plugin/dynamic/fluckbrowser/FluckBrowserTabComponent.kt")
@@ -187,14 +220,17 @@ class AddressBarWiringSourceTest {
         // dropdown instead of releasing the claim, Enter navigated to a suggestion computed from
         // the pre-Cmd+L text, and the arrow keys walked a list that no longer matched the field.
         val code = tabComponentCode()
-        val callback = code.substringAfter("claimGeneration.incrementAndGet()").substringBefore("selectAll(")
+        // Anchored on AddressBarRegistration, not on the first `claimGeneration.incrementAndGet()`
+        // - there are two of those (here and onUrlBarTextChange) and "first" is only the right
+        // one by declaration order.
+        val callback = normalised(blockAfter("AddressBarRegistration(", code))
 
         assertTrue(
-            callback.contains(Regex("""showUrlSuggestions\s*=\s*false""")),
+            callback.contains("showUrlSuggestions = false"),
             "Cmd+L no longer closes a stale dropdown - the two-stage Escape needs two presses",
         )
         assertTrue(
-            callback.contains(Regex("""autocompleteSuggestion\s*=\s*null""")),
+            callback.contains("autocompleteSuggestion = null"),
             "Cmd+L leaves a stale inline completion - Enter would navigate to the wrong URL",
         )
     }
@@ -209,7 +245,7 @@ class AddressBarWiringSourceTest {
         // Whitespace-normalised region rather than a one-line regex: this condition is free to
         // move and rewrap, and each of its three terms guards a different failure. An exact-source
         // match would break on a reformat AND missed the isUserEditingUrl term when it was added.
-        val cancel = normalised(code.substringAfter("onCancelUrlEditing = {").substringBefore("},"))
+        val cancel = normalised(blockAfter("onCancelUrlEditing =", code))
 
         assertTrue(
             cancel.contains("isUserEditingUrl &&"),
