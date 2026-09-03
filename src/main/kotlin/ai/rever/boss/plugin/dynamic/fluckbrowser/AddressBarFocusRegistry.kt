@@ -129,9 +129,12 @@ internal object AddressBarFocusRegistry {
     /**
      * Drops every registration. Called on plugin dispose, and by tests between cases.
      *
-     * This object is a process-global singleton, so a test that registers anything MUST clear
-     * (see `AddressBarFocusRegistryTest`'s `@BeforeTest`/`@AfterTest`) or it leaks entries into
-     * whatever runs next. Resets the one-shot log latches for the same reason.
+     * This object is a process-global singleton, so a test that registers anything MUST clear or
+     * it leaks entries into whatever runs next — `AddressBarFocusRegistryTest` and
+     * `AddressBarShortcutProviderTest` both do, in `@BeforeTest`/`@AfterTest`. Safe because the
+     * build runs test classes sequentially (no `maxParallelForks`); a parallel runner would need
+     * the registry injected rather than reached as a singleton. Resets the one-shot log latches
+     * for the same reason.
      */
     fun clear() {
         entries.clear()
