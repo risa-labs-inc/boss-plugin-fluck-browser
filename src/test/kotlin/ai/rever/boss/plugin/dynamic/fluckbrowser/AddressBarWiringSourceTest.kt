@@ -54,6 +54,9 @@ class AddressBarWiringSourceTest {
             .map { it.groupValues[1] }
             .toList()
 
+    /** [code] with every run of whitespace squeezed to one space, so layout stops mattering. */
+    private fun normalised(code: String): String = code.replace(Regex("""\s+"""), " ")
+
     private fun tabComponentCode(): String {
         val root = assertNotNull(repoRoot(), "could not locate the plugin root")
         val file = File(root, "src/main/kotlin/ai/rever/boss/plugin/dynamic/fluckbrowser/FluckBrowserTabComponent.kt")
@@ -178,16 +181,48 @@ class AddressBarWiringSourceTest {
     }
 
     @Test
+    fun `Cmd+L clears the dropdown state it invalidates`() {
+        // The two-stage Escape leans on "Cmd+L opens no dropdown", which is only true if Cmd+L
+        // also CLOSES one left over from typing. Without this, the first Escape dismissed a stale
+        // dropdown instead of releasing the claim, Enter navigated to a suggestion computed from
+        // the pre-Cmd+L text, and the arrow keys walked a list that no longer matched the field.
+        val code = tabComponentCode()
+        val callback = code.substringAfter("claimGeneration.incrementAndGet()").substringBefore("selectAll(")
+
+        assertTrue(
+            callback.contains(Regex("""showUrlSuggestions\s*=\s*false""")),
+            "Cmd+L no longer closes a stale dropdown - the two-stage Escape needs two presses",
+        )
+        assertTrue(
+            callback.contains(Regex("""autocompleteSuggestion\s*=\s*null""")),
+            "Cmd+L leaves a stale inline completion - Enter would navigate to the wrong URL",
+        )
+    }
+
+    @Test
     fun `Escape does not blank or collapse a field with nothing to revert`() {
         // The guard standing between Escape and a blanked address bar on a home tab, where
         // loadedUrl is deliberately "". Compose-side, so no unit test reaches it, and it is the
         // only thing making restoreTo safe to call from there.
         val code = tabComponentCode()
 
+        // Whitespace-normalised region rather than a one-line regex: this condition is free to
+        // move and rewrap, and each of its three terms guards a different failure. An exact-source
+        // match would break on a reformat AND missed the isUserEditingUrl term when it was added.
+        val cancel = normalised(code.substringAfter("onCancelUrlEditing = {").substringBefore("},"))
+
         assertTrue(
-            code.contains(Regex("""loadedUrl\.isNotBlank\(\)\s*&&\s*urlBarText\.text\s*!=\s*loadedUrl""")),
-            "Escape can now blank the bar on a home tab, or collapse the selection on a field " +
-                "that already reads as the loaded URL",
+            cancel.contains("isUserEditingUrl &&"),
+            "the revert is no longer confined to an edit the user started - it will fire " +
+                "mid-navigation and put the previous page's URL back until the load commits",
+        )
+        assertTrue(
+            cancel.contains("loadedUrl.isNotBlank()"),
+            "Escape can now blank the bar on a home tab, where loadedUrl is deliberately empty",
+        )
+        assertTrue(
+            cancel.contains("urlBarText.text != loadedUrl"),
+            "Escape now collapses the selection on a field that already reads as the loaded URL",
         )
     }
 

@@ -52,6 +52,16 @@ internal object AddressBarFocusRegistry {
     /**
      * Every composed toolbar, held by identity rather than keyed by tab id.
      *
+     * **What an entry retains.** The `focus` lambda closes over the tab's composition - which
+     * reaches `hoistedState`, and through it the live JxBrowser handle - and this object is a
+     * process-global singleton in a plugin with `canUnload: false`. Compose pairs every
+     * `DisposableEffect` with its `onDispose` and [clear] runs on plugin dispose, so entries are
+     * bounded by composed toolbars in practice. But there is no cap and no weak reference: ONE
+     * missed dispose retains a Chromium-backed state object for the life of the process rather
+     * than the life of a tab. A `WeakReference` to the callback would make that structural, at
+     * the cost of the identity keying's tidiness - worth revisiting if this ever holds anything
+     * heavier than a toolbar.
+     *
      * Keying by tab id would ask a question this registry cannot answer - whether the host can
      * ever compose one tab in two panels at once - and would silently drop one of the two
      * toolbars if it ever could. Identity makes that a non-question, and [unregister] already
@@ -167,10 +177,12 @@ internal object AddressBarFocusRegistry {
             }
             return false
         }
-        // Catches Throwable, which is deliberate for the same reason the host's plugin dispatch
-        // does: this runs inside the host's key-event dispatch, and letting anything escape would
-        // take out the whole keyboard path rather than one chord.
-        return runCatching { target.focus() }
+        // Exception, NOT Throwable. Containment is the point - this runs inside the host's
+        // key-event dispatch, and letting a bad chord take out the whole keyboard path would be
+        // far worse than one dead shortcut - but `runCatching` would also swallow an
+        // OutOfMemoryError or a LinkageError into a quiet `false` plus one throttled line, and a
+        // VM error is exactly what should reach the host's own guard and the logs.
+        return runCatchingException { target.focus() }
             .onFailure {
                 // Throttled like the two miss paths above, and for the same reason: this is the
                 // path a hibernated tab or a future toolbar gate takes, and it repeats on every
@@ -203,6 +215,17 @@ internal object AddressBarFocusRegistry {
             println("[FluckBrowser] Cmd+L unavailable for tab ${tabId.ifEmpty { "<no id>" }}: $reason")
         }
     }
+
+    /**
+     * [runCatching] narrowed to [Exception], because that stdlib function is Throwable-wide by
+     * definition and there is no variant that is not.
+     */
+    private inline fun runCatchingException(block: () -> Unit): Result<Unit> =
+        try {
+            Result.success(block())
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
 
     /** Test seam: how many toolbars are currently registered. */
     fun size(): Int = entries.size

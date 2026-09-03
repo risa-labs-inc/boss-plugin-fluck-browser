@@ -150,6 +150,11 @@ private fun AddressBarRegistration(
     focusRequester: FocusRequester,
     onFocus: () -> Unit,
 ) {
+    // The effect keys on (tabId, windowId, panelActive) but CAPTURES onFocus, which is a fresh
+    // lambda every recomposition. Safe today only because everything that lambda touches is a
+    // remembered MutableState or lives on hoistedState - an argument about the caller, not about
+    // this code. One line makes the effect independent of it.
+    val currentOnFocus by rememberUpdatedState(onFocus)
     // A plain call, not a snapshot state read, and used as a DisposableEffect key: a window id
     // that changed WITHOUT a recomposition would leave a stale entry. Safe only because a tab
     // changing windows rebuilds this composition (the same fact the registry's identity keying is
@@ -190,7 +195,7 @@ private fun AddressBarRegistration(
                 // frame) and any future change that gates the toolbar, which is why the throw is
                 // caught rather than assumed away.
                 focusRequester.requestFocus()
-                onFocus()
+                currentOnFocus()
             }
         onDispose { AddressBarFocusRegistry.unregister(token) }
     }
@@ -2724,26 +2729,9 @@ internal fun FluckBrowserTabContent(
     val claimGeneration = remember { AtomicLong(0) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
 
-    // Cmd+L. Declared BELOW isUserEditingUrl/lastUserEditTime deliberately: the focus callback
-    // has to set them, so it cannot be declared above them.
+    // Handed to BrowserToolbar far below; the registration that focuses it is further down,
+    // after the state its callback writes.
     val addressBarFocusRequester = remember { FocusRequester() }
-    AddressBarRegistration(
-        tabId = tabId,
-        focusRequester = addressBarFocusRequester,
-    ) {
-        // Claim the field BEFORE selecting it, or the navigation listener below wipes the
-        // selection - see AddressBarUrlField.navigationMayRewrite, which is the predicate that
-        // listener asks.
-        isUserEditingUrl = true
-        lastUserEditTime = System.currentTimeMillis()
-        // Cmd+L is an explicit "I am replacing this" gesture - it selects the whole field - so
-        // the claim it takes is a FRESH one even over a draft. That is what lets an abandoned
-        // Cmd+L go stale; see UNTYPED_CLAIM_STALE_MS for the promise this does and does not make.
-        typedSinceClaim = false
-        claimGeneration.incrementAndGet()
-
-        urlBarText = AddressBarUrlField.selectAll(urlBarText)
-    }
     val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
     val handlePopupNavigation: (PopupNavigation) -> Unit = { navigation ->
         val body = navigation.postData
@@ -2809,6 +2797,37 @@ internal fun FluckBrowserTabContent(
     var urlSuggestions by remember { mutableStateOf<List<UrlHistoryEntry>>(emptyList()) }
     var autocompleteSuggestion by remember { mutableStateOf<String?>(null) }
     var selectedDropdownIndex by remember { mutableStateOf(-1) }
+
+    // Cmd+L. Declared DOWN HERE deliberately, not next to the requester above: the focus
+    // callback writes isUserEditingUrl, lastUserEditTime, typedSinceClaim AND the three
+    // dropdown fields, so it cannot be declared above the last of them.
+    AddressBarRegistration(
+        tabId = tabId,
+        focusRequester = addressBarFocusRequester,
+    ) {
+        // Claim the field BEFORE selecting it, or the navigation listener below wipes the
+        // selection - see AddressBarUrlField.navigationMayRewrite, which is the predicate that
+        // listener asks.
+        isUserEditingUrl = true
+        lastUserEditTime = System.currentTimeMillis()
+        // Cmd+L is an explicit "I am replacing this" gesture - it selects the whole field - so
+        // the claim it takes is a FRESH one even over a draft. That is what lets an abandoned
+        // Cmd+L go stale; see UNTYPED_CLAIM_STALE_MS for the promise this does and does not make.
+        typedSinceClaim = false
+        claimGeneration.incrementAndGet()
+
+        // Clear the dropdown trio, like every other path that resets the claim (submit,
+        // suggestion selected, history click). Cmd+L over a half-typed query used to leave all
+        // three standing, which broke three things at once: the first Escape dismissed the stale
+        // dropdown instead of releasing the claim (so the two-stage design needed two presses to
+        // do what it promises in one), Enter navigated to a suggestion computed from the text
+        // BEFORE Cmd+L, and the arrow keys walked a dropdown that no longer matched the field.
+        showUrlSuggestions = false
+        autocompleteSuggestion = null
+        selectedDropdownIndex = -1
+
+        urlBarText = AddressBarUrlField.selectAll(urlBarText)
+    }
     val dropdownListState = rememberLazyListState()
 
     // Context-menu state lives on hoistedState (see FluckBrowserTabState) — it is written
@@ -4013,14 +4032,22 @@ internal fun FluckBrowserTabContent(
                 // Reset explicitly rather than leaning on the 200ms onFocusLost path: that only
                 // runs if a focus-changed event actually arrives, and on Windows/Linux
                 // HARDWARE_ACCELERATED a click into the native page surface may not produce one.
-                // Only rewrite when there is something to revert TO, and something to revert.
+                // Only rewrite when there is an edit to abandon, something to revert TO, and
+                // something to revert.
+                //
+                // isUserEditingUrl first, because "the user is editing" is what this branch is
+                // FOR: the submit path writes the resolved URL into the bar immediately while
+                // loadedUrl waits for NavigationFinished, so mid-navigation the text legitimately
+                // differs from loadedUrl with nobody editing - and reverting there would put the
+                // PREVIOUS page's URL back until the load commits, then jump forward again.
+                //
                 // loadedUrl is deliberately "" on a home tab (about:blank fires no navigation
                 // events, so home is the one surface that has to say "nothing loaded" itself), and
                 // blanking the field is not reverting it; a field that already reads as the loaded
                 // URL has nothing to revert, and rewriting it would collapse Cmd+L's selection and
                 // drop the caret to the end for no reason. The claim is released either way -
                 // that is what fixes the freeze.
-                if (loadedUrl.isNotBlank() && urlBarText.text != loadedUrl) {
+                if (isUserEditingUrl && loadedUrl.isNotBlank() && urlBarText.text != loadedUrl) {
                     urlBarText = AddressBarUrlField.restoreTo(loadedUrl)
                 }
                 isUserEditingUrl = false
