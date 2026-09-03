@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -203,6 +204,21 @@ class AddressBarWiringSourceTest {
             code.contains(Regex("""typedUnderClaim\(""")),
             "typedSinceClaim is no longer computed from a text comparison - a caret move would " +
                 "count as typing and the staleness bound could never fire",
+        )
+        // The previous text must be captured BEFORE the write, and both rules must use that
+        // capture. Reading it off urlBarText afterwards compares newValue with itself: always
+        // false, and it silently killed the history dropdown and inline autocomplete entirely.
+        // This cannot prove the ordering - only a run can - but it does catch the shape going
+        // back to reading shared state at the point of use.
+        val handler = normalised(blockAfter("onUrlBarTextChange =", code))
+        assertTrue(
+            handler.contains("val previousText = urlBarText.text"),
+            "the previous text is no longer captured once before the write",
+        )
+        assertFalse(
+            handler.contains("newValue.text != urlBarText.text"),
+            "the suggestion gate is reading urlBarText at the point of use again - after the " +
+                "assignment that is a comparison of newValue with itself, and the dropdown dies",
         )
     }
 

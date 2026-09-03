@@ -163,6 +163,18 @@ class AddressBarUrlFieldTest {
     }
 
     @Test
+    fun `textChanged compares the two strings it is handed`() {
+        // A named predicate taking `previous` as a parameter, because the version that read the
+        // previous value off shared state was placed AFTER the write to that state - so it
+        // compared newValue against itself, was always false, and the history dropdown and
+        // inline autocomplete stopped appearing at all. A caller cannot make that mistake here.
+        assertTrue(AddressBarUrlField.textChanged(previous = "goo", next = "goog"))
+        assertFalse(AddressBarUrlField.textChanged(previous = "goo", next = "goo"))
+        assertTrue(AddressBarUrlField.textChanged(previous = "", next = "g"))
+        assertTrue(AddressBarUrlField.textChanged(previous = "g", next = ""))
+    }
+
+    @Test
     fun `typing under the claim sets it, and it stays set`() {
         assertTrue(
             AddressBarUrlField.typedUnderClaim(alreadyTyped = false, previous = "goo", next = "goog"),

@@ -79,7 +79,23 @@ internal object AddressBarUrlField {
         alreadyTyped: Boolean,
         previous: String,
         next: String,
-    ): Boolean = alreadyTyped || previous != next
+    ): Boolean = alreadyTyped || textChanged(previous, next)
+
+    /**
+     * Whether a field change altered the TEXT, as opposed to only the selection.
+     *
+     * Trivial, and a named function on purpose: it takes [previous] as a parameter, so a caller
+     * physically cannot ask the question after it has already written the new value over the old
+     * one. That is not hypothetical - the first version of the suggestion gate read
+     * `newValue.text != urlBarText.text` two statements AFTER `urlBarText = newValue`, so it was
+     * always false and the history dropdown and inline autocomplete never appeared at all.
+     *
+     * Both callers ask the same question about the same pair, so they ask it here.
+     */
+    fun textChanged(
+        previous: String,
+        next: String,
+    ): Boolean = previous != next
 
     /** What a navigation callback should do to the URL field. */
     sealed interface NavigationWrite {

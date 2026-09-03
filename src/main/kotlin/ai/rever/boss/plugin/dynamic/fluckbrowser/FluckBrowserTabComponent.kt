@@ -3905,16 +3905,20 @@ internal fun FluckBrowserTabContent(
             addressBarFocusRequester = addressBarFocusRequester,
             urlBarText = urlBarText,
             onUrlBarTextChange = { newValue ->
+                // Captured ONCE, before the write below. Two rules here ask "did the text
+                // change" - the typed-under-claim flag and the suggestion gate - and both are
+                // silently false if asked after `urlBarText = newValue`, because that delegate
+                // is a plain property reference and the write is visible immediately.
+                val previousText = urlBarText.text
                 isUserEditingUrl = true
                 lastUserEditTime = System.currentTimeMillis()
                 // Compared, not set to true: this fires for selection-only changes too (caret
                 // moves, Home/End, click-to-place), and the staleness bound is gated on this
-                // flag - see AddressBarUrlField.typedUnderClaim. Read before the assignment
-                // below, which is what makes `previous` the previous text.
+                // flag - see AddressBarUrlField.typedUnderClaim.
                 typedSinceClaim =
                     AddressBarUrlField.typedUnderClaim(
                         alreadyTyped = typedSinceClaim,
-                        previous = urlBarText.text,
+                        previous = previousText,
                         next = newValue.text,
                     )
                 // Unconditional, unlike the flag above: the user is interacting either way, and
@@ -3927,18 +3931,17 @@ internal fun FluckBrowserTabContent(
                 // Get autocomplete suggestion and dropdown items
                 // Only compute when text is not empty and cursor is not selecting text
                 //
-                // `textChanged` because this callback fires for selection-only changes too, and a
-                // caret move cannot change what the suggestions are. Two things fall out: it
-                // skips a getSuggestions() call per arrow key, and it stops Cmd+L then Left
-                // OPENING the dropdown - which would spend the next Escape dismissing it instead
-                // of releasing the claim, breaking the one-press property the two-stage Escape
-                // is documented to have.
+                // Gated on the text changing because this callback fires for selection-only
+                // changes too, and a caret move cannot change what the suggestions are. Two
+                // things fall out: it skips a getSuggestions() call per arrow key, and it stops
+                // Cmd+L then Left OPENING the dropdown - which would spend the next Escape
+                // dismissing it instead of releasing the claim, breaking the one-press property
+                // the two-stage Escape is documented to have.
                 //
                 // A selection-only change leaves the dropdown state ALONE rather than taking the
                 // else branch: clearing there would close the suggestions every time the user
                 // arrowed through text they had just typed, which is worse than the bug above.
-                val textChanged = newValue.text != urlBarText.text
-                if (textChanged) {
+                if (AddressBarUrlField.textChanged(previousText, newValue.text)) {
                     if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
                         // distinctBy: the dropdown keys its rows by URL, and a duplicate key
                         // is fatal to a LazyColumn. The current host can't produce one, but
