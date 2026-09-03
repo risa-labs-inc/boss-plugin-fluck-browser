@@ -1,7 +1,6 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.api.DynamicPlugin
-import ai.rever.boss.plugin.api.KeyChordSpec
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.PluginShortcutSpec
 import ai.rever.boss.plugin.api.ShortcutActionProvider
@@ -28,14 +27,25 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
     private var pluginContext: PluginContext? = null
 
     /**
-     * Cmd+L — "Open Location", focusing the address bar of the browser tab in front of the user.
+     * "Focus Address Bar" - the handler behind Cmd+L, focusing the address bar of the browser tab
+     * in front of the user.
      *
-     * Contributed rather than built into the host keymap because the field lives here. The host
-     * unregisters this automatically on disable/unload, after which the chord goes inert; a user
-     * rebind stored under [FOCUS_ADDRESS_BAR_ACTION] in the keymap file supersedes the default
-     * and survives plugin reloads.
+     * Contributed rather than built into the host keymap because the field lives here: the host
+     * has no URL field, and every keymap action it owns acts on a BrowserHandle instead.
+     *
+     * **Registered with no defaultBinding on purpose.** A plugin default is GLOBAL in the host's
+     * v1 contract and is consumed whenever a provider owns the action, so a Cmd+L default would
+     * shadow the host's EDITOR_GO_TO_LINE (also Cmd+L) and swallow it - the editor plugin opens
+     * Go To Line from its own key handling, so the chord has to reach it. The host's keymap
+     * presets therefore carry Cmd+L for this action id with `context = BROWSER`, which is the
+     * only place a context can be expressed, and hosts too old to have that entry simply leave
+     * Cmd+L alone rather than breaking Go To Line. Bumping `minBossVersion` was the other option
+     * and is the wrong lever here - see the note in PageEventChannel on what that did in 1.2.22.
+     *
+     * The host unregisters this automatically on disable/unload, after which the chord goes
+     * inert; a user rebind under [FOCUS_ADDRESS_BAR_ACTION] persists across plugin reloads.
      */
-    private val addressBarShortcuts =
+    internal val addressBarShortcuts =
         object : ShortcutActionProvider {
             override val providerId: String = pluginId
 
@@ -45,10 +55,19 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
                         actionId = FOCUS_ADDRESS_BAR_ACTION,
                         displayName = "Focus Address Bar",
                         description = "Focus and select the browser tab's address bar",
-                        defaultBinding = KeyChordSpec(key = "L", modifiers = setOf("Cmd")),
+                        // No default: the host preset binds Cmd+L to this id with BROWSER
+                        // context. See the class KDoc above.
+                        defaultBinding = null,
                     ),
                 )
 
+            /**
+             * Called on the UI thread. Not an assumption: the host documents it on
+             * `PluginShortcutRegistryImpl.dispatch` ("Called on the UI thread by the
+             * interceptor"), and the interceptor is an AWT `KeyEventDispatcher`, so the caller is
+             * the EDT. That is what makes it safe to touch a FocusRequester and Compose state
+             * from here without posting to a scope.
+             */
             override fun onAction(
                 actionId: String,
                 windowId: String?,
@@ -94,6 +113,10 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // Tear down the share server (stops any active capture) before unregistering.
         BrowserShareManager.shutdown()
         pluginContext?.unregisterShortcutActionProvider(addressBarShortcuts.providerId)
+        // Symmetric with the registrations the tab compositions make. Nothing can invoke them
+        // once the provider is gone, so this is hygiene rather than a fix, but it stops entries
+        // holding torn-down compositions across a disable/re-enable on the same classloader.
+        AddressBarFocusRegistry.clear()
         pluginContext?.tabRegistry?.unregisterTabType(FluckBrowserTabType.typeId)
         pluginContext = null
     }

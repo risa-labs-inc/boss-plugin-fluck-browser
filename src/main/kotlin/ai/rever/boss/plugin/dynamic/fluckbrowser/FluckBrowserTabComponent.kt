@@ -128,11 +128,11 @@ import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
 import javax.swing.JSeparator
 import kotlin.math.abs
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.runtime.DisposableEffect
-import ai.rever.boss.plugin.api.LocalWindowIdProvider
 import ai.rever.boss.plugin.api.LocalIsPanelActive
+import ai.rever.boss.plugin.api.LocalWindowIdProvider
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 
 /**
  * Fluck Browser tab component (Dynamic Plugin)
@@ -2630,35 +2630,6 @@ internal fun FluckBrowserTabContent(
     val browserHandle by hoistedState::browserHandle
     var isLoading by hoistedState::isLoading
     var urlBarText by hoistedState::urlBarText
-
-    // Cmd+L. The chord is a plugin-contributed GLOBAL shortcut, so it arrives with only a window
-    // id and no idea which surface should answer; the registry resolves that from what is
-    // actually composed. Registered per (window, panel-active) so the answer follows the user
-    // between splits — see AddressBarFocusRegistry.
-    val addressBarFocusRequester = remember { FocusRequester() }
-    val addressBarWindowId = LocalWindowIdProvider.current?.getWindowId()
-    val addressBarPanelActive = LocalIsPanelActive.current
-    if (tabId.isNotEmpty() && addressBarWindowId != null) {
-        DisposableEffect(tabId, addressBarWindowId, addressBarPanelActive) {
-            val token =
-                AddressBarFocusRegistry.register(
-                    tabId = tabId,
-                    windowId = addressBarWindowId,
-                    panelActive = addressBarPanelActive,
-                ) {
-                    // requestFocus throws if the requester is not currently attached to a node
-                    // (this tab hibernated, or the toolbar is hidden in fullscreen). Treated as
-                    // "nothing to focus" rather than an escape into the host's event dispatch.
-                    runCatching {
-                        addressBarFocusRequester.requestFocus()
-                        // Select the whole URL, the way every browser's Cmd+L does, so typing
-                        // replaces it instead of appending to it.
-                        urlBarText = urlBarText.copy(selection = TextRange(0, urlBarText.text.length))
-                    }
-                }
-            onDispose { AddressBarFocusRegistry.unregister(tabId, token) }
-        }
-    }
     var loadedUrl by hoistedState::loadedUrl
     var pageTitle by hoistedState::pageTitle
     var zoomLevel by hoistedState::zoomLevel
@@ -2676,6 +2647,47 @@ internal fun FluckBrowserTabContent(
     // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
+
+    // Cmd+L. The chord is a plugin-contributed GLOBAL shortcut, so it arrives with only a window
+    // id and no idea which surface should answer; the registry resolves that from what is
+    // actually composed. Registered per (window, panel-active) so the answer follows the user
+    // between splits - see AddressBarFocusRegistry.
+    //
+    // Placed BELOW isUserEditingUrl/lastUserEditTime deliberately: the focus callback has to set
+    // them, so it cannot be declared above them.
+    val addressBarFocusRequester = remember { FocusRequester() }
+    val addressBarWindowId = LocalWindowIdProvider.current?.getWindowId()
+    val addressBarPanelActive = LocalIsPanelActive.current
+    if (tabId.isNotEmpty() && addressBarWindowId != null) {
+        DisposableEffect(tabId, addressBarWindowId, addressBarPanelActive) {
+            val token =
+                AddressBarFocusRegistry.register(
+                    tabId = tabId,
+                    windowId = addressBarWindowId,
+                    panelActive = addressBarPanelActive,
+                ) {
+                    // Not wrapped in runCatching: requestFocus throws when the requester is not
+                    // attached to a node (a hibernated tab, or a toolbar hidden in fullscreen),
+                    // and the registry's own catch turns that into the `false` its caller reads.
+                    // Catching it here as well made that false unreachable in production and left
+                    // the failure silent.
+                    addressBarFocusRequester.requestFocus()
+
+                    // Claim the field before selecting it. The navigation listener rewrites
+                    // urlBarText with a COLLAPSED selection whenever !isUserEditingUrl and the
+                    // last edit is over 300ms old, so on a still-loading or redirecting page a
+                    // callback landing a beat after Cmd+L would wipe the selection while the
+                    // field kept focus - the next keystroke then appends to the URL instead of
+                    // replacing it, which is exactly what selecting it exists to prevent.
+                    isUserEditingUrl = true
+                    lastUserEditTime = System.currentTimeMillis()
+
+                    // Select the whole URL, the way every browser's Cmd+L does.
+                    urlBarText = urlBarText.copy(selection = TextRange(0, urlBarText.text.length))
+                }
+            onDispose { AddressBarFocusRegistry.unregister(tabId, token) }
+        }
+    }
     val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
     val handlePopupNavigation: (PopupNavigation) -> Unit = { navigation ->
         val body = navigation.postData

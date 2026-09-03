@@ -5,6 +5,8 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -119,13 +121,76 @@ class AddressBarFocusRegistryTest {
     }
 
     @Test
-    fun `a throwing focus callback is contained`() {
-        // requestFocus throws when the requester is not attached to a node — a hibernated tab,
-        // or a toolbar hidden by fullscreen. That must not escape into the host's event dispatch.
+    fun `a throwing focus callback is contained and reported as unhandled`() {
+        // requestFocus throws when the requester is not attached to a node: a hibernated tab, or
+        // a toolbar hidden by fullscreen. That must not escape into the host's event dispatch,
+        // and the registry is the only place that catches it - the real callback deliberately
+        // does not wrap itself, or this `false` would be unreachable in production.
         AddressBarFocusRegistry.register("tab-1", "window-1", panelActive = true) {
             error("not attached to the composition")
         }
 
         assertFalse(AddressBarFocusRegistry.focusActiveIn("window-1"))
+    }
+
+    @Test
+    fun `the action id matches what the host requires of it`() {
+        // Must be exactly "plugin.<pluginId>.<name>" or the host rejects the registration and the
+        // shortcut is silently lost. The id is a const and the plugin id is a separate literal,
+        // so this is what stops the two drifting.
+        val plugin = FluckBrowserDynamicPlugin()
+
+        assertEquals(
+            "plugin.${plugin.pluginId}.focus_address_bar",
+            FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION,
+        )
+        assertTrue(FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION.startsWith("plugin."))
+    }
+
+    @Test
+    fun `the action ships with no default binding, deliberately`() {
+        // A plugin default is GLOBAL in the host's v1 contract and is consumed whenever a
+        // provider owns the action, so a Cmd+L default here would shadow the host's
+        // EDITOR_GO_TO_LINE (also Cmd+L) and swallow it - the editor plugin opens Go To Line from
+        // its own key handling, so the chord has to reach it.
+        //
+        // The chord therefore lives in the host's keymap presets, bound to this action id with
+        // BROWSER context, which is the only layer where a context can be expressed. A host too
+        // old to carry that entry leaves Cmd+L alone rather than breaking Go To Line, which is
+        // what makes this safe to ship independently of the host.
+        val spec = FluckBrowserDynamicPlugin().addressBarShortcuts.shortcuts().single()
+
+        assertEquals(FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION, spec.actionId)
+        assertNull(spec.defaultBinding, "a GLOBAL Cmd+L default would swallow the editor's Go To Line")
+        assertEquals("Focus Address Bar", spec.displayName)
+    }
+
+    @Test
+    fun `the provider ignores action ids that are not its own`() {
+        // dispatch() routes by action id, but a provider that acted on anything handed to it
+        // would move focus on an unrelated plugin's chord.
+        register("tab-1", "window-1")
+        val provider = FluckBrowserDynamicPlugin().addressBarShortcuts
+
+        provider.onAction("plugin.something.else", "window-1")
+
+        assertTrue(focused.isEmpty(), "only this plugin's action should focus the address bar")
+    }
+
+    @Test
+    fun `the provider focuses on its own action id`() {
+        register("tab-1", "window-1")
+        val provider = FluckBrowserDynamicPlugin().addressBarShortcuts
+
+        provider.onAction(FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION, "window-1")
+
+        assertEquals(listOf("tab-1"), focused)
+    }
+
+    @Test
+    fun `the provider id is the plugin id, as the host expects`() {
+        val plugin = FluckBrowserDynamicPlugin()
+
+        assertEquals(plugin.pluginId, plugin.addressBarShortcuts.providerId)
     }
 }

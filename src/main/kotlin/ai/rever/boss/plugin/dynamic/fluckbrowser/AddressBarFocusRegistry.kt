@@ -78,16 +78,30 @@ internal object AddressBarFocusRegistry {
      *   chord unhandled rather than swallow it.
      */
     fun focusActiveIn(windowId: String?): Boolean {
-        if (windowId == null) return false
-        val target = selectFocusTarget(entries.values, windowId) ?: return false
-        return runCatching { target.focus() }.isSuccess
+        if (windowId == null) {
+            // The host could not attribute the keypress to a window. Focusing "whatever we can
+            // find" would be worse than doing nothing.
+            println("[FluckBrowser] Cmd+L ignored: no window id")
+            return false
+        }
+        val target = selectFocusTarget(entries.values, windowId)
+        if (target == null) {
+            println("[FluckBrowser] Cmd+L ignored: no browser toolbar in the active panel of $windowId")
+            return false
+        }
+        // Catches Throwable, which is deliberate for the same reason the host's plugin dispatch
+        // does: this runs inside the host's key-event dispatch, and letting anything escape would
+        // take out the whole keyboard path rather than one chord.
+        return runCatching { target.focus() }
+            .onFailure { println("[FluckBrowser] Cmd+L could not focus the address bar: ${it.message}") }
+            .isSuccess
     }
 
     /** Test seam: how many toolbars are currently registered. */
-    internal fun size(): Int = entries.size
+    fun size(): Int = entries.size
 
-    /** Test seam. */
-    internal fun clear() {
+    /** Drops every registration. Called on plugin dispose, and by tests between cases. */
+    fun clear() {
         entries.clear()
     }
 
