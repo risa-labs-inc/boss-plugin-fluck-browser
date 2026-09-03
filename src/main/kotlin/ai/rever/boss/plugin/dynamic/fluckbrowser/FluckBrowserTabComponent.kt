@@ -3926,42 +3926,57 @@ internal fun FluckBrowserTabContent(
 
                 // Get autocomplete suggestion and dropdown items
                 // Only compute when text is not empty and cursor is not selecting text
-                if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
-                    // distinctBy: the dropdown keys its rows by URL, and a duplicate key
-                    // is fatal to a LazyColumn. The current host can't produce one, but
-                    // the list is host-supplied data and a provider that later merges
-                    // sources (history + bookmarks + open tabs) is exactly the shape that
-                    // would. Deleting already removes every copy, so this loses nothing.
-                    val suggestions =
-                        urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
-                            .distinctBy { it.url }
+                //
+                // `textChanged` because this callback fires for selection-only changes too, and a
+                // caret move cannot change what the suggestions are. Two things fall out: it
+                // skips a getSuggestions() call per arrow key, and it stops Cmd+L then Left
+                // OPENING the dropdown - which would spend the next Escape dismissing it instead
+                // of releasing the claim, breaking the one-press property the two-stage Escape
+                // is documented to have.
+                //
+                // A selection-only change leaves the dropdown state ALONE rather than taking the
+                // else branch: clearing there would close the suggestions every time the user
+                // arrowed through text they had just typed, which is worse than the bug above.
+                val textChanged = newValue.text != urlBarText.text
+                if (textChanged) {
+                    if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
+                        // distinctBy: the dropdown keys its rows by URL, and a duplicate key
+                        // is fatal to a LazyColumn. The current host can't produce one, but
+                        // the list is host-supplied data and a provider that later merges
+                        // sources (history + bookmarks + open tabs) is exactly the shape that
+                        // would. Deleting already removes every copy, so this loses nothing.
+                        val suggestions =
+                            urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
+                                .distinctBy { it.url }
 
-                    // Set inline autocomplete (first suggestion with protocol stripped)
-                    if (suggestions.isNotEmpty()) {
-                        val suggestion = suggestions.first()
-                        val suggestionUrl = suggestion.url
-                            .removePrefix("https://")
-                            .removePrefix("http://")
-                            .removePrefix("www.")
+                        // Set inline autocomplete (first suggestion with protocol stripped)
+                        if (suggestions.isNotEmpty()) {
+                            val suggestion = suggestions.first()
+                            val suggestionUrl = suggestion.url
+                                .removePrefix("https://")
+                                .removePrefix("http://")
+                                .removePrefix("www.")
 
-                        // Only suggest if the stripped URL starts with the input
-                        if (suggestionUrl.lowercase().startsWith(newValue.text.lowercase()) &&
-                            suggestionUrl.length > newValue.text.length) {
-                            autocompleteSuggestion = suggestionUrl
+                            // Only suggest if the stripped URL starts with the input
+                            if (suggestionUrl.lowercase().startsWith(newValue.text.lowercase()) &&
+                                suggestionUrl.length > newValue.text.length
+                            ) {
+                                autocompleteSuggestion = suggestionUrl
+                            } else {
+                                autocompleteSuggestion = null
+                            }
                         } else {
                             autocompleteSuggestion = null
                         }
+
+                        // Set dropdown suggestions
+                        urlSuggestions = suggestions
+                        showUrlSuggestions = suggestions.isNotEmpty()
                     } else {
                         autocompleteSuggestion = null
+                        urlSuggestions = emptyList()
+                        showUrlSuggestions = false
                     }
-
-                    // Set dropdown suggestions
-                    urlSuggestions = suggestions
-                    showUrlSuggestions = suggestions.isNotEmpty()
-                } else {
-                    autocompleteSuggestion = null
-                    urlSuggestions = emptyList()
-                    showUrlSuggestions = false
                 }
             },
             onNavigate = { url ->
