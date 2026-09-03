@@ -10,10 +10,11 @@ import kotlin.test.assertTrue
  *
  * [AddressBarFocusRegistryTest] proves the registry focuses the right toolbar, and
  * [AddressBarUrlFieldTest] proves the selection survives a navigation - but both talk to a
- * lambda a test supplied. The wiring that makes the REAL lambda do anything is four lines spread
- * across a 6000-line composable: the registration effect, the two registry calls in it, the
- * requester handed to `BrowserToolbar`, and the requester attached to the URL field's modifier.
- * Delete any one of them and Cmd+L silently does nothing while every other test still passes.
+ * lambda a test supplied. The wiring that makes the REAL lambda do anything is a handful of lines
+ * spread across a 6000-line composable: the registration effect and its two registry calls, the
+ * two host values the ranking depends on, the requester handed to `BrowserToolbar`, the requester
+ * attached to the URL field, and the Escape branch that hands a claimed field back. Delete any
+ * one and Cmd+L silently misbehaves while every other test still passes.
  *
  * A source check is the cheap half of the Compose UI test this repo has no infrastructure for -
  * the same trade `PageEventChannelSourceTest` makes, and it fails at the moment the line is
@@ -59,6 +60,27 @@ class AddressBarWiringSourceTest {
     }
 
     @Test
+    fun `the registration still reads the real window and panel`() {
+        // The registry's entire job is ranking on these two values. Hardcoding either - a
+        // constant window id, or panelActive = true - would leave every other test passing while
+        // Cmd+L answered from a background split, which is the failure the refusals exist for.
+        val code = tabComponentCode()
+
+        assertTrue(
+            code.contains(Regex("""LocalWindowIdProvider\s*\.\s*current""")),
+            "the window id is no longer read from the host - entries cannot be attributed to a window",
+        )
+        assertTrue(
+            code.contains(Regex("""LocalIsPanelActive\s*\.\s*current""")),
+            "panel-active is no longer read from the host - a background split could answer Cmd+L",
+        )
+        assertTrue(
+            code.contains(Regex("""panelActive\s*=\s*addressBarPanelActive""")),
+            "the registration no longer passes the real panel-active value",
+        )
+    }
+
+    @Test
     fun `the requester reaches the toolbar and the URL field`() {
         // The two ends of the same wire. Either one missing leaves the registry calling
         // requestFocus on a requester attached to nothing, which throws, is caught, and looks
@@ -72,6 +94,22 @@ class AddressBarWiringSourceTest {
         assertTrue(
             code.contains(Regex("""\.focusRequester\(\s*addressBarFocusRequester\s*\)""")),
             "the URL field no longer attaches the requester - requestFocus would throw on every Cmd+L",
+        )
+    }
+
+    @Test
+    fun `Escape still hands a claimed field back`() {
+        // Cmd+L claims the field without the user typing, so the Escape branch is the only thing
+        // stopping a change of mind freezing the URL bar for the life of the tab.
+        val code = tabComponentCode()
+
+        assertTrue(
+            code.contains(Regex("""onCancelUrlEditing\s*\(\s*\)""")),
+            "Escape no longer cancels the edit - a Cmd+L the user backs out of leaves the bar claimed",
+        )
+        assertTrue(
+            code.contains(Regex("""onCancelUrlEditing\s*=""")),
+            "nothing supplies onCancelUrlEditing, so Escape cancels nothing",
         )
     }
 }

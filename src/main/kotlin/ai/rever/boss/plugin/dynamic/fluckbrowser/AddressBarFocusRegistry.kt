@@ -33,12 +33,15 @@ internal object AddressBarFocusRegistry {
     /**
      * One composed browser toolbar.
      *
-     * Value-equality is load-bearing: it lets [unregister] remove an entry only while it is still
-     * the current one, so a tab moving between windows (which builds one composition and tears
-     * down the other in an order this registry does not control) cannot have the outgoing
-     * composition delete the incoming one's entry.
+     * NOT a data class, deliberately: [entries] is a set, so entry equality decides what
+     * [unregister] removes, and identity is exactly the semantics wanted. Value equality would
+     * make two toolbars that happened to agree on every field one entry - and it is what makes
+     * the teardown race unrepresentable rather than merely handled, since a tab moving between
+     * windows builds one composition and tears down the other in an order this registry does not
+     * control, both carrying the same tab id. Each composition owns exactly the entry it
+     * registered.
      */
-    private data class Entry(
+    private class Entry(
         val tabId: String,
         val windowId: String,
         val panelActive: Boolean,
@@ -46,7 +49,16 @@ internal object AddressBarFocusRegistry {
         val focus: () -> Unit,
     ) : Registration
 
-    private val entries = ConcurrentHashMap<String, Entry>()
+    /**
+     * Every composed toolbar, held by identity rather than keyed by tab id.
+     *
+     * Keying by tab id would ask a question this registry cannot answer - whether the host can
+     * ever compose one tab in two panels at once - and would silently drop one of the two
+     * toolbars if it ever could. Identity makes that a non-question, and [unregister] already
+     * takes the token, so the tab id was never doing any work as a key. Compose pairs every
+     * effect with its `onDispose`, so entries do not accumulate.
+     */
+    private val entries = ConcurrentHashMap.newKeySet<Entry>()
     private val sequencer = AtomicLong(0)
 
     /**
@@ -63,14 +75,22 @@ internal object AddressBarFocusRegistry {
 
     private const val MISS_LOG_THROTTLE_MS = 30_000L
 
-    /** Whether this miss is far enough from the last one of its kind to be worth a line. */
+    /**
+     * Whether this miss is far enough from the last one of its kind to be worth a line.
+     *
+     * One atomic `compute` rather than a get-then-put: the map is a [ConcurrentHashMap], and a
+     * check-then-act body would promise a concurrency guarantee it does not keep. `onAction` is
+     * EDT-only today, so this is about the code saying what it means.
+     */
     private fun shouldLogMiss(key: String): Boolean {
         val now = System.currentTimeMillis()
-        val previous = lastMissLogged[key]
-        // Also true when the clock steps backwards, which errs toward logging.
-        if (previous != null && now - previous in 0 until MISS_LOG_THROTTLE_MS) return false
-        lastMissLogged[key] = now
-        return true
+        var log = false
+        lastMissLogged.compute(key) { _, previous ->
+            // A clock stepping backwards errs toward logging.
+            log = previous == null || now - previous !in 0 until MISS_LOG_THROTTLE_MS
+            if (log) now else previous
+        }
+        return log
     }
 
     /**
@@ -80,7 +100,7 @@ internal object AddressBarFocusRegistry {
      *   (`LocalIsPanelActive`). Defaults to true outside a managed panel, which is why it cannot
      *   be the only thing consulted — see [selectFocusTarget].
      * @param focus focuses and selects the field; called on the UI thread.
-     * @return a token to hand back to [unregister].
+     * @return the token to hand back to [unregister]; identity is what identifies it.
      */
     fun register(
         tabId: String,
@@ -96,16 +116,19 @@ internal object AddressBarFocusRegistry {
                 sequence = sequencer.incrementAndGet(),
                 focus = focus,
             )
-        entries[tabId] = entry
+        entries.add(entry)
         return entry
     }
 
-    /** Remove [tabId]'s registration, but only if [token] is still the current one. */
-    fun unregister(
-        tabId: String,
-        token: Registration?,
-    ) {
-        if (token is Entry) entries.remove(tabId, token)
+    /**
+     * Drop the registration [token] identifies.
+     *
+     * A token this registry did not issue (or null) is ignored rather than treated as "remove
+     * whatever is there for that tab" - the distinction the old tab-id keying needed a value
+     * comparison to make.
+     */
+    fun unregister(token: Registration?) {
+        if (token is Entry) entries.remove(token)
     }
 
     /**
@@ -113,7 +136,8 @@ internal object AddressBarFocusRegistry {
      *
      * @return whether a toolbar took the focus. Defense-in-depth and a test seam rather than a
      *   signal any caller acts on: a plugin `onAction` returns Unit, so the host's `dispatch`
-     *   reports the chord handled whenever a provider owns the action, however this answers.
+     *   reports the chord handled whenever a provider owns the action, however this answers. A
+     *   `false` therefore means "Cmd+L did nothing here", never "someone else may serve it".
      */
     fun focusActiveIn(windowId: String?): Boolean {
         if (windowId == null) {
@@ -124,7 +148,7 @@ internal object AddressBarFocusRegistry {
             }
             return false
         }
-        val target = selectFocusTarget(entries.values, windowId)
+        val target = selectFocusTarget(entries, windowId)
         if (target == null) {
             if (shouldLogMiss("no-toolbar:$windowId")) {
                 println("[FluckBrowser] Cmd+L ignored: no browser toolbar in the active panel of $windowId")
@@ -160,28 +184,29 @@ internal object AddressBarFocusRegistry {
     /**
      * Of the composed toolbars in [windowId], which one owns the chord.
      *
-     * A toolbar in a NON-active panel is not a candidate at all, rather than a lower-ranked one.
-     * The chord is global (plugin shortcuts have no context in the host's v1 contract) and the
-     * host consumes it whenever a provider owns the action, so answering from a background split
-     * would take Cmd+L away from whatever the user is actually working in — an editor's Go To
-     * Line, say — and move focus to a browser they were not looking at. Declining leaves the
-     * chord to that panel.
+     * A toolbar in a NON-active panel is not a candidate at all, rather than a lower-ranked one:
+     * answering from a background split would move focus to a browser the user was not looking
+     * at, which is reason enough on its own.
+     *
+     * It does NOT hand the chord back. The host consumes it whenever a provider owns the action
+     * (`onAction` returns Unit, so `dispatch` reports success however this answers), so declining
+     * makes Cmd+L a no-op there rather than an editor's Go To Line. What actually protects Go To
+     * Line is the host preset binding this action with `context = BROWSER`, so the chord is not
+     * dispatched to us at all while the user is in an editor — see [focusActiveIn]. This refusal
+     * is what covers the case that scoping cannot: an action rebound to a globally-scoped chord.
      *
      * Among the remaining candidates the most recently composed wins: the browser tab the user
      * most recently brought to the front.
      *
-     * **Why there is no "is this really a main-window panel?" rank above `panelActive`, unlike
-     * the host's `selectActiveHandleId`.** `LocalIsPanelActive` defaults to `true`, so a surface
-     * composed outside a managed panel reads as active too; the host separates the two with
-     * `LocalInMainWindowPanel`, which is host-internal (`BossMainWindowPanel.kt`) and NOT part of
-     * the plugin api, so this registry cannot read it. It does not need to: the host composes a
-     * plugin TAB type's `Content()` from exactly one place, `BossMainPanelContent`, which sits
-     * under `LocalInMainWindowPanel provides true`. Side panels render `PanelComponentWithUI`,
-     * which this plugin does not implement, and the host's own sidebar/preview browsers are
-     * `BrowserHandle` surfaces that never build a fluck toolbar. The host hit this (v9.4.17, on
-     * `ActiveBrowserRegistry`) because its entries come from `BrowserHandleImpl.Content()`, which
-     * IS composed in those slots. If this plugin ever grows a panel provider, this ranking has to
-     * grow the same preference — and would need the local exported through the api first.
+     * **Why `panelActive` alone is enough, though the host's equivalent registry needed a
+     * main-panel rank above it.** `LocalIsPanelActive` defaults to `true`, so a surface composed
+     * outside a managed panel reads as active too — which is a live hazard for the host, whose
+     * entries come from a browser SURFACE that really is composed in sidebar slots and previews.
+     * These entries come from a plugin TAB type, and the host composes one only inside a main
+     * window panel; a side panel takes a different interface, which this plugin does not
+     * implement. The local that separates the two is host-internal and not in the plugin api, so
+     * this could not read it in any case. If this plugin ever grows a panel provider, this
+     * ranking needs the same preference — and needs that local exported first.
      */
     private fun selectFocusTarget(
         candidates: Collection<Entry>,

@@ -98,25 +98,42 @@ class AddressBarFocusRegistryTest {
     @Test
     fun `disposing a toolbar stops it answering`() {
         val token = register("tab-1", "window-1")
-        AddressBarFocusRegistry.unregister("tab-1", token)
+        AddressBarFocusRegistry.unregister(token)
 
         assertFalse(AddressBarFocusRegistry.focusActiveIn("window-1"))
         assertEquals(0, AddressBarFocusRegistry.size())
     }
 
     @Test
-    fun `a stale token cannot evict the current registration`() {
+    fun `the outgoing composition's dispose cannot evict the incoming one`() {
         // A tab moving between windows builds one composition and tears down the other in an
-        // order this registry does not control, and both carry the same tab id. An
-        // unconditional remove from the outgoing one would delete the incoming one's entry and
-        // leave the window with nothing to focus.
-        val staleToken = register("tab-1", "window-1")
+        // order this registry does not control, and both carry the same tab id. Anything keyed on
+        // the tab could have the outgoing dispose delete the incoming entry and leave the window
+        // with nothing to focus; identity keys make that unrepresentable.
+        val outgoing = register("tab-1", "window-1")
         register("tab-1", "window-2") // the move completed; window-2 now owns this tab
 
-        AddressBarFocusRegistry.unregister("tab-1", staleToken)
+        AddressBarFocusRegistry.unregister(outgoing)
 
         assertTrue(AddressBarFocusRegistry.focusActiveIn("window-2"), "the live registration survived")
         assertEquals(listOf("tab-1"), focused)
+        assertEquals(1, AddressBarFocusRegistry.size())
+    }
+
+    @Test
+    fun `one tab composed in two panels keeps both toolbars`() {
+        // No host feature composes one tab twice today (tab ids are minted per open and a tab
+        // lives in one panel), so this pins the property rather than a live path: identity keys
+        // mean neither registration can silently displace the other. Tab-id keying would drop
+        // one, and its dispose would then no-op on a stale entry.
+        val first = register("tab-1", "window-1")
+        register("tab-1", "window-1")
+
+        assertEquals(2, AddressBarFocusRegistry.size())
+        AddressBarFocusRegistry.unregister(first)
+
+        assertTrue(AddressBarFocusRegistry.focusActiveIn("window-1"), "the surviving toolbar still answers")
+        assertEquals(1, AddressBarFocusRegistry.size())
     }
 
     @Test
@@ -149,10 +166,10 @@ class AddressBarFocusRegistryTest {
     fun `a token that is not a registration is ignored`() {
         // The branch a null token takes. It reaches unregister for real: the composable's
         // onDispose hands back whatever register returned, and a future refactor that made that
-        // nullable must not silently wipe the live entry for the tab id.
+        // nullable must not quietly remove something else.
         register("tab-1", "window-1")
 
-        AddressBarFocusRegistry.unregister("tab-1", null)
+        AddressBarFocusRegistry.unregister(null)
 
         assertEquals(1, AddressBarFocusRegistry.size(), "a null token must not evict anything")
         assertTrue(AddressBarFocusRegistry.focusActiveIn("window-1"))

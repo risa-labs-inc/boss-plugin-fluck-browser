@@ -135,13 +135,11 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // for a keyboard shortcut. Ordering alone would leave dispose() to unwind a half-built
         // plugin, so it is both.
         //
-        // Safe at the declared api floor: registerShortcutActionProvider /
-        // unregisterShortcutActionProvider / ShortcutActionProvider / PluginShortcutSpec all
-        // landed in api 1.0.62, LocalWindowIdProvider in 1.0.16 and LocalIsPanelActive in 1.0.38
-        // — all at or below plugin.json's minApiVersion 1.0.73, so no host that loads this jar
-        // can be missing them. That check is the point of PageEventChannelSourceTest; see its
-        // floor rationale for why getting it wrong costs the whole plugin rather than the chord.
-        // Existing is not the same as not throwing, which is what the runCatching is for.
+        // Every symbol this uses is at or below the declared api floor, so no host that loads
+        // this jar can be missing them - the per-symbol audit is recorded in
+        // PageEventChannelSourceTest, alongside why getting a floor wrong costs the whole plugin
+        // rather than the feature. Existing is not the same as not throwing, which is what the
+        // runCatching is for.
         runCatching { context.registerShortcutActionProvider(addressBarShortcuts) }
             .onFailure { println("[FluckBrowser] Cmd+L unavailable: ${it.message}") }
     }

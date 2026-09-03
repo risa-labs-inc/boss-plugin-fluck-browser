@@ -63,6 +63,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -2690,7 +2691,7 @@ internal fun FluckBrowserTabContent(
 
                     urlBarText = AddressBarUrlField.selectAll(urlBarText)
                 }
-            onDispose { AddressBarFocusRegistry.unregister(tabId, token) }
+            onDispose { AddressBarFocusRegistry.unregister(token) }
         }
     }
     val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
@@ -3952,6 +3953,14 @@ internal fun FluckBrowserTabContent(
                 showUrlSuggestions = false
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
+            },
+            onCancelUrlEditing = {
+                // Reset explicitly rather than leaning on the 200ms onFocusLost path: that only
+                // runs if a focus-changed event actually arrives, and on Windows/Linux
+                // HARDWARE_ACCELERATED a click into the native page surface may not produce one.
+                urlBarText = AddressBarUrlField.restoreTo(loadedUrl)
+                isUserEditingUrl = false
+                lastUserEditTime = 0L
             },
             onAcceptAutocomplete = {
                 if (autocompleteSuggestion != null) {
@@ -5904,6 +5913,12 @@ internal fun BrowserToolbar(
     dropdownListState: LazyListState = rememberLazyListState(),
     onSuggestionSelected: (UrlHistoryEntry) -> Unit = {},
     onDismissSuggestions: () -> Unit = {},
+    /**
+     * Escape: the user is abandoning the edit, not just closing the dropdown. Puts the loaded URL
+     * back and releases the field, which is what stops a Cmd+L the user changed their mind about
+     * leaving the bar claimed forever - see [AddressBarUrlField.restoreTo].
+     */
+    onCancelUrlEditing: () -> Unit = {},
     onAcceptAutocomplete: () -> Unit = {},
     onSelectedDropdownIndexChange: (Int) -> Unit = {},
     onSuggestionDeleted: (UrlHistoryEntry) -> Unit = {},
@@ -5919,6 +5934,9 @@ internal fun BrowserToolbar(
     addressBarFocusRequester: FocusRequester = remember { FocusRequester() }
 ) {
     val coroutineScope = rememberCoroutineScope()
+    // Escape hands the field back; there is nowhere better to send focus, since the page is a
+    // native surface the plugin cannot focus directly.
+    val focusManager = LocalFocusManager.current
     // Auto-scroll to selected suggestion when using arrow keys
     LaunchedEffect(selectedDropdownIndex) {
         if (selectedDropdownIndex >= 0 && urlSuggestions.isNotEmpty()) {
@@ -6139,7 +6157,13 @@ internal fun BrowserToolbar(
                                 true
                             }
                             keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape -> {
+                                // Dropdown AND edit: dismissing the suggestions alone left the
+                                // field claimed (isUserEditingUrl), and a claimed field stops the
+                                // navigation listener updating the bar until focus happens to move
+                                // away. Cmd+L made that reachable without typing anything.
                                 onDismissSuggestions()
+                                onCancelUrlEditing()
+                                focusManager.clearFocus()
                                 true
                             }
                             else -> false

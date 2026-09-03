@@ -44,4 +44,16 @@ internal object AddressBarUrlField {
      * everything else the value carries belong to the field the user is looking at.
      */
     fun selectAll(current: TextFieldValue): TextFieldValue = current.copy(selection = TextRange(0, current.text.length))
+
+    /**
+     * The field as it should read once the user abandons an edit with Escape: whatever the page
+     * actually loaded, caret at the end.
+     *
+     * The paired half of releasing the claim, and the reason it matters is Cmd+L. Before Cmd+L
+     * existed, "claimed" implied the user had TYPED, so the only way into the claimed state was
+     * one the user could see. Cmd+L claims the field on a keystroke that types nothing, which
+     * makes claim-then-Escape reachable in two keys - and while the claim stands,
+     * [navigationMayRewrite] is false and the URL bar silently stops following navigations.
+     */
+    fun restoreTo(loadedUrl: String): TextFieldValue = TextFieldValue(loadedUrl, TextRange(loadedUrl.length))
 }

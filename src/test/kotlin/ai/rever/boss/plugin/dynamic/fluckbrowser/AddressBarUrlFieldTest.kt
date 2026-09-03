@@ -74,6 +74,31 @@ class AddressBarUrlFieldTest {
     }
 
     @Test
+    fun `Escape after Cmd+L hands the field back`() {
+        // The whole point of restoreTo + clearing the claim. Cmd+L claims the field without the
+        // user typing, so before this existed, Cmd+L then Escape left isUserEditingUrl true and
+        // navigationMayRewrite false - the URL bar silently stopped following navigations for
+        // the life of the tab. These are the two values onCancelUrlEditing writes.
+        val restored = AddressBarUrlField.restoreTo("https://example.com/page")
+
+        assertEquals("https://example.com/page", restored.text)
+        assertEquals(TextRange(24), restored.selection, "caret at the end, nothing selected")
+        assertTrue(
+            AddressBarUrlField.navigationMayRewrite(isUserEditing = false, msSinceUserEdit = System.currentTimeMillis()),
+            "with the claim released and lastUserEditTime reset to 0, navigations track again",
+        )
+    }
+
+    @Test
+    fun `restoring an unloaded page yields an empty field, not a crash`() {
+        // Escape on the home screen, where nothing has loaded.
+        val restored = AddressBarUrlField.restoreTo("")
+
+        assertEquals("", restored.text)
+        assertEquals(TextRange(0), restored.selection)
+    }
+
+    @Test
     fun `selectAll on an empty field is a collapsed selection, not a crash`() {
         // A tab on the home screen has no URL yet, and Cmd+L still has to be pressable there.
         val selected = AddressBarUrlField.selectAll(TextFieldValue(""))
