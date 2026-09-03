@@ -103,16 +103,24 @@ class PageEventChannelSourceTest {
         // while calling directly would make it CRASH there instead. They move together or not at
         // all.
         //
-        // Every api symbol this plugin NAMES directly must therefore exist at 1.0.73. Recorded as
-        // they get added, so the next person does not have to re-derive them from the api repo's
-        // tags (`git grep <symbol> <tag>` over risa-labs-inc/boss-plugin-api):
+        // Every api symbol this plugin NAMES directly must therefore exist at 1.0.73. The list
+        // below is a HAND AUDIT recorded at review time, NOT something this test enforces - no
+        // assertion here mentions those symbols, and adding an above-floor one would not fail.
+        //
+        // Which is exactly why it is written down: CI builds against `boss_plugin_api_version:
+        // 'latest'` (.github/workflows/build.yml), so a green compileKotlin proves the symbols
+        // exist in the NEWEST api, never that they exist at the declared floor. Enforcing it
+        // would need a floor-version jar to reflect against, which nothing here fetches.
+        //
+        // Derived with `git grep <symbol> <tag>` over risa-labs-inc/boss-plugin-api's tags:
         //   - registerShortcutActionProvider, unregisterShortcutActionProvider,
         //     ShortcutActionProvider, PluginShortcutSpec, KeyChordSpec .... api 1.0.62
         //   - LocalWindowIdProvider ................................................ api 1.0.16
         //   - LocalIsPanelActive ................................................... api 1.0.38
-        // All at or below the floor, so Cmd+L's registration cannot be what stops the jar
-        // loading. Anything added ABOVE the floor has to go through PageEventChannel-style
-        // reflection instead, not a floor bump.
+        // All at or below the floor when checked, so Cmd+L's registration is not what stops the
+        // jar loading. Anything added ABOVE the floor has to go through PageEventChannel-style
+        // reflection instead of a floor bump - and has to be checked the same way, by hand,
+        // because the build cannot see it.
         val root = assertNotNull(repoRoot(), "could not locate the plugin root")
         val manifest = File(root, "src/main/resources/META-INF/boss-plugin/plugin.json").readText()
         assertTrue(

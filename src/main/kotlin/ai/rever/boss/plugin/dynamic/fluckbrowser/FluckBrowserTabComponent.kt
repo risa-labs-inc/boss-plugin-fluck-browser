@@ -2818,15 +2818,20 @@ internal fun FluckBrowserTabContent(
         typedSinceClaim = false
         claimGeneration.incrementAndGet()
 
-        // Clear the dropdown trio, like every other path that resets the claim (submit,
-        // suggestion selected, history click). Cmd+L over a half-typed query used to leave all
-        // three standing, which broke three things at once: the first Escape dismissed the stale
+        // Clear the dropdown state, like every other path that resets the claim (submit,
+        // suggestion selected, history click). Cmd+L over a half-typed query used to leave it
+        // standing, which broke three things at once: the first Escape dismissed the stale
         // dropdown instead of releasing the claim (so the two-stage design needed two presses to
         // do what it promises in one), Enter navigated to a suggestion computed from the text
         // BEFORE Cmd+L, and the arrow keys walked a dropdown that no longer matched the field.
+        //
+        // urlSuggestions included, though nothing reads it while the other three are cleared:
+        // the Enter branch reaches for urlSuggestions.first(), so leaving a stale list behind is
+        // a trap for whoever relaxes those guards, not a live bug.
         showUrlSuggestions = false
         autocompleteSuggestion = null
         selectedDropdownIndex = -1
+        urlSuggestions = emptyList()
 
         urlBarText = AddressBarUrlField.selectAll(urlBarText)
     }
@@ -4034,22 +4039,15 @@ internal fun FluckBrowserTabContent(
                 // Reset explicitly rather than leaning on the 200ms onFocusLost path: that only
                 // runs if a focus-changed event actually arrives, and on Windows/Linux
                 // HARDWARE_ACCELERATED a click into the native page surface may not produce one.
-                // Only rewrite when there is an edit to abandon, something to revert TO, and
-                // something to revert.
-                //
-                // isUserEditingUrl first, because "the user is editing" is what this branch is
-                // FOR: the submit path writes the resolved URL into the bar immediately while
-                // loadedUrl waits for NavigationFinished, so mid-navigation the text legitimately
-                // differs from loadedUrl with nobody editing - and reverting there would put the
-                // PREVIOUS page's URL back until the load commits, then jump forward again.
-                //
-                // loadedUrl is deliberately "" on a home tab (about:blank fires no navigation
-                // events, so home is the one surface that has to say "nothing loaded" itself), and
-                // blanking the field is not reverting it; a field that already reads as the loaded
-                // URL has nothing to revert, and rewriting it would collapse Cmd+L's selection and
-                // drop the caret to the end for no reason. The claim is released either way -
-                // that is what fixes the freeze.
-                if (isUserEditingUrl && loadedUrl.isNotBlank() && urlBarText.text != loadedUrl) {
+                // The claim is released either way - that is what fixes the freeze. Whether the
+                // TEXT reverts is three separate judgements, so they live in a predicate with
+                // their reasons and their own tests rather than inline here.
+                if (AddressBarUrlField.shouldRestore(
+                        isUserEditing = isUserEditingUrl,
+                        loadedUrl = loadedUrl,
+                        currentText = urlBarText.text,
+                    )
+                ) {
                     urlBarText = AddressBarUrlField.restoreTo(loadedUrl)
                 }
                 isUserEditingUrl = false

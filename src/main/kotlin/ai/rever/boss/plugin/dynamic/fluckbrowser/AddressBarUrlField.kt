@@ -44,6 +44,17 @@ internal object AddressBarUrlField {
      * Note also that this branch does not clear `isUserEditingUrl` - it only stops consulting it.
      * "Claimed" and "protected" therefore diverge permanently once a claim goes stale, until the
      * next keystroke re-arms protection through [USER_EDIT_GRACE_MS].
+     *
+     * **A TYPED claim is still unbounded, and this rule does not close that.** The same freeze is
+     * reachable without Cmd+L: type into the bar on Windows/Linux HARDWARE_ACCELERATED, click
+     * into the page, and if no focus-changed event arrives - the very reason this bound exists -
+     * `onFocusLost` never runs, `typedSinceClaim` stays true, and the URL bar stops following
+     * navigations for the life of the tab. That path predates Cmd+L, which is why it is not
+     * fixed here rather than why it does not matter: closing it means either a second, much
+     * longer bound for typed claims (with the data-loss window that implies for a draft someone
+     * was interrupted mid-way through) or releasing on a navigation the user demonstrably did
+     * not start. Both are behaviour changes for users who never press Cmd+L, and belong with the
+     * claim lifecycle rather than with the chord that exposed them.
      */
     const val UNTYPED_CLAIM_STALE_MS = 60_000L
 
@@ -102,4 +113,25 @@ internal object AddressBarUrlField {
      * a home tab, and blanking the field is not reverting it.
      */
     fun restoreTo(loadedUrl: String): TextFieldValue = TextFieldValue(loadedUrl, TextRange(loadedUrl.length))
+
+    /**
+     * Whether Escape should rewrite the field, as opposed to only releasing the claim.
+     *
+     * The claim is released either way - that is what closes the stuck-claim freeze - so this
+     * decides the text alone, and each term rules out a different way of making things worse:
+     *  - [isUserEditing]: the submit path writes the resolved URL into the bar immediately while
+     *    `loadedUrl` waits for `NavigationFinished`, so mid-navigation the text differs from it
+     *    with nobody editing. Reverting there would put the PREVIOUS page's URL back until the
+     *    load commits, then jump forward again.
+     *  - [loadedUrl] non-blank: it is deliberately "" on a home tab (about:blank fires no
+     *    navigation events, so home is the one surface that has to say "nothing loaded" itself),
+     *    and blanking the field is not reverting it.
+     *  - text differing: a field that already reads as the loaded URL has nothing to revert, and
+     *    rewriting it would collapse Cmd+L's selection and drop the caret for no reason.
+     */
+    fun shouldRestore(
+        isUserEditing: Boolean,
+        loadedUrl: String,
+        currentText: String,
+    ): Boolean = isUserEditing && loadedUrl.isNotBlank() && currentText != loadedUrl
 }

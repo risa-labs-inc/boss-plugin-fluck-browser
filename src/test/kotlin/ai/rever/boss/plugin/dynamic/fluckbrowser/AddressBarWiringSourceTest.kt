@@ -9,6 +9,12 @@ import kotlin.test.assertTrue
 /**
  * The Compose half of Cmd+L, which no unit test can reach.
  *
+ * Deliberately SMALL. A source-text assertion fails when code is reformatted or extracted - i.e.
+ * on improvements - so it earns its place only where deleting a line would silently break
+ * behaviour and nothing else would notice. Assertions that could instead be a unit test have been
+ * moved to one: the Escape revert condition now lives in `AddressBarUrlField.shouldRestore`, and
+ * this class no longer asserts on it.
+ *
  * [AddressBarFocusRegistryTest] proves the registry focuses the right toolbar, and
  * [AddressBarUrlFieldTest] proves the selection survives a navigation - but both talk to a
  * lambda a test supplied. The wiring that makes the REAL lambda do anything is a handful of lines
@@ -154,13 +160,6 @@ class AddressBarWiringSourceTest {
             "BrowserToolbar is no longer given a requester ($threaded) - the field it focuses is " +
                 "not the one on screen",
         )
-        // A smoke check, and only that: it matches any focusRequester modifier in the file, so
-        // it would keep passing if the URL field's were deleted and an unrelated one added. The
-        // honest guarantee is "some field still attaches one".
-        assertTrue(
-            code.contains(Regex("""\.focusRequester\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*\)""")),
-            "no field attaches a focus requester at all - requestFocus would throw on every Cmd+L",
-        )
     }
 
     @Test
@@ -232,33 +231,6 @@ class AddressBarWiringSourceTest {
         assertTrue(
             callback.contains("autocompleteSuggestion = null"),
             "Cmd+L leaves a stale inline completion - Enter would navigate to the wrong URL",
-        )
-    }
-
-    @Test
-    fun `Escape does not blank or collapse a field with nothing to revert`() {
-        // The guard standing between Escape and a blanked address bar on a home tab, where
-        // loadedUrl is deliberately "". Compose-side, so no unit test reaches it, and it is the
-        // only thing making restoreTo safe to call from there.
-        val code = tabComponentCode()
-
-        // Whitespace-normalised region rather than a one-line regex: this condition is free to
-        // move and rewrap, and each of its three terms guards a different failure. An exact-source
-        // match would break on a reformat AND missed the isUserEditingUrl term when it was added.
-        val cancel = normalised(blockAfter("onCancelUrlEditing =", code))
-
-        assertTrue(
-            cancel.contains("isUserEditingUrl &&"),
-            "the revert is no longer confined to an edit the user started - it will fire " +
-                "mid-navigation and put the previous page's URL back until the load commits",
-        )
-        assertTrue(
-            cancel.contains("loadedUrl.isNotBlank()"),
-            "Escape can now blank the bar on a home tab, where loadedUrl is deliberately empty",
-        )
-        assertTrue(
-            cancel.contains("urlBarText.text != loadedUrl"),
-            "Escape now collapses the selection on a field that already reads as the loaded URL",
         )
     }
 

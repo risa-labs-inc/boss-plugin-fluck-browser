@@ -202,6 +202,41 @@ class AddressBarUrlFieldTest {
     }
 
     @Test
+    fun `Escape reverts only an edit the user started`() {
+        // Was three literal substrings asserted over source text, which would have failed the
+        // moment the condition was extracted into this function - i.e. failed on an improvement.
+        // Each term rules out a different way of making things worse.
+        assertTrue(
+            AddressBarUrlField.shouldRestore(
+                isUserEditing = true,
+                loadedUrl = "https://example.com",
+                currentText = "exa",
+            ),
+        )
+        assertFalse(
+            AddressBarUrlField.shouldRestore(
+                isUserEditing = false,
+                loadedUrl = "https://example.com",
+                currentText = "https://example.com/next",
+            ),
+            "mid-navigation the bar legitimately differs from loadedUrl with nobody editing - " +
+                "reverting there puts the previous page's URL back until the load commits",
+        )
+        assertFalse(
+            AddressBarUrlField.shouldRestore(isUserEditing = true, loadedUrl = "", currentText = "goo"),
+            "loadedUrl is blank on a home tab, and blanking the field is not reverting it",
+        )
+        assertFalse(
+            AddressBarUrlField.shouldRestore(
+                isUserEditing = true,
+                loadedUrl = "https://example.com",
+                currentText = "https://example.com",
+            ),
+            "nothing to revert - rewriting would collapse Cmd+L's selection for no reason",
+        )
+    }
+
+    @Test
     fun `selectAll on an empty field is a collapsed selection, not a crash`() {
         // A tab on the home screen has no URL yet, and Cmd+L still has to be pressable there.
         val selected = AddressBarUrlField.selectAll(TextFieldValue(""))
