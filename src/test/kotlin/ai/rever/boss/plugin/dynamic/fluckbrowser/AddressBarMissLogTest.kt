@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -42,6 +43,22 @@ class AddressBarMissLogTest {
                 now = start + AddressBarFocusRegistry.MISS_LOG_THROTTLE_MS,
             ),
         )
+    }
+
+    @Test
+    fun `an unregisterable tab is reported, and throttled by reason`() {
+        // The path that makes "Cmd+L never works in this tab" diagnosable. Keyed on the reason
+        // rather than the tab so a long session cannot accumulate one permanent throttle entry
+        // per tab - this plugin has canUnload:false, so permanent means the whole process.
+        AddressBarFocusRegistry.clear()
+
+        AddressBarFocusRegistry.noteUnregisterable("tab-1", "the host reported no window id")
+        AddressBarFocusRegistry.noteUnregisterable("tab-2", "the host reported no window id")
+        AddressBarFocusRegistry.noteUnregisterable("", "the tab has no id")
+
+        // Two distinct reasons, however many tabs hit them.
+        assertEquals(2, AddressBarFocusRegistry.throttleKeyCount())
+        AddressBarFocusRegistry.clear()
     }
 
     @Test

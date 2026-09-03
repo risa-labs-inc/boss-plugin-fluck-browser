@@ -164,7 +164,12 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // Guarded for the same reason the registration is: everything below this line matters
         // more than the shortcut, and an unload that stops here leaves the tab type registered
         // against dead plugin code.
-        runCatching { pluginContext?.unregisterShortcutActionProvider(addressBarShortcuts.providerId) }
+        // PLUGIN_ID, not addressBarShortcuts.providerId: `by lazy` does not cache initialization
+        // FAILURES, so reading the provider here would re-run the initializer on exactly the host
+        // the laziness exists for - throwing a second NoClassDefFoundError, and building a
+        // provider that was never registered. The two strings are the same and
+        // AddressBarShortcutProviderTest pins that they are.
+        runCatching { pluginContext?.unregisterShortcutActionProvider(PLUGIN_ID) }
             .onFailure { println("[FluckBrowser] could not unregister the Cmd+L provider: ${it.message}") }
         // Symmetric with the registrations the tab compositions make. Nothing can invoke them
         // once the provider is gone, so this is hygiene rather than a fix, but it stops entries

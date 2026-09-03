@@ -32,7 +32,9 @@ internal object AddressBarUrlField {
      * Bounded rather than released outright, and gated on nothing having been TYPED, because
      * those are the two things that keep it from undoing the other two rules here: Cmd+L's
      * selection needs protecting for seconds, not a minute, and text the user actually typed is
-     * never discarded however long it has sat there.
+     * not discarded by THIS rule however long it has sat there. Not a promise that a typed draft
+     * survives indefinitely: once `onFocusLost`'s delayed release clears the claim, a navigation
+     * past [USER_EDIT_GRACE_MS] overwrites the field like it always did.
      */
     const val UNTYPED_CLAIM_STALE_MS = 60_000L
 

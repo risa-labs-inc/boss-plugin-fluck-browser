@@ -3990,11 +3990,14 @@ internal fun FluckBrowserTabContent(
                 // Reset explicitly rather than leaning on the 200ms onFocusLost path: that only
                 // runs if a focus-changed event actually arrives, and on Windows/Linux
                 // HARDWARE_ACCELERATED a click into the native page surface may not produce one.
-                // Only rewrite when there is something to revert TO. loadedUrl is deliberately
-                // "" on a home tab (about:blank fires no navigation events, so home is the one
-                // surface that has to say "nothing loaded" itself), and blanking the field is not
-                // reverting it. The claim is released either way - that is what fixes the freeze.
-                if (loadedUrl.isNotBlank()) {
+                // Only rewrite when there is something to revert TO, and something to revert.
+                // loadedUrl is deliberately "" on a home tab (about:blank fires no navigation
+                // events, so home is the one surface that has to say "nothing loaded" itself), and
+                // blanking the field is not reverting it; a field that already reads as the loaded
+                // URL has nothing to revert, and rewriting it would collapse Cmd+L's selection and
+                // drop the caret to the end for no reason. The claim is released either way -
+                // that is what fixes the freeze.
+                if (loadedUrl.isNotBlank() && urlBarText.text != loadedUrl) {
                     urlBarText = AddressBarUrlField.restoreTo(loadedUrl)
                 }
                 isUserEditingUrl = false
@@ -6207,20 +6210,24 @@ internal fun BrowserToolbar(
                                 true
                             }
                             keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape -> {
-                                // Dropdown AND edit: dismissing the suggestions alone left the
-                                // field claimed (isUserEditingUrl), and a claimed field stops the
-                                // navigation listener updating the bar until focus happens to move
-                                // away. Cmd+L made that reachable without typing anything.
+                                // TWO-STAGE, Firefox's shape rather than Chrome's: the first press
+                                // closes the dropdown, the second abandons the edit. Chrome reverts
+                                // on the first press, but Chrome has no separate dropdown-dismiss
+                                // gesture to spend one on - this field does, and collapsing both
+                                // into one press meant "type a few characters, Escape the dropdown
+                                // away, keep typing" silently lost the draft.
                                 //
-                                // Focus deliberately STAYS in the field, which is what Chrome and
-                                // Firefox do - Escape reverts the text and leaves you able to
+                                // The stuck claim is still closed: Cmd+L opens no dropdown, so the
+                                // first Escape after it goes straight to the release.
+                                //
+                                // Focus deliberately STAYS in the field either way, which is what
+                                // both browsers do - Escape reverts the text and leaves you able to
                                 // retype. Clearing it would also send focus nowhere in particular
                                 // (the page is a native surface this plugin cannot focus), and the
                                 // tab's own onPreviewKeyEvent hangs off a non-focusable Column, so
                                 // dropping focus to the root risks taking Cmd+R and the zoom
                                 // chords out of the dispatch path.
-                                onDismissSuggestions()
-                                onCancelUrlEditing()
+                                if (showUrlSuggestions) onDismissSuggestions() else onCancelUrlEditing()
                                 true
                             }
                             else -> false

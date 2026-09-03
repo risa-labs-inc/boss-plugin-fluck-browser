@@ -97,7 +97,7 @@ class AddressBarUrlFieldTest {
         assertTrue(
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = false,
-                msSinceUserEdit = System.currentTimeMillis(),
+                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
                 typedSinceClaim = false,
             ),
             "with the claim released and lastUserEditTime reset to 0, navigations track again",

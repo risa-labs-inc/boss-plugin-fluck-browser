@@ -186,13 +186,20 @@ internal object AddressBarFocusRegistry {
         tabId: String,
         reason: String,
     ) {
-        if (shouldLogMiss("unregisterable:$tabId:$reason")) {
+        // Keyed on the REASON only, deliberately: including the tab id would leave one permanent
+        // entry per tab that ever hit this path, and this is a systemPlugin with canUnload:false,
+        // so "permanent" means the life of the process. The 30s window still names a fresh tab
+        // each time it reopens, which diagnoses the same thing.
+        if (shouldLogMiss("unregisterable:$reason")) {
             println("[FluckBrowser] Cmd+L unavailable for tab ${tabId.ifEmpty { "<no id>" }}: $reason")
         }
     }
 
     /** Test seam: how many toolbars are currently registered. */
     fun size(): Int = entries.size
+
+    /** Test seam: how many distinct throttle keys the miss log is holding. */
+    fun throttleKeyCount(): Int = lastMissLogged.size
 
     /**
      * Drops every registration. Called on plugin dispose, and by tests between cases.

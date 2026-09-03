@@ -109,13 +109,18 @@ class AddressBarWiringSourceTest {
         // exactly like "Cmd+L did nothing".
         val code = tabComponentCode()
 
+        // The PARAMETER name is BrowserToolbar's signature and fair to pin; the local handed to
+        // it is not - a rename there changes no behaviour, which is the same argument this file
+        // makes for panelActive.
+        val threaded = argumentsPassedTo("addressBarFocusRequester", code)
         assertTrue(
-            code.contains(Regex("""addressBarFocusRequester\s*=\s*addressBarFocusRequester""")),
-            "BrowserToolbar is no longer given the requester - the field it focuses is not the one on screen",
+            threaded.any { it != "null" },
+            "BrowserToolbar is no longer given a requester ($threaded) - the field it focuses is " +
+                "not the one on screen",
         )
         assertTrue(
-            code.contains(Regex("""\.focusRequester\(\s*addressBarFocusRequester\s*\)""")),
-            "the URL field no longer attaches the requester - requestFocus would throw on every Cmd+L",
+            code.contains(Regex("""\.focusRequester\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*\)""")),
+            "the URL field no longer attaches a requester - requestFocus would throw on every Cmd+L",
         )
     }
 
@@ -166,6 +171,32 @@ class AddressBarWiringSourceTest {
     }
 
     @Test
+    fun `Escape does not blank or collapse a field with nothing to revert`() {
+        // The guard standing between Escape and a blanked address bar on a home tab, where
+        // loadedUrl is deliberately "". Compose-side, so no unit test reaches it, and it is the
+        // only thing making restoreTo safe to call from there.
+        val code = tabComponentCode()
+
+        assertTrue(
+            code.contains(Regex("""loadedUrl\.isNotBlank\(\)\s*&&\s*urlBarText\.text\s*!=\s*loadedUrl""")),
+            "Escape can now blank the bar on a home tab, or collapse the selection on a field " +
+                "that already reads as the loaded URL",
+        )
+    }
+
+    @Test
+    fun `a tab that cannot register says so`() {
+        // Otherwise "Cmd+L never works in this tab" is indistinguishable in a log from "no
+        // toolbar in the active panel" - and only one of those is a configuration problem.
+        val code = tabComponentCode()
+
+        assertTrue(
+            code.contains(Regex("""noteUnregisterable\(""")),
+            "a tab that cannot register its toolbar is silent again",
+        )
+    }
+
+    @Test
     fun `Escape still hands a claimed field back`() {
         // Cmd+L claims the field without the user typing, so the Escape branch is the only thing
         // stopping a change of mind freezing the URL bar for the life of the tab.
@@ -173,7 +204,7 @@ class AddressBarWiringSourceTest {
 
         assertTrue(
             code.contains(Regex("""onCancelUrlEditing\s*\(\s*\)""")),
-            "Escape no longer cancels the edit - a Cmd+L the user backs out of leaves the bar claimed",
+            "nothing calls onCancelUrlEditing - a Cmd+L the user backs out of leaves the bar claimed",
         )
         assertTrue(
             code.contains(Regex("""onCancelUrlEditing\s*=""")),
