@@ -22,25 +22,25 @@ class AddressBarMissLogTest {
 
     @Test
     fun `a repeat inside the window stays quiet`() {
-        val start = 1_000_000L
+        val start = 1_000_000_000L
 
         assertFalse(AddressBarFocusRegistry.missLogDue(previous = start, now = start))
         assertFalse(
             AddressBarFocusRegistry.missLogDue(
                 previous = start,
-                now = start + AddressBarFocusRegistry.MISS_LOG_THROTTLE_MS - 1,
+                now = start + AddressBarFocusRegistry.MISS_LOG_THROTTLE_NANOS - 1,
             ),
         )
     }
 
     @Test
     fun `the window reopens`() {
-        val start = 1_000_000L
+        val start = 1_000_000_000L
 
         assertTrue(
             AddressBarFocusRegistry.missLogDue(
                 previous = start,
-                now = start + AddressBarFocusRegistry.MISS_LOG_THROTTLE_MS,
+                now = start + AddressBarFocusRegistry.MISS_LOG_THROTTLE_NANOS,
             ),
         )
     }
@@ -62,11 +62,15 @@ class AddressBarMissLogTest {
     }
 
     @Test
-    fun `a clock stepping backwards reads as due, not as half a century of silence`() {
-        // now - previous is negative, which is outside the throttle range either way. Erring
-        // toward logging costs a line; erring the other way costs the diagnosis.
-        val start = 1_000_000L
-
-        assertTrue(AddressBarFocusRegistry.missLogDue(previous = start, now = start - 5_000))
+    fun `the throttle is measured on a monotonic clock`() {
+        // The reason there is no backwards-step case any more: nanoTime cannot step in either
+        // direction, so the rule is a plain >= rather than a range with a special case for a
+        // wall clock that moved. Pinned as a unit check on the constant, since the clock itself
+        // is not injectable here.
+        assertEquals(30_000_000_000L, AddressBarFocusRegistry.MISS_LOG_THROTTLE_NANOS)
+        assertTrue(
+            AddressBarFocusRegistry.MISS_LOG_THROTTLE_NANOS > 1_000_000_000L,
+            "a nanosecond threshold mistaken for milliseconds would throttle for 30 nanoseconds",
+        )
     }
 }

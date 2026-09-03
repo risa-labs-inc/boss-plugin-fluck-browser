@@ -118,9 +118,12 @@ class AddressBarWiringSourceTest {
             "BrowserToolbar is no longer given a requester ($threaded) - the field it focuses is " +
                 "not the one on screen",
         )
+        // A smoke check, and only that: it matches any focusRequester modifier in the file, so
+        // it would keep passing if the URL field's were deleted and an unrelated one added. The
+        // honest guarantee is "some field still attaches one".
         assertTrue(
             code.contains(Regex("""\.focusRequester\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*\)""")),
-            "the URL field no longer attaches a requester - requestFocus would throw on every Cmd+L",
+            "no field attaches a focus requester at all - requestFocus would throw on every Cmd+L",
         )
     }
 
@@ -155,18 +158,22 @@ class AddressBarWiringSourceTest {
         // made - the claim-before-select ordering undone from behind.
         val code = tabComponentCode()
 
-        assertTrue(
-            code.contains(Regex("""val\s+releasing\s*=\s*claimGeneration\.get\(\)""")),
-            "the focus-loss release no longer captures the claim it was scheduled for",
-        )
-        assertTrue(
-            code.contains(Regex("""claimGeneration\.get\(\)\s*!=\s*releasing""")),
-            "the delayed release no longer checks it still owns the claim - a fresh Cmd+L can be " +
-                "wiped by the previous claim's release",
-        )
+        // Neither a local's name nor a one-line layout: rewrapping the condition changes no
+        // behaviour, which is the same objection this file makes for panelActive. What has to
+        // hold is that the generation is both bumped and read.
         assertTrue(
             code.contains(Regex("""claimGeneration\.incrementAndGet\(\)""")),
-            "nothing bumps the claim generation, so the check above can never fire",
+            "nothing bumps the claim generation, so no release can tell whose claim it holds",
+        )
+        assertTrue(
+            code.contains(Regex("""claimGeneration\.get\(\)""")),
+            "nothing reads the claim generation - the delayed focus-loss release can wipe a " +
+                "fresh Cmd+L claim",
+        )
+        assertTrue(
+            argumentsPassedTo("releasing", code).isNotEmpty() ||
+                code.contains(Regex("""!=\s*releasing""")),
+            "the delayed release no longer compares against the claim it was scheduled for",
         )
     }
 

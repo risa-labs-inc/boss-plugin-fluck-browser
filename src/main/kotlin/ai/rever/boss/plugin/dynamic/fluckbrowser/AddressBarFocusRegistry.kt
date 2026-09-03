@@ -62,7 +62,7 @@ internal object AddressBarFocusRegistry {
     private val sequencer = AtomicLong(0)
 
     /**
-     * Last time each miss reason was logged, keyed by reason AND window.
+     * Last time each miss reason was logged, keyed by reason AND window, on [System.nanoTime].
      *
      * Throttled rather than one-shot: a user who rebinds this action to a GLOBAL chord would get
      * a line every time they pressed it anywhere in the app, but a latch that never reopens keeps
@@ -73,7 +73,7 @@ internal object AddressBarFocusRegistry {
      */
     private val lastMissLogged = ConcurrentHashMap<String, Long>()
 
-    internal const val MISS_LOG_THROTTLE_MS = 30_000L
+    internal const val MISS_LOG_THROTTLE_NANOS = 30_000_000_000L
 
     /**
      * Whether this miss is far enough from the last one of its kind to be worth a line.
@@ -83,7 +83,7 @@ internal object AddressBarFocusRegistry {
      * EDT-only today, so this is about the code saying what it means.
      */
     private fun shouldLogMiss(key: String): Boolean {
-        val now = System.currentTimeMillis()
+        val now = System.nanoTime()
         var log = false
         lastMissLogged.compute(key) { _, previous ->
             log = missLogDue(previous, now)
@@ -96,14 +96,14 @@ internal object AddressBarFocusRegistry {
      * The throttle decision, split out of [shouldLogMiss] so it is assertable: the map access
      * around it is only observable through `println`, and the rule inside it is not obvious.
      *
-     * A never-logged key is always due. A clock stepping backwards (so the elapsed time is
-     * negative) reads as due rather than as "half a century of silence", which errs toward
-     * logging - the direction that costs a line rather than a diagnosis.
+     * A never-logged key is always due. [System.nanoTime] is monotonic, so unlike a wall clock
+     * it cannot step in either direction and no special case is needed for one that does - which
+     * is the whole reason this is not measured in `currentTimeMillis`.
      */
     internal fun missLogDue(
         previous: Long?,
         now: Long,
-    ): Boolean = previous == null || now - previous !in 0 until MISS_LOG_THROTTLE_MS
+    ): Boolean = previous == null || now - previous >= MISS_LOG_THROTTLE_NANOS
 
     /**
      * Record that [tabId]'s address bar is composed in [windowId].
@@ -171,8 +171,17 @@ internal object AddressBarFocusRegistry {
         // does: this runs inside the host's key-event dispatch, and letting anything escape would
         // take out the whole keyboard path rather than one chord.
         return runCatching { target.focus() }
-            .onFailure { println("[FluckBrowser] Cmd+L could not focus the address bar: ${it.message}") }
-            .isSuccess
+            .onFailure {
+                // Throttled like the two miss paths above, and for the same reason: this is the
+                // path a hibernated tab or a future toolbar gate takes, and it repeats on every
+                // press. Keyed on the reason only, not the tab - see noteUnregisterable.
+                if (shouldLogMiss("focus-failed")) {
+                    println(
+                        "[FluckBrowser] Cmd+L could not focus the address bar of tab " +
+                            "${target.tabId.ifEmpty { "<no id>" }}: ${it.message}",
+                    )
+                }
+            }.isSuccess
     }
 
     /**

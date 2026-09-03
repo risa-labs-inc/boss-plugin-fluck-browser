@@ -29,12 +29,21 @@ internal object AddressBarUrlField {
      * takes the claim on a keystroke that types nothing, so "claim it, then click the page"
      * would otherwise stop the URL bar following navigations for the life of the tab.
      *
-     * Bounded rather than released outright, and gated on nothing having been TYPED, because
-     * those are the two things that keep it from undoing the other two rules here: Cmd+L's
-     * selection needs protecting for seconds, not a minute, and text the user actually typed is
-     * not discarded by THIS rule however long it has sat there. Not a promise that a typed draft
-     * survives indefinitely: once `onFocusLost`'s delayed release clears the claim, a navigation
-     * past [USER_EDIT_GRACE_MS] overwrites the field like it always did.
+     * Bounded rather than released outright, and gated on nothing having been TYPED UNDER THE
+     * CURRENT CLAIM, because those are the two things that keep it from undoing the other two
+     * rules here: Cmd+L's selection needs protecting for seconds, not a minute, and text typed
+     * under a standing claim is not discarded by this rule however long it has sat there.
+     *
+     * "Under the current claim" is the exact scope, and it is narrower than "the user typed it":
+     *  - `onFocusLost`'s delayed release ends the claim, after which a navigation past
+     *    [USER_EDIT_GRACE_MS] overwrites the field like it always did;
+     *  - Cmd+L over an existing draft starts a FRESH claim, so that draft becomes staleable. That
+     *    is deliberate: Cmd+L selects the whole field, which is the user saying they are about to
+     *    replace it, so treating the text as precious would be reading the gesture backwards.
+     *
+     * Note also that this branch does not clear `isUserEditingUrl` - it only stops consulting it.
+     * "Claimed" and "protected" therefore diverge permanently once a claim goes stale, until the
+     * next keystroke re-arms protection through [USER_EDIT_GRACE_MS].
      */
     const val UNTYPED_CLAIM_STALE_MS = 60_000L
 

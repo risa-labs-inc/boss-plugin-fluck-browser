@@ -135,6 +135,68 @@ import javax.swing.JSeparator
 import kotlin.math.abs
 
 /**
+ * Keeps [AddressBarFocusRegistry] told about this tab's address bar, for as long as it is composed.
+ *
+ * Its own composable purely to scope the invalidation: reading `LocalIsPanelActive.current` in
+ * `FluckBrowserTabContent`'s body would subscribe that entire 7000-line function to panel-active
+ * changes, so every click between splits would recompose the whole tab. Here it recomposes this.
+ *
+ * @param onFocus focuses and selects the field. Invoked from the host's key dispatch on the UI
+ *   thread, NOT from composition, so it may touch state directly.
+ */
+@Composable
+private fun AddressBarRegistration(
+    tabId: String,
+    focusRequester: FocusRequester,
+    onFocus: () -> Unit,
+) {
+    // A plain call, not a snapshot state read, and used as a DisposableEffect key: a window id
+    // that changed WITHOUT a recomposition would leave a stale entry. Safe only because a tab
+    // changing windows rebuilds this composition (the same fact the registry's identity keying is
+    // built on), which is where that assumption is cashed. getWindowId() is a field read
+    // host-side, so calling it per recomposition costs nothing worth remembering.
+    val windowId = LocalWindowIdProvider.current?.getWindowId()
+    val panelActive = LocalIsPanelActive.current
+
+    if (windowId == null) {
+        // Say so once per reason, rather than leaving this tab silently unable to answer Cmd+L.
+        // An effect, not a bare call: a composable body re-runs on every recomposition.
+        DisposableEffect(windowId) {
+            AddressBarFocusRegistry.noteUnregisterable(tabId, "the host reported no window id")
+            onDispose {}
+        }
+        return
+    }
+
+    // Not gated on a non-blank tabId. The registry ranks on window, panel and composition order
+    // and never reads the id for anything but a log line, so refusing an id-less tab would cost
+    // it Cmd+L in exchange for nothing.
+    DisposableEffect(tabId, windowId, panelActive) {
+        val token =
+            AddressBarFocusRegistry.register(
+                tabId = tabId,
+                windowId = windowId,
+                panelActive = panelActive,
+            ) {
+                // Not wrapped in runCatching: requestFocus throws when the requester is not
+                // attached to a node, and the registry's own catch turns that into the `false`
+                // its caller reads. Catching it here as well made that false unreachable in
+                // production and left the failure silent.
+                //
+                // Registered is very nearly the same as focusable here, because BrowserToolbar is
+                // composed UNCONDITIONALLY alongside this effect - fullscreen and the boot spinner
+                // replace only the weighted Box below the toolbar, not the toolbar itself. What is
+                // left is attach timing (the effect runs before the field is laid out on the first
+                // frame) and any future change that gates the toolbar, which is why the throw is
+                // caught rather than assumed away.
+                focusRequester.requestFocus()
+                onFocus()
+            }
+        onDispose { AddressBarFocusRegistry.unregister(token) }
+    }
+}
+
+/**
  * Fluck Browser tab component (Dynamic Plugin)
  *
  * Uses BrowserService from host for full browser functionality.
@@ -2662,64 +2724,25 @@ internal fun FluckBrowserTabContent(
     val claimGeneration = remember { AtomicLong(0) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
 
-    // Cmd+L. The chord is a plugin-contributed GLOBAL shortcut, so it arrives with only a window
-    // id and no idea which surface should answer; the registry resolves that from what is
-    // actually composed. Registered per (window, panel-active) so the answer follows the user
-    // between splits - see AddressBarFocusRegistry.
-    //
-    // Placed BELOW isUserEditingUrl/lastUserEditTime deliberately: the focus callback has to set
-    // them, so it cannot be declared above them.
+    // Cmd+L. Declared BELOW isUserEditingUrl/lastUserEditTime deliberately: the focus callback
+    // has to set them, so it cannot be declared above them.
     val addressBarFocusRequester = remember { FocusRequester() }
-    // A plain call, not a snapshot state read, and used as a DisposableEffect key: a window id
-    // that changed WITHOUT a recomposition would leave a stale entry. Safe only because a tab
-    // changing windows rebuilds this composition (the same fact the registry's stale-token
-    // handling is built on), which is where that assumption is cashed.
-    val addressBarWindowId = LocalWindowIdProvider.current?.getWindowId()
-    val addressBarPanelActive = LocalIsPanelActive.current
-    if (tabId.isNotEmpty() && addressBarWindowId != null) {
-        DisposableEffect(tabId, addressBarWindowId, addressBarPanelActive) {
-            val token =
-                AddressBarFocusRegistry.register(
-                    tabId = tabId,
-                    windowId = addressBarWindowId,
-                    panelActive = addressBarPanelActive,
-                ) {
-                    // Not wrapped in runCatching: requestFocus throws when the requester is not
-                    // attached to a node, and the registry's own catch turns that into the
-                    // `false` its caller reads. Catching it here as well made that false
-                    // unreachable in production and left the failure silent.
-                    //
-                    // Registered is very nearly the same as focusable here, because BrowserToolbar
-                    // is composed UNCONDITIONALLY alongside this effect - fullscreen and the boot
-                    // spinner replace only the weighted Box below the toolbar, not the toolbar
-                    // itself. What is left is attach timing (the effect runs before the field is
-                    // laid out on the first frame) and any future change that gates the toolbar,
-                    // which is why the throw is caught rather than assumed away.
-                    addressBarFocusRequester.requestFocus()
+    AddressBarRegistration(
+        tabId = tabId,
+        focusRequester = addressBarFocusRequester,
+    ) {
+        // Claim the field BEFORE selecting it, or the navigation listener below wipes the
+        // selection - see AddressBarUrlField.navigationMayRewrite, which is the predicate that
+        // listener asks.
+        isUserEditingUrl = true
+        lastUserEditTime = System.currentTimeMillis()
+        // Cmd+L is an explicit "I am replacing this" gesture - it selects the whole field - so
+        // the claim it takes is a FRESH one even over a draft. That is what lets an abandoned
+        // Cmd+L go stale; see UNTYPED_CLAIM_STALE_MS for the promise this does and does not make.
+        typedSinceClaim = false
+        claimGeneration.incrementAndGet()
 
-                    // Claim the field BEFORE selecting it, or the navigation listener below
-                    // wipes the selection - see AddressBarUrlField.navigationMayRewrite, which
-                    // is the predicate that listener asks.
-                    isUserEditingUrl = true
-                    lastUserEditTime = System.currentTimeMillis()
-                    // A fresh claim, whatever the field happens to be holding.
-                    typedSinceClaim = false
-                    claimGeneration.incrementAndGet()
-
-                    urlBarText = AddressBarUrlField.selectAll(urlBarText)
-                }
-            onDispose { AddressBarFocusRegistry.unregister(token) }
-        }
-    } else {
-        // Say so once, rather than leaving this tab silently unable to answer Cmd+L. An
-        // effect, not a bare call: the composable body re-runs on every recomposition.
-        DisposableEffect(tabId, addressBarWindowId) {
-            AddressBarFocusRegistry.noteUnregisterable(
-                tabId = tabId,
-                reason = if (addressBarWindowId == null) "the host reported no window id" else "the tab has no id",
-            )
-            onDispose {}
-        }
+        urlBarText = AddressBarUrlField.selectAll(urlBarText)
     }
     val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
     val handlePopupNavigation: (PopupNavigation) -> Unit = { navigation ->

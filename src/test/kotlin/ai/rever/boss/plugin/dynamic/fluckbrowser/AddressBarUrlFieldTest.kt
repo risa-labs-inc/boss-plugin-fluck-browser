@@ -169,10 +169,15 @@ class AddressBarUrlFieldTest {
     }
 
     @Test
-    fun `text the user actually typed is never discarded, however stale`() {
+    fun `text typed under the standing claim is never discarded, however stale`() {
         // The gate that keeps the staleness bound from becoming a data-loss bug: someone who
         // types a long URL and is interrupted for an hour still finds it there, because the
-        // bound only ever releases a claim over text nothing has changed.
+        // bound only ever releases a claim nothing was typed under.
+        //
+        // Scope matters and is documented on UNTYPED_CLAIM_STALE_MS: this is "typed under the
+        // CURRENT claim", so pressing Cmd+L over a draft starts a fresh one and makes that draft
+        // staleable - deliberately, because Cmd+L selects the whole field, which is the user
+        // saying they are about to replace it.
         assertFalse(
             AddressBarUrlField.navigationMayRewrite(
                 isUserEditing = true,
