@@ -1,7 +1,10 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.api.DynamicPlugin
+import ai.rever.boss.plugin.api.KeyChordSpec
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.boss.plugin.api.PluginShortcutSpec
+import ai.rever.boss.plugin.api.ShortcutActionProvider
 import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
 
 /**
@@ -24,6 +27,39 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
 
     private var pluginContext: PluginContext? = null
 
+    /**
+     * Cmd+L — "Open Location", focusing the address bar of the browser tab in front of the user.
+     *
+     * Contributed rather than built into the host keymap because the field lives here. The host
+     * unregisters this automatically on disable/unload, after which the chord goes inert; a user
+     * rebind stored under [FOCUS_ADDRESS_BAR_ACTION] in the keymap file supersedes the default
+     * and survives plugin reloads.
+     */
+    private val addressBarShortcuts =
+        object : ShortcutActionProvider {
+            override val providerId: String = pluginId
+
+            override fun shortcuts(): List<PluginShortcutSpec> =
+                listOf(
+                    PluginShortcutSpec(
+                        actionId = FOCUS_ADDRESS_BAR_ACTION,
+                        displayName = "Focus Address Bar",
+                        description = "Focus and select the browser tab's address bar",
+                        defaultBinding = KeyChordSpec(key = "L", modifiers = setOf("Cmd")),
+                    ),
+                )
+
+            override fun onAction(
+                actionId: String,
+                windowId: String?,
+            ) {
+                if (actionId != FOCUS_ADDRESS_BAR_ACTION) return
+                // False when this window has no composed browser toolbar. Nothing to do — the
+                // registry deliberately does not reach into another window to find one.
+                AddressBarFocusRegistry.focusActiveIn(windowId)
+            }
+        }
+
     override fun register(context: PluginContext) {
         pluginContext = context
 
@@ -34,6 +70,11 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
 
         // Contribute browser_get_url/navigate/run_js MCP tools; auto-removed on disable/unload.
         context.registerMcpToolProvider(FluckBrowserMcpToolProvider(pluginId, context.activeTabsProvider))
+
+        // Cmd+L. The address bar belongs to this plugin, not the host, so the chord does too —
+        // the host has no URL field to focus and every other keymap action it owns acts on a
+        // BrowserHandle rather than on our toolbar.
+        context.registerShortcutActionProvider(addressBarShortcuts)
 
         // Co-browse tab sharing: store context. The embedded server binds lazily on
         // the first share() call. Approval is surfaced BossTerm-style — the in-tab
@@ -52,7 +93,13 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
 
         // Tear down the share server (stops any active capture) before unregistering.
         BrowserShareManager.shutdown()
+        pluginContext?.unregisterShortcutActionProvider(addressBarShortcuts.providerId)
         pluginContext?.tabRegistry?.unregisterTabType(FluckBrowserTabType.typeId)
         pluginContext = null
+    }
+
+    companion object {
+        /** Must be `plugin.<pluginId>.<name>`; the host rejects anything else. */
+        const val FOCUS_ADDRESS_BAR_ACTION = "plugin.ai.rever.boss.plugin.dynamic.fluckbrowser.focus_address_bar"
     }
 }

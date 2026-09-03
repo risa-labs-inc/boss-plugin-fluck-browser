@@ -128,6 +128,11 @@ import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
 import javax.swing.JSeparator
 import kotlin.math.abs
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.runtime.DisposableEffect
+import ai.rever.boss.plugin.api.LocalWindowIdProvider
+import ai.rever.boss.plugin.api.LocalIsPanelActive
 
 /**
  * Fluck Browser tab component (Dynamic Plugin)
@@ -2625,6 +2630,35 @@ internal fun FluckBrowserTabContent(
     val browserHandle by hoistedState::browserHandle
     var isLoading by hoistedState::isLoading
     var urlBarText by hoistedState::urlBarText
+
+    // Cmd+L. The chord is a plugin-contributed GLOBAL shortcut, so it arrives with only a window
+    // id and no idea which surface should answer; the registry resolves that from what is
+    // actually composed. Registered per (window, panel-active) so the answer follows the user
+    // between splits — see AddressBarFocusRegistry.
+    val addressBarFocusRequester = remember { FocusRequester() }
+    val addressBarWindowId = LocalWindowIdProvider.current?.getWindowId()
+    val addressBarPanelActive = LocalIsPanelActive.current
+    if (tabId.isNotEmpty() && addressBarWindowId != null) {
+        DisposableEffect(tabId, addressBarWindowId, addressBarPanelActive) {
+            val token =
+                AddressBarFocusRegistry.register(
+                    tabId = tabId,
+                    windowId = addressBarWindowId,
+                    panelActive = addressBarPanelActive,
+                ) {
+                    // requestFocus throws if the requester is not currently attached to a node
+                    // (this tab hibernated, or the toolbar is hidden in fullscreen). Treated as
+                    // "nothing to focus" rather than an escape into the host's event dispatch.
+                    runCatching {
+                        addressBarFocusRequester.requestFocus()
+                        // Select the whole URL, the way every browser's Cmd+L does, so typing
+                        // replaces it instead of appending to it.
+                        urlBarText = urlBarText.copy(selection = TextRange(0, urlBarText.text.length))
+                    }
+                }
+            onDispose { AddressBarFocusRegistry.unregister(tabId, token) }
+        }
+    }
     var loadedUrl by hoistedState::loadedUrl
     var pageTitle by hoistedState::pageTitle
     var zoomLevel by hoistedState::zoomLevel
@@ -3764,6 +3798,7 @@ internal fun FluckBrowserTabContent(
                 }
             } else null,
             isSharing = liveShareInfo != null,
+            addressBarFocusRequester = addressBarFocusRequester,
             urlBarText = urlBarText,
             onUrlBarTextChange = { newValue ->
                 isUserEditingUrl = true
@@ -5854,7 +5889,12 @@ internal fun BrowserToolbar(
     onSuggestionDeleted: (UrlHistoryEntry) -> Unit = {},
     onFocusLost: () -> Unit = {},
     onShare: (() -> Unit)? = null,
-    isSharing: Boolean = false
+    isSharing: Boolean = false,
+    /**
+     * Attached to the URL field so Cmd+L can focus it from outside the composition
+     * (see [AddressBarFocusRegistry]). Null in previews and tests, which do not need it.
+     */
+    addressBarFocusRequester: FocusRequester? = null
 ) {
     val coroutineScope = rememberCoroutineScope()
     // Auto-scroll to selected suggestion when using arrow keys
@@ -5996,6 +6036,7 @@ internal fun BrowserToolbar(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(28.dp)
+                    .then(addressBarFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
                     .onFocusChanged { focusState ->
                         if (!focusState.isFocused) {
                             onFocusLost()
