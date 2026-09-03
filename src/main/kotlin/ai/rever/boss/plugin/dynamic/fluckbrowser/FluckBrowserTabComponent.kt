@@ -10,6 +10,8 @@ import ai.rever.boss.plugin.api.BookmarkDataProvider
 import ai.rever.boss.plugin.api.CreateSecretRequestData
 import ai.rever.boss.plugin.api.DashboardContentProvider
 import ai.rever.boss.plugin.api.InternalBrowserTabData
+import ai.rever.boss.plugin.api.LocalIsPanelActive
+import ai.rever.boss.plugin.api.LocalWindowIdProvider
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.ScreenCaptureProvider
 import ai.rever.boss.plugin.api.SecretDataProvider
@@ -67,6 +69,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerButton
@@ -128,11 +132,6 @@ import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
 import javax.swing.JSeparator
 import kotlin.math.abs
-import ai.rever.boss.plugin.api.LocalIsPanelActive
-import ai.rever.boss.plugin.api.LocalWindowIdProvider
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 
 /**
  * Fluck Browser tab component (Dynamic Plugin)
@@ -2673,17 +2672,13 @@ internal fun FluckBrowserTabContent(
                     // the failure silent.
                     addressBarFocusRequester.requestFocus()
 
-                    // Claim the field before selecting it. The navigation listener rewrites
-                    // urlBarText with a COLLAPSED selection whenever !isUserEditingUrl and the
-                    // last edit is over 300ms old, so on a still-loading or redirecting page a
-                    // callback landing a beat after Cmd+L would wipe the selection while the
-                    // field kept focus - the next keystroke then appends to the URL instead of
-                    // replacing it, which is exactly what selecting it exists to prevent.
+                    // Claim the field BEFORE selecting it, or the navigation listener below
+                    // wipes the selection - see AddressBarUrlField.navigationMayRewrite, which
+                    // is the predicate that listener asks.
                     isUserEditingUrl = true
                     lastUserEditTime = System.currentTimeMillis()
 
-                    // Select the whole URL, the way every browser's Cmd+L does.
-                    urlBarText = urlBarText.copy(selection = TextRange(0, urlBarText.text.length))
+                    urlBarText = AddressBarUrlField.selectAll(urlBarText)
                 }
             onDispose { AddressBarFocusRegistry.unregister(tabId, token) }
         }
@@ -3060,10 +3055,13 @@ internal fun FluckBrowserTabContent(
                     if (hoistedState.browserHandle !== handle) return@addNavigationListener
                     installDirtyMarker(handle, coroutineScope, hoistedState)
                     loadedUrl = url
-                    // Only update URL bar if user isn't actively editing
-                    // AND sufficient time has passed since last input (300ms buffer for Tab completion)
-                    val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
-                    if (!isUserEditingUrl && timeSinceEdit > 300) {
+                    // Only update URL bar while the user does not own the field - which is
+                    // also what keeps Cmd+L's selection alive on a still-loading page.
+                    if (AddressBarUrlField.navigationMayRewrite(
+                            isUserEditing = isUserEditingUrl,
+                            msSinceUserEdit = System.currentTimeMillis() - lastUserEditTime,
+                        )
+                    ) {
                         urlBarText = TextFieldValue(url, TextRange(url.length))
                     }
 

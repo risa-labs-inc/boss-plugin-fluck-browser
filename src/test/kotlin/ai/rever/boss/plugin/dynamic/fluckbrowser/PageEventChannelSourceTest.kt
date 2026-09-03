@@ -102,6 +102,17 @@ class PageEventChannelSourceTest {
         // the plugin unloadable below them for a feature it can now do without, and lowering them
         // while calling directly would make it CRASH there instead. They move together or not at
         // all.
+        //
+        // Every api symbol this plugin NAMES directly must therefore exist at 1.0.73. Recorded as
+        // they get added, so the next person does not have to re-derive them from the api repo's
+        // tags (`git grep <symbol> <tag>` over risa-labs-inc/boss-plugin-api):
+        //   - registerShortcutActionProvider, unregisterShortcutActionProvider,
+        //     ShortcutActionProvider, PluginShortcutSpec, KeyChordSpec .... api 1.0.62
+        //   - LocalWindowIdProvider ................................................ api 1.0.16
+        //   - LocalIsPanelActive ................................................... api 1.0.38
+        // All at or below the floor, so Cmd+L's registration cannot be what stops the jar
+        // loading. Anything added ABOVE the floor has to go through PageEventChannel-style
+        // reflection instead, not a floor bump.
         val root = assertNotNull(repoRoot(), "could not locate the plugin root")
         val manifest = File(root, "src/main/resources/META-INF/boss-plugin/plugin.json").readText()
         assertTrue(

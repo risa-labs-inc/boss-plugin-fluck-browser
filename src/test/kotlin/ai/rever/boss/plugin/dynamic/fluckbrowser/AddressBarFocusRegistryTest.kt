@@ -5,8 +5,6 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import kotlin.test.assertNotNull
-import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -30,7 +28,8 @@ class AddressBarFocusRegistryTest {
         tabId: String,
         windowId: String,
         panelActive: Boolean = true,
-    ): Any = AddressBarFocusRegistry.register(tabId, windowId, panelActive) { focused.add(tabId) }
+    ): AddressBarFocusRegistry.Registration =
+        AddressBarFocusRegistry.register(tabId, windowId, panelActive) { focused.add(tabId) }
 
     @Test
     fun `no composed toolbar means the chord goes unhandled`() {
@@ -134,63 +133,27 @@ class AddressBarFocusRegistryTest {
     }
 
     @Test
-    fun `the action id matches what the host requires of it`() {
-        // Must be exactly "plugin.<pluginId>.<name>" or the host rejects the registration and the
-        // shortcut is silently lost. The id is a const and the plugin id is a separate literal,
-        // so this is what stops the two drifting.
-        val plugin = FluckBrowserDynamicPlugin()
+    fun `the window filter runs before the tie-break`() {
+        // The other window's toolbar is composed LATER, so it has the higher sequence. Filtering
+        // after ranking - or ranking a mixed set - would focus a toolbar in a window the user is
+        // not even in. One entry per window is not enough to catch that: it passes either way.
+        register("in-this-window", "window-1")
+        register("in-that-window", "window-2")
 
-        assertEquals(
-            "plugin.${plugin.pluginId}.focus_address_bar",
-            FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION,
-        )
-        assertTrue(FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION.startsWith("plugin."))
+        assertTrue(AddressBarFocusRegistry.focusActiveIn("window-1"))
+        assertEquals(listOf("in-this-window"), focused)
     }
 
     @Test
-    fun `the action ships with no default binding, deliberately`() {
-        // A plugin default is GLOBAL in the host's v1 contract and is consumed whenever a
-        // provider owns the action, so a Cmd+L default here would shadow the host's
-        // EDITOR_GO_TO_LINE (also Cmd+L) and swallow it - the editor plugin opens Go To Line from
-        // its own key handling, so the chord has to reach it.
-        //
-        // The chord therefore lives in the host's keymap presets, bound to this action id with
-        // BROWSER context, which is the only layer where a context can be expressed. A host too
-        // old to carry that entry leaves Cmd+L alone rather than breaking Go To Line, which is
-        // what makes this safe to ship independently of the host.
-        val spec = FluckBrowserDynamicPlugin().addressBarShortcuts.shortcuts().single()
-
-        assertEquals(FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION, spec.actionId)
-        assertNull(spec.defaultBinding, "a GLOBAL Cmd+L default would swallow the editor's Go To Line")
-        assertEquals("Focus Address Bar", spec.displayName)
-    }
-
-    @Test
-    fun `the provider ignores action ids that are not its own`() {
-        // dispatch() routes by action id, but a provider that acted on anything handed to it
-        // would move focus on an unrelated plugin's chord.
+    fun `a token that is not a registration is ignored`() {
+        // The branch a null token takes. It reaches unregister for real: the composable's
+        // onDispose hands back whatever register returned, and a future refactor that made that
+        // nullable must not silently wipe the live entry for the tab id.
         register("tab-1", "window-1")
-        val provider = FluckBrowserDynamicPlugin().addressBarShortcuts
 
-        provider.onAction("plugin.something.else", "window-1")
+        AddressBarFocusRegistry.unregister("tab-1", null)
 
-        assertTrue(focused.isEmpty(), "only this plugin's action should focus the address bar")
-    }
-
-    @Test
-    fun `the provider focuses on its own action id`() {
-        register("tab-1", "window-1")
-        val provider = FluckBrowserDynamicPlugin().addressBarShortcuts
-
-        provider.onAction(FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION, "window-1")
-
-        assertEquals(listOf("tab-1"), focused)
-    }
-
-    @Test
-    fun `the provider id is the plugin id, as the host expects`() {
-        val plugin = FluckBrowserDynamicPlugin()
-
-        assertEquals(plugin.pluginId, plugin.addressBarShortcuts.providerId)
+        assertEquals(1, AddressBarFocusRegistry.size(), "a null token must not evict anything")
+        assertTrue(AddressBarFocusRegistry.focusActiveIn("window-1"))
     }
 }

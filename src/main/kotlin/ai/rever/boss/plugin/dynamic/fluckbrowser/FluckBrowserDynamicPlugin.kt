@@ -67,6 +67,25 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
              * interceptor"), and the interceptor is an AWT `KeyEventDispatcher`, so the caller is
              * the EDT. That is what makes it safe to touch a FocusRequester and Compose state
              * from here without posting to a scope.
+             *
+             * **When the chord reaches here at all**, given the host's interceptor is an AWT
+             * dispatcher and the page is a native Chromium surface:
+             *  - macOS, either rendering mode: yes, including while focus is inside page content.
+             *    The host's `FluckEngine.ownsChordsNatively` is macOS-exempt precisely because
+             *    the chord reaches AWT there, and its native key callback declines to serve
+             *    chords for that reason.
+             *  - OFF_SCREEN anywhere: yes - the keystroke arrives through AWT and Compose.
+             *  - Windows/Linux in HARDWARE_ACCELERATED, focus inside the page: NO. Chromium's
+             *    native child window consumes the key before the JVM sees it, which is the whole
+             *    reason `ownsChordsNatively` exists. That affects every keymap chord equally, not
+             *    just this one; the host serves the handful it owns (reload, zoom, N/T/W,
+             *    Shift+F/S, find) from its own `PressKeyCallback`, and that callback dispatches
+             *    named host actions rather than plugin action ids. Closing it for THIS action is a
+             *    host-side change, in that callback - it cannot be done from the plugin.
+             *
+             * Taking Compose focus is enough to redirect typing: the page is JxBrowser's Compose
+             * `BrowserViewState` inside the window's single ComposePanel, not a sibling AWT
+             * component, so there is no separate AWT focus owner still holding the keyboard.
              */
             override fun onAction(
                 actionId: String,
@@ -93,6 +112,13 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // Cmd+L. The address bar belongs to this plugin, not the host, so the chord does too —
         // the host has no URL field to focus and every other keymap action it owns acts on a
         // BrowserHandle rather than on our toolbar.
+        //
+        // Safe at the declared api floor: registerShortcutActionProvider /
+        // unregisterShortcutActionProvider / ShortcutActionProvider / PluginShortcutSpec all
+        // landed in api 1.0.62, LocalWindowIdProvider in 1.0.16 and LocalIsPanelActive in 1.0.38
+        // — all at or below plugin.json's minApiVersion 1.0.73, so no host that loads this jar
+        // can be missing them. That check is the point of PageEventChannelSourceTest; see its
+        // floor rationale for why getting it wrong costs the whole plugin rather than the chord.
         context.registerShortcutActionProvider(addressBarShortcuts)
 
         // Co-browse tab sharing: store context. The embedded server binds lazily on

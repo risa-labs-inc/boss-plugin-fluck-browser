@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -15,8 +16,21 @@ import java.util.concurrent.atomic.AtomicLong
  * Without this, Cmd+L in a terminal tab would yank focus into some arbitrary browser tab in
  * another split. With it, the chord is inert unless a browser toolbar is actually the thing in
  * front of the user.
+ *
+ * **The invariant the tie-break rests on:** `FluckBrowserTabContent` LEAVES COMPOSITION on a tab
+ * switch — that is what the hibernation `DisposableEffect` further down that file is built on, and
+ * why the browser handle is hoisted into the parent Component instead. So a background tab in the
+ * same panel holds no entry at all, and "most recently composed" means "the tab in front of the
+ * user". If tab compositions were ever kept alive while hidden, [sequence] would start picking
+ * hidden tabs and would have to be replaced by something the host tells us.
  */
 internal object AddressBarFocusRegistry {
+    /**
+     * A live registration. Opaque on purpose: [unregister] takes this type rather than [Any], so
+     * handing back the wrong thing is a compile error instead of a silent no-op.
+     */
+    interface Registration
+
     /**
      * One composed browser toolbar.
      *
@@ -31,10 +45,17 @@ internal object AddressBarFocusRegistry {
         val panelActive: Boolean,
         val sequence: Long,
         val focus: () -> Unit,
-    )
+    ) : Registration
 
     private val entries = ConcurrentHashMap<String, Entry>()
     private val sequencer = AtomicLong(0)
+
+    // One-shot, because the miss paths are diagnostics for a misconfiguration, not per-keypress
+    // telemetry: under the BROWSER-context preset binding a miss is rare, but a user who rebinds
+    // this action to a GLOBAL chord would otherwise get a line every time they pressed it
+    // anywhere in the app. First occurrence is the one worth having.
+    private val loggedNoWindowId = AtomicBoolean(false)
+    private val loggedNoToolbar = AtomicBoolean(false)
 
     /**
      * Record that [tabId]'s address bar is composed in [windowId].
@@ -50,7 +71,7 @@ internal object AddressBarFocusRegistry {
         windowId: String,
         panelActive: Boolean,
         focus: () -> Unit,
-    ): Any {
+    ): Registration {
         val entry =
             Entry(
                 tabId = tabId,
@@ -66,7 +87,7 @@ internal object AddressBarFocusRegistry {
     /** Remove [tabId]'s registration, but only if [token] is still the current one. */
     fun unregister(
         tabId: String,
-        token: Any?,
+        token: Registration?,
     ) {
         if (token is Entry) entries.remove(tabId, token)
     }
@@ -74,19 +95,24 @@ internal object AddressBarFocusRegistry {
     /**
      * Focus the address bar of the browser tab that owns Cmd+L in [windowId].
      *
-     * @return false when this window has no composed browser toolbar, so the caller can leave the
-     *   chord unhandled rather than swallow it.
+     * @return whether a toolbar took the focus. Defense-in-depth and a test seam rather than a
+     *   signal any caller acts on: a plugin `onAction` returns Unit, so the host's `dispatch`
+     *   reports the chord handled whenever a provider owns the action, however this answers.
      */
     fun focusActiveIn(windowId: String?): Boolean {
         if (windowId == null) {
             // The host could not attribute the keypress to a window. Focusing "whatever we can
             // find" would be worse than doing nothing.
-            println("[FluckBrowser] Cmd+L ignored: no window id")
+            if (loggedNoWindowId.compareAndSet(false, true)) {
+                println("[FluckBrowser] Cmd+L ignored: no window id")
+            }
             return false
         }
         val target = selectFocusTarget(entries.values, windowId)
         if (target == null) {
-            println("[FluckBrowser] Cmd+L ignored: no browser toolbar in the active panel of $windowId")
+            if (loggedNoToolbar.compareAndSet(false, true)) {
+                println("[FluckBrowser] Cmd+L ignored: no browser toolbar in the active panel of $windowId")
+            }
             return false
         }
         // Catches Throwable, which is deliberate for the same reason the host's plugin dispatch
@@ -100,9 +126,17 @@ internal object AddressBarFocusRegistry {
     /** Test seam: how many toolbars are currently registered. */
     fun size(): Int = entries.size
 
-    /** Drops every registration. Called on plugin dispose, and by tests between cases. */
+    /**
+     * Drops every registration. Called on plugin dispose, and by tests between cases.
+     *
+     * This object is a process-global singleton, so a test that registers anything MUST clear
+     * (see `AddressBarFocusRegistryTest`'s `@BeforeTest`/`@AfterTest`) or it leaks entries into
+     * whatever runs next. Resets the one-shot log latches for the same reason.
+     */
     fun clear() {
         entries.clear()
+        loggedNoWindowId.set(false)
+        loggedNoToolbar.set(false)
     }
 
     /**
@@ -117,6 +151,19 @@ internal object AddressBarFocusRegistry {
      *
      * Among the remaining candidates the most recently composed wins: the browser tab the user
      * most recently brought to the front.
+     *
+     * **Why there is no "is this really a main-window panel?" rank above `panelActive`, unlike
+     * the host's `selectActiveHandleId`.** `LocalIsPanelActive` defaults to `true`, so a surface
+     * composed outside a managed panel reads as active too; the host separates the two with
+     * `LocalInMainWindowPanel`, which is host-internal (`BossMainWindowPanel.kt`) and NOT part of
+     * the plugin api, so this registry cannot read it. It does not need to: the host composes a
+     * plugin TAB type's `Content()` from exactly one place, `BossMainPanelContent`, which sits
+     * under `LocalInMainWindowPanel provides true`. Side panels render `PanelComponentWithUI`,
+     * which this plugin does not implement, and the host's own sidebar/preview browsers are
+     * `BrowserHandle` surfaces that never build a fluck toolbar. The host hit this (v9.4.17, on
+     * `ActiveBrowserRegistry`) because its entries come from `BrowserHandleImpl.Content()`, which
+     * IS composed in those slots. If this plugin ever grows a panel provider, this ranking has to
+     * grow the same preference — and would need the local exported through the api first.
      */
     private fun selectFocusTarget(
         candidates: Collection<Entry>,
