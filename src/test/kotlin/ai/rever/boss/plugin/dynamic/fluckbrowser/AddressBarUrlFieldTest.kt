@@ -237,6 +237,41 @@ class AddressBarUrlFieldTest {
     }
 
     @Test
+    fun `a stale rewrite keeps the selection it is writing over`() {
+        // Otherwise the staleness bound just defers the original bug by a minute: the page URL
+        // lands with a collapsed caret while the field is still claimed and may still hold
+        // focus, so the user comes back, types, and appends instead of replacing.
+        assertTrue(
+            AddressBarUrlField.keepSelectionOnRewrite(
+                isUserEditing = true,
+                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
+                typedSinceClaim = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `an ordinary rewrite collapses the caret, as every browser does`() {
+        // The USER_EDIT_GRACE_MS path - nobody is editing, so there is no selection worth
+        // keeping and a caret at the end is the normal behaviour.
+        assertFalse(
+            AddressBarUrlField.keepSelectionOnRewrite(
+                isUserEditing = false,
+                msSinceUserEdit = 10_000,
+                typedSinceClaim = false,
+            ),
+        )
+        // And a typed claim never reaches the staleness branch at all, so it never gets here.
+        assertFalse(
+            AddressBarUrlField.keepSelectionOnRewrite(
+                isUserEditing = true,
+                msSinceUserEdit = AddressBarUrlField.UNTYPED_CLAIM_STALE_MS + 1,
+                typedSinceClaim = true,
+            ),
+        )
+    }
+
+    @Test
     fun `selectAll on an empty field is a collapsed selection, not a crash`() {
         // A tab on the home screen has no URL yet, and Cmd+L still has to be pressable there.
         val selected = AddressBarUrlField.selectAll(TextFieldValue(""))

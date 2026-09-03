@@ -3150,7 +3150,22 @@ internal fun FluckBrowserTabContent(
                             typedSinceClaim = typedSinceClaim,
                         )
                     ) {
-                        urlBarText = TextFieldValue(url, TextRange(url.length))
+                        // Caret at the end normally; whole-text selected when it was the
+                        // staleness branch that allowed this and the field is still claimed -
+                        // otherwise an abandoned Cmd+L gets its selection collapsed under it and
+                        // the user's next keystroke appends to the URL.
+                        val selection =
+                            if (AddressBarUrlField.keepSelectionOnRewrite(
+                                    isUserEditing = isUserEditingUrl,
+                                    msSinceUserEdit = System.currentTimeMillis() - lastUserEditTime,
+                                    typedSinceClaim = typedSinceClaim,
+                                )
+                            ) {
+                                TextRange(0, url.length)
+                            } else {
+                                TextRange(url.length)
+                            }
+                        urlBarText = TextFieldValue(url, selection)
                     }
 
                     canGoBack = handle.canGoBack()
@@ -6281,7 +6296,17 @@ internal fun BrowserToolbar(
                                 // tab's own onPreviewKeyEvent hangs off a non-focusable Column, so
                                 // dropping focus to the root risks taking Cmd+R and the zoom
                                 // chords out of the dispatch path.
-                                if (showUrlSuggestions) onDismissSuggestions() else onCancelUrlEditing()
+                                // `&& isNotEmpty()` to match every other consumer of this flag
+                                // (the dropdown's own render condition, and the arrow-key and
+                                // shift-delete branches). They are in lockstep today; if that
+                                // ever slips, the first Escape would burn a press dismissing an
+                                // invisible dropdown - which is the "two presses to do what it
+                                // promises in one" failure this design exists to avoid.
+                                if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
+                                    onDismissSuggestions()
+                                } else {
+                                    onCancelUrlEditing()
+                                }
                                 true
                             }
                             else -> false

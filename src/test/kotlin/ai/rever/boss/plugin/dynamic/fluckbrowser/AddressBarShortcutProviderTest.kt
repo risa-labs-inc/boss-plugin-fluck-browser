@@ -4,6 +4,7 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -31,20 +32,35 @@ class AddressBarShortcutProviderTest {
     ) = AddressBarFocusRegistry.register(tabId, windowId, panelActive = true) { focused.add(tabId) }
 
     @Test
-    fun `the action id has the shape the host requires`() {
-        // Must be exactly "plugin.<pluginId>.<name>" or the host rejects the registration and the
-        // shortcut is silently lost. Drift between the id and the plugin id is now impossible -
-        // FOCUS_ADDRESS_BAR_ACTION is a const template over PLUGIN_ID - so this asserts the
-        // SHAPE, which the compiler cannot. The host's keymap preset spells the same string out
-        // by hand (KeymapPresets.FLUCK_FOCUS_ADDRESS_BAR_ACTION) because it does not compile
-        // against this plugin; that duplication is the one a test still has to carry.
-        val plugin = FluckBrowserDynamicPlugin()
+    fun `the action id matches the manifest's plugin id`() {
+        // The host rejects an action id that is not "plugin.<the manifest's pluginId>.<name>",
+        // and the shortcut then vanishes with no error anyone sees.
+        //
+        // This reads the MANIFEST, because that is the only drift still reachable. Comparing
+        // FOCUS_ADDRESS_BAR_ACTION against PLUGIN_ID would be comparing an expression with
+        // itself: the id is a const template over the constant, so the compiler already settles
+        // it. plugin.json's pluginId is hand-written and nothing connects the two.
+        val root =
+            generateSequence(java.io.File("").absoluteFile) { it.parentFile }
+                .firstOrNull { java.io.File(it, "build.gradle.kts").isFile && java.io.File(it, "src/main/kotlin").isDirectory }
+        assertNotNull(root, "could not locate the plugin root")
+        val manifest = java.io.File(root, "src/main/resources/META-INF/boss-plugin/plugin.json").readText()
+        val manifestId =
+            Regex(""""pluginId"\s*:\s*"([^"]+)""").find(manifest)?.groupValues?.get(1)
 
+        assertEquals(FluckBrowserDynamicPlugin.PLUGIN_ID, manifestId, "the manifest and PLUGIN_ID have drifted")
         assertEquals(
-            "plugin.${plugin.pluginId}.focus_address_bar",
+            "plugin.$manifestId.focus_address_bar",
             FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION,
         )
-        assertEquals(FluckBrowserDynamicPlugin.PLUGIN_ID, plugin.pluginId)
+        // The host's keymap preset spells the same string out by hand
+        // (KeymapPresets.FLUCK_FOCUS_ADDRESS_BAR_ACTION) because it does not compile against this
+        // plugin. That duplication is across repos and no test on either side can close it.
+        assertEquals(
+            "plugin.ai.rever.boss.plugin.dynamic.fluckbrowser.focus_address_bar",
+            FluckBrowserDynamicPlugin.FOCUS_ADDRESS_BAR_ACTION,
+            "the host preset pins this literal; changing it here silently unbinds Cmd+L",
+        )
     }
 
     @Test

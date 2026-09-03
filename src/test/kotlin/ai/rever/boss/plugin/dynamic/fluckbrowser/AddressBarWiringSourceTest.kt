@@ -160,6 +160,17 @@ class AddressBarWiringSourceTest {
             "BrowserToolbar is no longer given a requester ($threaded) - the field it focuses is " +
                 "not the one on screen",
         )
+        // The far end of the same wire, and it DOES pin the identifier - deliberately, after a
+        // round of getting this wrong in both directions. The loose version (any
+        // `.focusRequester(x)` in the file) passed with the URL field's line deleted, so it
+        // asserted nothing; naming the requester is what makes this "the right field attaches
+        // the right one". The cost is that a rename fails the test, which is a one-line fix,
+        // against a silent dead Cmd+L, which is not.
+        assertTrue(
+            code.contains(Regex("""\.focusRequester\s*\(\s*addressBarFocusRequester\s*\)""")),
+            "the URL field no longer attaches the requester - requestFocus would throw on every " +
+                "Cmd+L and the user would get a throttled log line and nothing else",
+        )
     }
 
     @Test

@@ -118,7 +118,10 @@ class PageEventChannelSourceTest {
         //   - LocalWindowIdProvider ................................................ api 1.0.16
         //   - LocalIsPanelActive ................................................... api 1.0.38
         // All at or below the floor when checked, so Cmd+L's registration is not what stops the
-        // jar loading. Anything added ABOVE the floor has to go through PageEventChannel-style
+        // jar loading. Note the exposure is wider than the registration: the shortcut calls sit
+        // inside a runCatching, but LocalWindowIdProvider and LocalIsPanelActive are touched from
+        // composition in AddressBarRegistration, outside any guard - so if the floor ever moves
+        // DOWN, that composable is the unprotected path. Anything added ABOVE the floor has to go through PageEventChannel-style
         // reflection instead of a floor bump - and has to be checked the same way, by hand,
         // because the build cannot see it.
         val root = assertNotNull(repoRoot(), "could not locate the plugin root")

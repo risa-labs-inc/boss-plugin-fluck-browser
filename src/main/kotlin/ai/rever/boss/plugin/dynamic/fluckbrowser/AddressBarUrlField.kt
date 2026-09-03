@@ -92,6 +92,25 @@ internal object AddressBarUrlField {
         }
 
     /**
+     * Whether a navigation rewrite should KEEP the field's selection rather than collapse it.
+     *
+     * True in exactly one case: the staleness branch of [navigationMayRewrite] is what let the
+     * write through while the field is still claimed. Without this, an abandoned Cmd+L that goes
+     * stale gets the page URL written in with a collapsed caret while the field may still hold
+     * focus - so the user comes back, types, and appends to the URL instead of replacing it.
+     * That is the original selection bug, deferred by [UNTYPED_CLAIM_STALE_MS] rather than fixed.
+     *
+     * Deliberately narrow: an unclaimed field has no selection worth preserving, and a rewrite
+     * allowed by [USER_EDIT_GRACE_MS] is the ordinary "nobody is editing" path, where a caret at
+     * the end is what every browser does.
+     */
+    fun keepSelectionOnRewrite(
+        isUserEditing: Boolean,
+        msSinceUserEdit: Long,
+        typedSinceClaim: Boolean,
+    ): Boolean = isUserEditing && !typedSinceClaim && msSinceUserEdit > UNTYPED_CLAIM_STALE_MS
+
+    /**
      * [current] with its whole text selected, the way every browser's Cmd+L leaves the field.
      *
      * Keeps the text rather than building a fresh [TextFieldValue] from it: the composition and
