@@ -10,6 +10,8 @@ import ai.rever.boss.plugin.api.BookmarkDataProvider
 import ai.rever.boss.plugin.api.CreateSecretRequestData
 import ai.rever.boss.plugin.api.DashboardContentProvider
 import ai.rever.boss.plugin.api.InternalBrowserTabData
+import ai.rever.boss.plugin.api.LocalIsPanelActive
+import ai.rever.boss.plugin.api.LocalWindowIdProvider
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.ScreenCaptureProvider
 import ai.rever.boss.plugin.api.SecretDataProvider
@@ -67,6 +69,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.PointerButton
@@ -123,11 +127,81 @@ import java.awt.Window
 import java.awt.datatransfer.StringSelection
 import java.net.URI
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicLong
 import javax.swing.BorderFactory
 import javax.swing.JMenuItem
 import javax.swing.JPopupMenu
 import javax.swing.JSeparator
 import kotlin.math.abs
+
+/**
+ * Keeps [AddressBarFocusRegistry] told about this tab's address bar, for as long as it is composed.
+ *
+ * Its own composable purely to scope the invalidation: reading `LocalIsPanelActive.current` in
+ * `FluckBrowserTabContent`'s body would subscribe that entire 7000-line function to panel-active
+ * changes, so every click between splits would recompose the whole tab. Here it recomposes this.
+ *
+ * @param onFocus focuses and selects the field. Invoked from the host's key dispatch on the UI
+ *   thread, NOT from composition, so it may touch state directly.
+ */
+@Composable
+private fun AddressBarRegistration(
+    tabId: String,
+    focusRequester: FocusRequester,
+    onFocus: () -> Unit,
+) {
+    // The effect keys on (tabId, windowId, panelActive) but CAPTURES onFocus, which is a fresh
+    // lambda every recomposition. Safe today only because everything that lambda touches is a
+    // remembered MutableState or lives on hoistedState - an argument about the caller, not about
+    // this code. One line makes the effect independent of it.
+    val currentOnFocus by rememberUpdatedState(onFocus)
+    // A plain call, not a snapshot state read, and used as a DisposableEffect key: a window id
+    // that changed WITHOUT a recomposition would leave a stale entry. Safe only because a tab
+    // changing windows rebuilds this composition (the same fact the registry's identity keying is
+    // built on), which is where that assumption is cashed. getWindowId() is a field read
+    // host-side, so calling it per recomposition costs nothing worth remembering.
+    val windowId = LocalWindowIdProvider.current?.getWindowId()
+    val panelActive = LocalIsPanelActive.current
+
+    if (windowId == null) {
+        // Say so once per reason, rather than leaving this tab silently unable to answer Cmd+L.
+        // An effect, not a bare call: a composable body re-runs on every recomposition.
+        // Unit, not windowId: it is statically null in this branch, so keying on it would imply
+        // a variation that cannot happen.
+        DisposableEffect(Unit) {
+            AddressBarFocusRegistry.noteUnregisterable(tabId, "the host reported no window id")
+            onDispose {}
+        }
+        return
+    }
+
+    // Not gated on a non-blank tabId. The registry ranks on window, panel and composition order
+    // and never reads the id for anything but a log line, so refusing an id-less tab would cost
+    // it Cmd+L in exchange for nothing.
+    DisposableEffect(tabId, windowId, panelActive) {
+        val token =
+            AddressBarFocusRegistry.register(
+                tabId = tabId,
+                windowId = windowId,
+                panelActive = panelActive,
+            ) {
+                // Not wrapped in runCatching: requestFocus throws when the requester is not
+                // attached to a node, and the registry's own catch turns that into the `false`
+                // its caller reads. Catching it here as well made that false unreachable in
+                // production and left the failure silent.
+                //
+                // Registered is very nearly the same as focusable here, because BrowserToolbar is
+                // composed UNCONDITIONALLY alongside this effect - fullscreen and the boot spinner
+                // replace only the weighted Box below the toolbar, not the toolbar itself. What is
+                // left is attach timing (the effect runs before the field is laid out on the first
+                // frame) and any future change that gates the toolbar, which is why the throw is
+                // caught rather than assumed away.
+                focusRequester.requestFocus()
+                currentOnFocus()
+            }
+        onDispose { AddressBarFocusRegistry.unregister(token) }
+    }
+}
 
 /**
  * Fluck Browser tab component (Dynamic Plugin)
@@ -2641,7 +2715,25 @@ internal fun FluckBrowserTabContent(
     // Local-only state (not shared across composition) — derived/transient,
     // doesn't need to survive tab switches.
     var isUserEditingUrl by remember { mutableStateOf(false) }
+    // Whether anything has been TYPED since the current claim was taken. Tracked rather than
+    // inferred from "does the field still read as the loaded URL": that comparison is false
+    // whenever the bar legitimately shows something else - a home tab holds "about:blank" while
+    // loadedUrl is deliberately "", and a draft the user abandoned outlives the claim that was
+    // released with it - and in every one of those states the staleness bound below would never
+    // fire, which is the freeze it exists to prevent.
+    var typedSinceClaim by remember { mutableStateOf(false) }
+    // Bumped every time the field is CLAIMED. onFocusLost releases the claim from a delayed
+    // coroutine, and nothing cancels that job if the field is re-claimed inside its 200ms - so
+    // Cmd+L pressed just after a click into the page would have its fresh claim wiped by the
+    // previous one's release, and the next navigation would collapse the selection it had just
+    // made. Deliberately NOT snapshot state: nothing composes off it, and it must be readable
+    // from a coroutine without invalidating anything.
+    val claimGeneration = remember { AtomicLong(0) }
     var lastUserEditTime by remember { mutableStateOf(0L) }
+
+    // Handed to BrowserToolbar far below; the registration that focuses it is further down,
+    // after the state its callback writes.
+    val addressBarFocusRequester = remember { FocusRequester() }
     val middleClickPopupCoordinator = remember { MiddleClickPopupCoordinator() }
     val handlePopupNavigation: (PopupNavigation) -> Unit = { navigation ->
         val body = navigation.postData
@@ -2707,6 +2799,42 @@ internal fun FluckBrowserTabContent(
     var urlSuggestions by remember { mutableStateOf<List<UrlHistoryEntry>>(emptyList()) }
     var autocompleteSuggestion by remember { mutableStateOf<String?>(null) }
     var selectedDropdownIndex by remember { mutableStateOf(-1) }
+
+    // Cmd+L. Declared DOWN HERE deliberately, not next to the requester above: the focus
+    // callback writes isUserEditingUrl, lastUserEditTime, typedSinceClaim AND the three
+    // dropdown fields, so it cannot be declared above the last of them.
+    AddressBarRegistration(
+        tabId = tabId,
+        focusRequester = addressBarFocusRequester,
+    ) {
+        // Claim the field BEFORE selecting it, or the navigation listener below wipes the
+        // selection - see AddressBarUrlField.navigationWrite, which is the decision that
+        // listener asks for.
+        isUserEditingUrl = true
+        lastUserEditTime = System.currentTimeMillis()
+        // Cmd+L is an explicit "I am replacing this" gesture - it selects the whole field - so
+        // the claim it takes is a FRESH one even over a draft. That is what lets an abandoned
+        // Cmd+L go stale; see UNTYPED_CLAIM_STALE_MS for the promise this does and does not make.
+        typedSinceClaim = false
+        claimGeneration.incrementAndGet()
+
+        // Clear the dropdown state, like every other path that resets the claim (submit,
+        // suggestion selected, history click). Cmd+L over a half-typed query used to leave it
+        // standing, which broke three things at once: the first Escape dismissed the stale
+        // dropdown instead of releasing the claim (so the two-stage design needed two presses to
+        // do what it promises in one), Enter navigated to a suggestion computed from the text
+        // BEFORE Cmd+L, and the arrow keys walked a dropdown that no longer matched the field.
+        //
+        // urlSuggestions included, though nothing reads it while the other three are cleared:
+        // the Enter branch reaches for urlSuggestions.first(), so leaving a stale list behind is
+        // a trap for whoever relaxes those guards, not a live bug.
+        showUrlSuggestions = false
+        autocompleteSuggestion = null
+        selectedDropdownIndex = -1
+        urlSuggestions = emptyList()
+
+        urlBarText = AddressBarUrlField.selectAll(urlBarText)
+    }
     val dropdownListState = rememberLazyListState()
 
     // Context-menu state lives on hoistedState (see FluckBrowserTabState) — it is written
@@ -3014,11 +3142,21 @@ internal fun FluckBrowserTabContent(
                     if (hoistedState.browserHandle !== handle) return@addNavigationListener
                     installDirtyMarker(handle, coroutineScope, hoistedState)
                     loadedUrl = url
-                    // Only update URL bar if user isn't actively editing
-                    // AND sufficient time has passed since last input (300ms buffer for Tab completion)
-                    val timeSinceEdit = System.currentTimeMillis() - lastUserEditTime
-                    if (!isUserEditingUrl && timeSinceEdit > 300) {
-                        urlBarText = TextFieldValue(url, TextRange(url.length))
+                    // ONE decision, one clock read: whether to write and how to leave the
+                    // selection are the same question asked of the same state, and asking twice
+                    // meant two reads that had to agree across the staleness boundary.
+                    when (
+                        AddressBarUrlField.navigationWrite(
+                            isUserEditing = isUserEditingUrl,
+                            msSinceUserEdit = System.currentTimeMillis() - lastUserEditTime,
+                            typedSinceClaim = typedSinceClaim,
+                        )
+                    ) {
+                        AddressBarUrlField.NavigationWrite.Skip -> Unit
+                        AddressBarUrlField.NavigationWrite.CollapseCaret ->
+                            urlBarText = TextFieldValue(url, TextRange(url.length))
+                        AddressBarUrlField.NavigationWrite.KeepSelection ->
+                            urlBarText = TextFieldValue(url, TextRange(0, url.length))
                     }
 
                     canGoBack = handle.canGoBack()
@@ -3764,51 +3902,84 @@ internal fun FluckBrowserTabContent(
                 }
             } else null,
             isSharing = liveShareInfo != null,
+            addressBarFocusRequester = addressBarFocusRequester,
             urlBarText = urlBarText,
             onUrlBarTextChange = { newValue ->
+                // Captured ONCE, before the write below. Two rules here ask "did the text
+                // change" - the typed-under-claim flag and the suggestion gate - and both are
+                // silently false if asked after `urlBarText = newValue`, because that delegate
+                // is a plain property reference and the write is visible immediately.
+                val previousText = urlBarText.text
                 isUserEditingUrl = true
                 lastUserEditTime = System.currentTimeMillis()
+                // Compared, not set to true: this fires for selection-only changes too (caret
+                // moves, Home/End, click-to-place), and the staleness bound is gated on this
+                // flag - see AddressBarUrlField.typedUnderClaim.
+                typedSinceClaim =
+                    AddressBarUrlField.typedUnderClaim(
+                        alreadyTyped = typedSinceClaim,
+                        previous = previousText,
+                        next = newValue.text,
+                    )
+                // Unconditional, unlike the flag above: the user is interacting either way, and
+                // a stale onFocusLost release landing on a caret move is the same hazard the
+                // generation stamp exists for.
+                claimGeneration.incrementAndGet()
                 urlBarText = newValue
                 selectedDropdownIndex = -1
 
                 // Get autocomplete suggestion and dropdown items
                 // Only compute when text is not empty and cursor is not selecting text
-                if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
-                    // distinctBy: the dropdown keys its rows by URL, and a duplicate key
-                    // is fatal to a LazyColumn. The current host can't produce one, but
-                    // the list is host-supplied data and a provider that later merges
-                    // sources (history + bookmarks + open tabs) is exactly the shape that
-                    // would. Deleting already removes every copy, so this loses nothing.
-                    val suggestions =
-                        urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
-                            .distinctBy { it.url }
+                //
+                // Only a CARET MOVE is skipped here - see suggestionsNeedUpdate for the three
+                // cases and why a non-collapsed selection must still clear. Skipping the caret
+                // move is what stops Cmd+L then Left re-opening the dropdown, which would spend
+                // the next Escape dismissing it rather than releasing the claim, and what avoids
+                // a getSuggestions() call per arrow key.
+                if (AddressBarUrlField.suggestionsNeedUpdate(
+                        previous = previousText,
+                        next = newValue.text,
+                        selectionCollapsed = newValue.selection.collapsed,
+                    )
+                ) {
+                    if (newValue.text.isNotEmpty() && newValue.selection.collapsed && urlHistoryProvider != null) {
+                        // distinctBy: the dropdown keys its rows by URL, and a duplicate key
+                        // is fatal to a LazyColumn. The current host can't produce one, but
+                        // the list is host-supplied data and a provider that later merges
+                        // sources (history + bookmarks + open tabs) is exactly the shape that
+                        // would. Deleting already removes every copy, so this loses nothing.
+                        val suggestions =
+                            urlHistoryProvider.getSuggestions(newValue.text, limit = 10)
+                                .distinctBy { it.url }
 
-                    // Set inline autocomplete (first suggestion with protocol stripped)
-                    if (suggestions.isNotEmpty()) {
-                        val suggestion = suggestions.first()
-                        val suggestionUrl = suggestion.url
-                            .removePrefix("https://")
-                            .removePrefix("http://")
-                            .removePrefix("www.")
+                        // Set inline autocomplete (first suggestion with protocol stripped)
+                        if (suggestions.isNotEmpty()) {
+                            val suggestion = suggestions.first()
+                            val suggestionUrl = suggestion.url
+                                .removePrefix("https://")
+                                .removePrefix("http://")
+                                .removePrefix("www.")
 
-                        // Only suggest if the stripped URL starts with the input
-                        if (suggestionUrl.lowercase().startsWith(newValue.text.lowercase()) &&
-                            suggestionUrl.length > newValue.text.length) {
-                            autocompleteSuggestion = suggestionUrl
+                            // Only suggest if the stripped URL starts with the input
+                            if (suggestionUrl.lowercase().startsWith(newValue.text.lowercase()) &&
+                                suggestionUrl.length > newValue.text.length
+                            ) {
+                                autocompleteSuggestion = suggestionUrl
+                            } else {
+                                autocompleteSuggestion = null
+                            }
                         } else {
                             autocompleteSuggestion = null
                         }
+
+                        // Set dropdown suggestions
+                        urlSuggestions = suggestions
+                        showUrlSuggestions = suggestions.isNotEmpty()
                     } else {
                         autocompleteSuggestion = null
+                        urlSuggestions = emptyList()
+                        showUrlSuggestions = false
                     }
-
-                    // Set dropdown suggestions
-                    urlSuggestions = suggestions
-                    showUrlSuggestions = suggestions.isNotEmpty()
-                } else {
-                    autocompleteSuggestion = null
-                    urlSuggestions = emptyList()
-                    showUrlSuggestions = false
                 }
             },
             onNavigate = { url ->
@@ -3819,6 +3990,7 @@ internal fun FluckBrowserTabContent(
                 // Clear editing state to allow URL bar updates during navigation
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
+                typedSinceClaim = false
                 showUrlSuggestions = false
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
@@ -3886,6 +4058,7 @@ internal fun FluckBrowserTabContent(
                 urlBarText = TextFieldValue(suggestion.url, TextRange(suggestion.url.length))
                 isUserEditingUrl = false
                 lastUserEditTime = 0L
+                typedSinceClaim = false
                 showUrlSuggestions = false
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
@@ -3897,6 +4070,30 @@ internal fun FluckBrowserTabContent(
                 showUrlSuggestions = false
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
+            },
+            onCancelUrlEditing = {
+                // Reset explicitly rather than leaning on the 200ms onFocusLost path: that only
+                // runs if a focus-changed event actually arrives, and on Windows/Linux
+                // HARDWARE_ACCELERATED a click into the native page surface may not produce one.
+                // The claim is released either way - that is what fixes the freeze. Whether the
+                // TEXT reverts is three separate judgements, so they live in a predicate with
+                // their reasons and their own tests rather than inline here.
+                if (AddressBarUrlField.shouldRestore(
+                        isUserEditing = isUserEditingUrl,
+                        loadedUrl = loadedUrl,
+                        currentText = urlBarText.text,
+                    )
+                ) {
+                    urlBarText = AddressBarUrlField.restoreTo(loadedUrl)
+                }
+                isUserEditingUrl = false
+                lastUserEditTime = 0L
+                typedSinceClaim = false
+                // Uniform with submit, suggestion-selected and history-click, which all clear
+                // this. Unreachable today - the Escape branch only gets here when the dropdown
+                // is closed or empty - but "the one release path that doesn't" is how the last
+                // three of these became reachable.
+                showUrlSuggestions = false
             },
             onAcceptAutocomplete = {
                 if (autocompleteSuggestion != null) {
@@ -3910,10 +4107,27 @@ internal fun FluckBrowserTabContent(
             onSuggestionDeleted = onDeleteSuggestion,
             onFocusLost = {
                 // Hide dropdown when focus is lost (with delay to allow click events)
+                val releasing = claimGeneration.get()
                 coroutineScope.launch {
                     delay(200)
+                    // Only release the claim this job was scheduled for, and that covers the
+                    // DROPDOWN too - the check used to sit one line below, so a user who clicked
+                    // away and came straight back to type had the freshly computed dropdown
+                    // blanked by the outgoing job before it noticed the claim was no longer its
+                    // own. Cmd+L (or a keystroke) inside the 200ms takes a NEW claim, and
+                    // clearing that one would also undo the claim-before-select ordering: the
+                    // next navigation would rewrite the field with a collapsed selection while it
+                    // still held focus.
+                    if (claimGeneration.get() != releasing) return@launch
                     showUrlSuggestions = false
                     isUserEditingUrl = false
+                    typedSinceClaim = false
+                    // lastUserEditTime is deliberately LEFT ALONE, unlike the other release
+                    // paths. It is what keeps USER_EDIT_GRACE_MS reachable: this is the one
+                    // release where the user may come straight back mid-Tab-completion, and
+                    // zeroing it here made a navigation landing in that window overwrite what
+                    // they were assembling. Resetting all three "for consistency" is what
+                    // quietly retired the 300ms buffer.
                 }
             }
         )
@@ -4761,6 +4975,7 @@ internal fun FluckBrowserTabContent(
                                     selectedDropdownIndex = -1
                                     isUserEditingUrl = false
                                     lastUserEditTime = 0L
+                                    typedSinceClaim = false
                                     coroutineScope.launch {
                                         browserHandle.onBrowser("loadUrl") { it.loadUrl(entry.url) }
                                     }
@@ -5849,12 +6064,25 @@ internal fun BrowserToolbar(
     dropdownListState: LazyListState = rememberLazyListState(),
     onSuggestionSelected: (UrlHistoryEntry) -> Unit = {},
     onDismissSuggestions: () -> Unit = {},
+    /**
+     * Escape: the user is abandoning the edit, not just closing the dropdown. Puts the loaded URL
+     * back and releases the field, which is what stops a Cmd+L the user changed their mind about
+     * leaving the bar claimed forever - see [AddressBarUrlField.restoreTo].
+     */
+    onCancelUrlEditing: () -> Unit = {},
     onAcceptAutocomplete: () -> Unit = {},
     onSelectedDropdownIndexChange: (Int) -> Unit = {},
     onSuggestionDeleted: (UrlHistoryEntry) -> Unit = {},
     onFocusLost: () -> Unit = {},
     onShare: (() -> Unit)? = null,
-    isSharing: Boolean = false
+    isSharing: Boolean = false,
+    /**
+     * Attached to the URL field so Cmd+L can focus it from outside the composition
+     * (see [AddressBarFocusRegistry]). Defaulted rather than nullable so the modifier chain
+     * below stays a plain `.focusRequester(...)`; a caller that omits it - a preview - gets a
+     * live requester nothing ever asks to focus.
+     */
+    addressBarFocusRequester: FocusRequester = remember { FocusRequester() }
 ) {
     val coroutineScope = rememberCoroutineScope()
     // Auto-scroll to selected suggestion when using arrow keys
@@ -5996,6 +6224,7 @@ internal fun BrowserToolbar(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(28.dp)
+                    .focusRequester(addressBarFocusRequester)
                     .onFocusChanged { focusState ->
                         if (!focusState.isFocused) {
                             onFocusLost()
@@ -6076,7 +6305,34 @@ internal fun BrowserToolbar(
                                 true
                             }
                             keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Escape -> {
-                                onDismissSuggestions()
+                                // TWO-STAGE, Firefox's shape rather than Chrome's: the first press
+                                // closes the dropdown, the second abandons the edit. Chrome reverts
+                                // on the first press, but Chrome has no separate dropdown-dismiss
+                                // gesture to spend one on - this field does, and collapsing both
+                                // into one press meant "type a few characters, Escape the dropdown
+                                // away, keep typing" silently lost the draft.
+                                //
+                                // The stuck claim is still closed: Cmd+L opens no dropdown, so the
+                                // first Escape after it goes straight to the release.
+                                //
+                                // Focus deliberately STAYS in the field either way, which is what
+                                // both browsers do - Escape reverts the text and leaves you able to
+                                // retype. Clearing it would also send focus nowhere in particular
+                                // (the page is a native surface this plugin cannot focus), and the
+                                // tab's own onPreviewKeyEvent hangs off a non-focusable Column, so
+                                // dropping focus to the root risks taking Cmd+R and the zoom
+                                // chords out of the dispatch path.
+                                // `&& isNotEmpty()` to match every other consumer of this flag
+                                // (the dropdown's own render condition, and the arrow-key and
+                                // shift-delete branches). They are in lockstep today; if that
+                                // ever slips, the first Escape would burn a press dismissing an
+                                // invisible dropdown - which is the "two presses to do what it
+                                // promises in one" failure this design exists to avoid.
+                                if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
+                                    onDismissSuggestions()
+                                } else {
+                                    onCancelUrlEditing()
+                                }
                                 true
                             }
                             else -> false
