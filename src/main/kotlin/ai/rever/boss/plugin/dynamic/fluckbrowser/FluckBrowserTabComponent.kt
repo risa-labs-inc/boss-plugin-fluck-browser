@@ -700,6 +700,37 @@ internal const val HOME_TITLE = "Home"
 internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:blank"
 
 /**
+ * Copy [url] to the clipboard and report whether it actually landed.
+ *
+ * The copy-link button used to set its "copied" state unconditionally:
+ *
+ * ```
+ * clipboardManager.setText(AnnotatedString(pageUrl))
+ * urlCopied = true
+ * ```
+ *
+ * `setText` reaches AWT's system clipboard, which throws `IllegalStateException` when the
+ * clipboard is unavailable or another process holds it - not rare on Linux, and reachable
+ * anywhere under contention. The green check-mark therefore claimed a copy that had not
+ * happened, and the user pasted whatever was there before.
+ *
+ * Returning the outcome rather than swallowing it is the point: a control that reports success
+ * it did not verify is worse than one with no feedback at all, because the failure is silent on
+ * both sides.
+ *
+ * The home guard lives here too so the button's enabled state and its success state are decided
+ * by one rule. They were two, which is how "disabled on home" and "shows a tick" could ever
+ * disagree.
+ */
+internal fun copyPageLink(
+    url: String,
+    setText: (String) -> Unit,
+): Boolean {
+    if (isHomeUrl(url)) return false
+    return runCatching { setText(url) }.isSuccess
+}
+
+/**
  * The URL of the page the user is looking at, as opposed to [draft] - whatever is currently in
  * the URL bar.
  *
@@ -6196,8 +6227,8 @@ internal fun BrowserToolbar(
             }
             IconButton(
                 onClick = {
-                    clipboardManager.setText(AnnotatedString(pageUrl))
-                    urlCopied = true
+                    // Only claim success if the clipboard actually took it. See [copyPageLink].
+                    urlCopied = copyPageLink(pageUrl) { clipboardManager.setText(AnnotatedString(it)) }
                 },
                 enabled = copyable,
                 modifier = Modifier.size(32.dp)
