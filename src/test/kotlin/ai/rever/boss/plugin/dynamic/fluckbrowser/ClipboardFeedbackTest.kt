@@ -6,9 +6,10 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * Whether the copy-link button is allowed to say it copied something.
+ * Whether this file's copy affordances are allowed to say they copied something.
  *
- * The button reports success with a green check-mark. It used to set that state unconditionally,
+ * Both paths reported success without checking. The copy-link button set its green check-mark
+ * unconditionally,
  * immediately after `clipboardManager.setText(...)`, so the only thing the tick actually proved
  * was that the click handler ran. `setText` reaches AWT's system clipboard, which throws
  * `IllegalStateException` when the clipboard is unavailable or another process holds it, and the
@@ -17,7 +18,7 @@ import kotlin.test.assertTrue
  * That is worse than silence: a control that reports unverified success hides the failure on both
  * sides, from the user and from anyone reading a bug report about it.
  */
-class CopyPageLinkTest {
+class ClipboardFeedbackTest {
     @Test
     fun `a normal url is copied and reported as copied`() {
         var written: String? = null
@@ -70,5 +71,37 @@ class CopyPageLinkTest {
 
         assertTrue(copyPageLink("https://example.com/docs/about:blank-explained") { written = it })
         assertEquals("https://example.com/docs/about:blank-explained", written)
+    }
+
+    @Test
+    fun `copyToClipboard reports a refused write instead of swallowing it`() {
+        // This used to be `catch (e: Exception) { // Silently fail }`, so no caller could tell.
+        // The comment was right that clipboard writes fail; discarding the outcome was the bug.
+        assertFalse(copyToClipboard("secret") { throw IllegalStateException("cannot open system clipboard") })
+    }
+
+    @Test
+    fun `copyToClipboard reports a successful write, and hands over the exact text`() {
+        var written: String? = null
+
+        assertTrue(copyToClipboard("correct horse battery staple") { written = it })
+        assertEquals("correct horse battery staple", written)
+    }
+
+    @Test
+    fun `a generated password that fails to copy is not reported as copied`() {
+        // The call site that matters. Copy is the path for taking the password WITHOUT filling
+        // the field, and the card says it is only saved to Secret Manager when used - so on a
+        // silent failure the user pastes whatever was on the clipboard before. The card now
+        // reads its state from this boolean, so this is the decision behind the warning icon.
+        val password = "T7#kq2Lm9!vZ"
+
+        assertFalse(copyToClipboard(password) { throw IllegalStateException("clipboard busy") })
+        assertTrue(copyToClipboard(password) { })
+    }
+
+    @Test
+    fun `an Error is caught too, since the caller is a click handler`() {
+        assertFalse(copyToClipboard("x") { throw NoClassDefFoundError("awt backend") })
     }
 }

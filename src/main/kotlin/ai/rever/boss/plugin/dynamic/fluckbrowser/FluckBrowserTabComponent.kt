@@ -5673,16 +5673,26 @@ object SwingContextMenu {
 }
 
 /**
- * Copy text to system clipboard.
+ * Copy [text] to the system clipboard, reporting whether the write actually landed.
+ *
+ * This used to swallow the failure with `// Silently fail`. The comment was right that these
+ * fail - AWT throws `IllegalStateException` when the clipboard is unavailable or another process
+ * holds it, which is ordinary contention - but discarding the outcome meant no caller could tell,
+ * and none asked.
+ *
+ * That is tolerable for the context-menu copies, where nothing happens and the user clicks again.
+ * It is not tolerable for the generated-password card: Copy is the path for a user who wants the
+ * password WITHOUT filling the field with it, so on that path the clipboard briefly holds the
+ * only copy. A silent failure there means they paste whatever was on the clipboard before, which
+ * on a signup form creates an account with a password they do not have.
+ *
+ * [write] is injectable so the failure path can be tested; the clipboard itself is not something
+ * a test JVM can be made to refuse on demand.
  */
-private fun copyToClipboard(text: String) {
-    try {
-        val clipboard = Toolkit.getDefaultToolkit().systemClipboard
-        clipboard.setContents(StringSelection(text), null)
-    } catch (e: Exception) {
-        // Silently fail - clipboard operations can fail in certain environments
-    }
-}
+internal fun copyToClipboard(
+    text: String,
+    write: (String) -> Unit = { Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(it), null) },
+): Boolean = runCatching { write(text) }.isSuccess
 
 // Share window palette — sourced from the reactive BOSS theme tokens so the
 // co-browse window re-skins with the host (previously hardcoded to match
