@@ -1955,6 +1955,7 @@ internal enum class FullscreenExitPhase {
  */
 internal inline fun <T> BrowserHandle?.onBrowser(
     op: String,
+    noinline onEngineDead: () -> Unit = {},
     block: (BrowserHandle) -> T,
 ): T? {
     val handle = this ?: return null
@@ -1964,8 +1965,54 @@ internal inline fun <T> BrowserHandle?.onBrowser(
         throw e
     } catch (e: Throwable) {
         println("[FluckBrowser] Browser call '$op' failed: ${e.message}")
+        // A call that throws because the engine was replaced or closed is the ONLY in-plugin
+        // evidence of a browser that died with its IPC channel severed: `isValid` stays true for
+        // that browser (see this function's KDoc above), so the 500ms validity poll never sees it
+        // and the tab wedges - dead controls, a stuck loading spinner, only scroll still working
+        // (BossConsole#392). Swallowing the exception is what keeps the plugin alive; reporting
+        // the death is what lets the poll rebuild the browser instead of leaving it wedged for
+        // the rest of the tab's life.
+        if (BrowserLiveness.isEngineClosed(e)) onEngineDead()
         null
     }
+}
+
+/**
+ * Liveness signals for a [BrowserHandle] whose host-side `isValid` cannot be trusted on its own.
+ *
+ * A pure object so `BrowserLivenessTest` can pin both halves without a browser or a host.
+ */
+internal object BrowserLiveness {
+    /**
+     * Whether [error] is the engine-replaced/closed failure that `BrowserHandle.isValid` does not
+     * reflect - the throw a browser call makes once its Chromium engine has been closed.
+     *
+     * Matched by type name and message rather than by importing JxBrowser's `ObjectClosedException`
+     * (this plugin does not depend on JxBrowser). Causes are walked, bounded, because the throw can
+     * arrive wrapped and a malformed cause chain can loop.
+     */
+    fun isEngineClosed(error: Throwable): Boolean {
+        var cause: Throwable? = error
+        var depth = 0
+        while (cause != null && depth < 16) {
+            val name = cause::class.qualifiedName ?: cause::class.simpleName
+            if (name != null && name.contains("ObjectClosedException")) return true
+            val message = cause.message
+            if (message != null && message.contains("closed object", ignoreCase = true)) return true
+            cause = cause.cause
+            depth++
+        }
+        return false
+    }
+
+    /**
+     * Whether the validity poll should rebuild the browser now. `isValid` catches an engine reset
+     * the host manages to report; [engineDeathReported] catches the one it cannot - an engine that
+     * died with its IPC channel severed, seen only as an [isEngineClosed] throwable from a browser
+     * call routed through [onBrowser].
+     */
+    fun shouldRecover(isValid: Boolean, engineDeathReported: Boolean): Boolean =
+        !isValid || engineDeathReported
 }
 
 /**
@@ -2252,6 +2299,28 @@ internal class FluckBrowserTabState {
 
     @Volatile
     var scrollRestoreJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Set when a browser call caught the engine-closed throwable that [BrowserHandle.isValid] does
+     * not reflect (see [onBrowser]). The validity poll consults it through
+     * [BrowserLiveness.shouldRecover], so a browser that died with its IPC channel severed still
+     * triggers recovery instead of leaving the tab wedged (BossConsole#392). Reset on every handle
+     * transition ([adoptBrowserHandle], [releaseBrowserHandle]), so a report can only ever pertain
+     * to the handle that is current now.
+     *
+     * `@Volatile` for the same reason [scrollRestoreJob] is: onBrowser catches on whichever thread
+     * made the call - a click handler on Main, a fill on IO - while the poll reads it on Main.
+     * Visibility is all that is needed; a lost race just recovers on the next 500ms tick.
+     */
+    @Volatile
+    var engineDeathReported: Boolean = false
+        private set
+
+    /** See [engineDeathReported]. The reporter [onBrowser] calls from its engine-closed branch. */
+    fun reportEngineDeath() {
+        engineDeathReported = true
+    }
+
     var isLoading: Boolean by mutableStateOf(false)
     var urlBarText: TextFieldValue by mutableStateOf(TextFieldValue(""))
 
@@ -2407,6 +2476,9 @@ internal class FluckBrowserTabState {
             disposeBrowserHandleOffThread(previous)
         }
         clearFullscreenState()
+        // A fresh handle starts alive; a report carried over from the handle it replaces would
+        // rebuild this one on the poll's next tick for no reason.
+        engineDeathReported = false
         browserHandle = handle
     }
 
@@ -2457,6 +2529,10 @@ internal class FluckBrowserTabState {
         // exists - the "the tab says it is doing something it isn't" family this file is being
         // cleaned of. Adoption re-seeds it from the replacement.
         isLoading = false
+        // The report belonged to the handle now leaving. Clearing it here means the poll that is
+        // about to rebuild does not immediately re-trigger against the replacement, and a fresh
+        // handle that never dies is never rebuilt on a stale flag.
+        engineDeathReported = false
         return ReleasedHandle(handle, pending)
     }
 
@@ -3419,8 +3495,12 @@ internal fun FluckBrowserTabContent(
                 delay(500) // Check every 500ms for fast recovery
 
                 val handle = browserHandle
-                if (handle != null && !handle.isValid) {
-                    // Browser became invalid - trigger recovery
+                if (handle != null &&
+                    BrowserLiveness.shouldRecover(handle.isValid, hoistedState.engineDeathReported)
+                ) {
+                    // Browser became invalid - trigger recovery. `engineDeathReported` is the
+                    // second arm: an engine that died with its IPC channel severed keeps isValid
+                    // true, and without it the tab wedged instead of rebuilding (BossConsole#392).
                     if (recoveryAttempts < maxRecoveryAttempts) {
                         recoveryAttempts++
                         println("[FluckBrowser] Browser invalid, triggering recovery (attempt $recoveryAttempts/$maxRecoveryAttempts)")
@@ -3862,7 +3942,7 @@ internal fun FluckBrowserTabContent(
                         when (keyEvent.key) {
                             Key.R -> {
                                 // Reload - Cmd+R / Ctrl+R
-                                browserHandle.onBrowser("reload") { it.reload() }
+                                browserHandle.onBrowser("reload", onEngineDead = hoistedState::reportEngineDeath) { it.reload() }
                                 true
                             }
                             Key.Zero -> {
@@ -3995,15 +4075,15 @@ internal fun FluckBrowserTabContent(
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
                 coroutineScope.launch {
-                    browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
+                    browserHandle.onBrowser("loadUrl", onEngineDead = hoistedState::reportEngineDeath) { it.loadUrl(url) }
                 }
             },
             canGoBack = canGoBack,
             canGoForward = canGoForward,
             onBack = { browserHandle.onBrowser("goBack") { it.goBack() } },
             onForward = { browserHandle.onBrowser("goForward") { it.goForward() } },
-            onReload = { browserHandle.onBrowser("reload") { it.reload() } },
-            onStop = { browserHandle.onBrowser("stop") { it.stop() } },
+            onReload = { browserHandle.onBrowser("reload", onEngineDead = hoistedState::reportEngineDeath) { it.reload() } },
+            onStop = { browserHandle.onBrowser("stop", onEngineDead = hoistedState::reportEngineDeath) { it.stop() } },
             isLoading = isLoading,
             isSecure = isSecure,
             zoomLevel = zoomLevel,
@@ -4063,7 +4143,7 @@ internal fun FluckBrowserTabContent(
                 autocompleteSuggestion = null
                 selectedDropdownIndex = -1
                 coroutineScope.launch {
-                    browserHandle.onBrowser("loadUrl") { it.loadUrl(suggestion.url) }
+                    browserHandle.onBrowser("loadUrl", onEngineDead = hoistedState::reportEngineDeath) { it.loadUrl(suggestion.url) }
                 }
             },
             onDismissSuggestions = {
