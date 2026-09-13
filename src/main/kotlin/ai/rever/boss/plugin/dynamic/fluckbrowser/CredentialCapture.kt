@@ -85,9 +85,9 @@ internal object CredentialCapture {
      * The document-start script.
      *
      * Field eligibility comes from [FIELD_ELIGIBILITY_JS], shared with the probe and the fill, so
-     * all three agree on what a login field is. The specific trap it encodes: a `display: none`
-     * password input (`accounts.google.com` ships one) must not be read as the field the user
-     * typed into, or the "saved" password is whatever a decoy held.
+     * all three agree on what a login field is and on which fields belong together. The specific
+     * trap it encodes: a `display: none` password input (`accounts.google.com` ships one) must not
+     * be read as the field the user typed into, or the "saved" password is whatever a decoy held.
      *
      * The bridge arrives as a parameter named [PAGE_EVENT_BRIDGE], not as a `window` property, so
      * the script never touches `window` to post. That is the api's shape and the reason for it is
@@ -177,9 +177,14 @@ internal object CredentialCapture {
             return best;
         }
 
-        function capture() {
+        // `origin` is what the user acted on: the submitted form, the box Enter was pressed in, or the
+        // submit control. Only its group (see groupOf) is read. The first password box with a value
+        // anywhere on the page used to be taken instead, so a signup box typed into earlier was saved
+        // against a login, and a search sent while a login box held a half-typed password was
+        // captured as a sign-in.
+        function capture(origin) {
             try {
-                var fields = eligibleFields();
+                var fields = groupOf(origin, eligibleFields());
                 var pw = null;
                 for (var i = 0; i < fields.length; i++) {
                     // The FIRST password box with something in it. On a change-password form that
@@ -228,12 +233,12 @@ internal object CredentialCapture {
             return false;
         }
 
-        document.addEventListener('submit', function() { capture(); }, true);
+        document.addEventListener('submit', function(e) { capture(e.target); }, true);
         document.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') capture();
+            if (e.key === 'Enter') capture(e.target);
         }, true);
         document.addEventListener('pointerdown', function(e) {
-            if (looksLikeSubmit(e.target)) capture();
+            if (looksLikeSubmit(e.target)) capture(e.target);
         }, true);
         })();
         """.trimIndent()
