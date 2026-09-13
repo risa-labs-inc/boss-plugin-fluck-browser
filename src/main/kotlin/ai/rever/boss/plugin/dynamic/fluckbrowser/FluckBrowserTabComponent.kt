@@ -36,6 +36,8 @@ import ai.rever.boss.plugin.browser.BrowserHandle
 import ai.rever.boss.plugin.browser.BrowserService
 import ai.rever.boss.plugin.browser.PopupNavigation
 import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
+import ai.rever.boss.plugin.dynamic.fluckbrowser.markdown.FluckBrowserMarkdownRegistry
+import ai.rever.boss.plugin.dynamic.fluckbrowser.markdown.FluckMarkdownExtractor
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -3483,6 +3485,34 @@ internal fun FluckBrowserTabContent(
         }
     }
 
+    // Keyboard shortcut coordinator for "Copy as Markdown for Agent".
+    val windowId = LocalWindowIdProvider.current?.getWindowId()
+    val panelActive = LocalIsPanelActive.current
+
+    DisposableEffect(tabId, windowId, panelActive, browserHandle) {
+        val handle = browserHandle
+        if (windowId != null && handle != null) {
+            val reg = FluckBrowserMarkdownRegistry.register(
+                tabId = tabId,
+                windowId = windowId,
+                panelActive = panelActive,
+                copyAction = {
+                    coroutineScope.launch {
+                        val result = FluckMarkdownExtractor.extractMarkdown(handle)
+                        if (result.markdown.isNotBlank()) {
+                            FluckMarkdownExtractor.copyToClipboardSafe(result.markdown)
+                        }
+                    }
+                },
+            )
+            onDispose {
+                FluckBrowserMarkdownRegistry.unregister(reg)
+            }
+        } else {
+            onDispose {}
+        }
+    }
+
     // Load all secrets for dialogs
     LaunchedEffect(secretDataProvider) {
         if (secretDataProvider != null) {
@@ -4424,6 +4454,16 @@ internal fun FluckBrowserTabContent(
                                         }
                                     }
                                 }
+                            },
+                            onCopyMarkdown = {
+                                coroutineScope.launch {
+                                    browserHandle?.let { handle ->
+                                        val result = FluckMarkdownExtractor.extractMarkdown(handle)
+                                        if (result.markdown.isNotBlank()) {
+                                            FluckMarkdownExtractor.copyToClipboardSafe(result.markdown)
+                                        }
+                                    }
+                                }
                             }
                         )
                         SwingContextMenu.show(
@@ -5255,7 +5295,8 @@ internal fun buildContextMenuItems(
     onFillCredential: (SecretEntryData) -> Unit = {},
     // Offered only on a password box, and only when the suggestor is switched on.
     canSuggestPassword: Boolean = false,
-    onSuggestPassword: () -> Unit = {}
+    onSuggestPassword: () -> Unit = {},
+    onCopyMarkdown: (() -> Unit)? = null
 ): List<ContextMenuItem> = buildList {
     // Check if form field is focused (editable element)
     if (info?.isEditable == true) {
@@ -5364,6 +5405,13 @@ internal fun buildContextMenuItems(
             }
         ))
 
+        if (onCopyMarkdown != null) {
+            add(ContextMenuItem(
+                text = "Copy Page as Markdown for Agent",
+                onClick = onCopyMarkdown
+            ))
+        }
+
         // Developer tools
         add(ContextMenuItem(
             text = "Inspect Element",
@@ -5414,6 +5462,13 @@ internal fun buildContextMenuItems(
                 }
             ))
 
+            if (onCopyMarkdown != null) {
+                add(ContextMenuItem(
+                    text = "Copy Selection as Markdown for Agent",
+                    onClick = onCopyMarkdown
+                ))
+            }
+
             // Search selected text in new tab
             add(ContextMenuItem(
                 text = "Search with Google",
@@ -5459,6 +5514,13 @@ internal fun buildContextMenuItems(
                 info?.pageUrl?.let { copyToClipboard(it) }
             }
         ))
+
+        if (onCopyMarkdown != null) {
+            add(ContextMenuItem(
+                text = "Copy Page as Markdown for Agent",
+                onClick = onCopyMarkdown
+            ))
+        }
 
         // Image actions, when the click landed on one. Independent of the link
         // branch above: images are routinely wrapped in an anchor, and both sets
