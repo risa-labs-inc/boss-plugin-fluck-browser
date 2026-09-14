@@ -340,6 +340,16 @@ class HomeSwipeNavigationTest {
         assertNull(endHomeSwipe(finished), "local vertical evidence still rejects the narrowed release")
     }
 
+    @Test
+    fun `split-view cancellation rejects the same contact on another home surface`() {
+        val firstSurface = HomeSwipeContacts.guard
+        val secondSurface = HomeSwipeContacts.guard
+        firstSurface.cancel(HomeSwipeGesture(nativeGestureId = "split-41"))
+        val tail = homeSwipeScrollGate(HomeSwipeGesture(), "split-41:active:1000", 1000, secondSurface, true)
+        assertFalse(tail.accept, "a second surface cannot use the cancelled contact's full displacement")
+        assertTrue(homeSwipeScrollGate(HomeSwipeGesture(), "split-42:active:2000", 2000, secondSurface, true).accept)
+    }
+
     /** One scroll event, as the surface would see it. */
     private data class Wheel(
         val dx: Float,

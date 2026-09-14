@@ -531,3 +531,8 @@ internal fun homeSwipeScrollGate(
     val belongs = homeSwipeEventBelongsToPhase(eventWhenMs, phase)
     return HomeSwipeScrollGate(false, reset, belongs, phase.id, timestampRejected = !belongs)
 }
+
+/** The host contact ID is process-wide, so cancellation must span split-view home surfaces. */
+internal object HomeSwipeContacts {
+    val guard = HomeSwipeContactGuard()
+}

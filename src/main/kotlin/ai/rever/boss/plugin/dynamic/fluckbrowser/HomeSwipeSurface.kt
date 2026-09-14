@@ -66,9 +66,9 @@ internal fun HomeSwipeSurface(
     content: @Composable () -> Unit,
 ) {
     val phaseSource = remember { HomeSwipePhaseSource() }
-    val contactGuard = remember { HomeSwipeContactGuard() }
+    val contactGuard = HomeSwipeContacts.guard
     var reportedTimestampFailure by remember { mutableStateOf(false) }
-    var lastNativeEventNanos by remember { mutableStateOf(0L) }
+    var lastNativeEventNanos by remember { mutableStateOf(System.nanoTime()) }
     var gesture by remember { mutableStateOf(HomeSwipeGesture()) }
     var shown by remember { mutableStateOf<HomeSwipeDirection?>(null) }
     var progress by remember { mutableStateOf(0f) }
