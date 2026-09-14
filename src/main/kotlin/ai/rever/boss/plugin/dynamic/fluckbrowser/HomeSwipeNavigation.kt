@@ -65,11 +65,11 @@ internal const val SWIPE_TERMINALS_KEY = "boss.browser.swipe.terminals"
 internal fun homeSwipeReconciledPhase(
     gestureId: String?,
     rawPhase: String?,
-    terminalHistory: String?,
+    terminalHistory: () -> String?,
 ): HomeSwipeNativePhase {
     val current = parseHomeSwipeNativePhase(rawPhase)
     if (gestureId == null || current.id == gestureId || current.state == HomeSwipeNativeState.UNAVAILABLE) return current
-    return terminalHistory?.split(';')?.asReversed()?.asSequence()
+    return terminalHistory()?.split(';')?.asReversed()?.asSequence()
         ?.map(::parseHomeSwipeNativePhase)
         ?.firstOrNull {
             it.id == gestureId && (it.state == HomeSwipeNativeState.ENDED || it.state == HomeSwipeNativeState.CANCELLED)
@@ -166,6 +166,8 @@ internal fun homeSwipeEventBelongsToPhase(
     val beganAt = phase.beganAtEpochMs ?: return false
     // The host callback and AWT dispatch stamp at different points in event delivery. Unknown
     // times remain fail-closed: receipt time cannot distinguish a queued previous contact.
+    // The tolerance can admit trailing events from a contact released less than 120 ms earlier.
+    // Event-count and travel checks mitigate accidental acceptance; hardware validation remains.
     return phase.state == HomeSwipeNativeState.ACTIVE && eventWhenEpochMs != null &&
         eventWhenEpochMs >= beganAt - NATIVE_CLOCK_SKEW_MS
 }
@@ -226,6 +228,7 @@ internal fun homeSwipeWithNativeFinal(
     val finalVertical = (phase.verticalPath ?: return gesture) * NATIVE_TO_HOME_UNITS
     // AWT CPlatformResponder inverts native wheel deltas. Do not compare these signs directly;
     // the host latches net-sign reversals over the entire native contact, independently of thresholds.
+    // Preserve the accumulator's direction convention even though commit reads its magnitude.
     val signed = if (gesture.direction == HomeSwipeDirection.BACK) -finalMagnitude else finalMagnitude
     val updated = gesture.copy(
         accumX = signed.toFloat(),
@@ -490,7 +493,7 @@ internal class HomeSwipePhaseSource(
     fun hasTerminalHistory(): Boolean = terminalHistory() != null
     fun phase(gestureId: String? = null): HomeSwipeNativePhase = reconcile(gestureId, raw())
     fun reconcile(gestureId: String?, rawPhase: String?): HomeSwipeNativePhase =
-        homeSwipeReconciledPhase(gestureId, rawPhase, terminalHistory())
+        homeSwipeReconciledPhase(gestureId, rawPhase, ::terminalHistory)
 }
 
 /** Cancellation latches only the physical contact this surface has actually observed. */
@@ -577,7 +580,7 @@ internal data class PreparedHomeSwipeScroll(
 internal fun prepareHomeSwipeScroll(
     gesture: HomeSwipeGesture,
     rawPhase: String?,
-    terminalHistory: String?,
+    terminalHistory: () -> String?,
     eventWhenMs: Long?,
     guard: HomeSwipeContactGuard,
     isMac: Boolean,
@@ -607,7 +610,7 @@ internal fun prepareHomeSwipeScroll(
     }
     val gate = homeSwipeScrollGate(current, rawPhase, eventWhenMs, guard, isMac)
     if (gate.reset) {
-        guard.cancel(current)
+        // A reset can only follow an empty gesture or a mismatch already cancelled above.
         current = HomeSwipeGesture()
         clear = true
     }

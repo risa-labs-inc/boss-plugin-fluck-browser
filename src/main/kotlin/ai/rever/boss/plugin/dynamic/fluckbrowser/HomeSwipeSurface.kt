@@ -24,6 +24,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import java.awt.event.MouseEvent
 import java.util.logging.Logger
@@ -91,13 +92,13 @@ internal fun HomeSwipeSurface(
         progress = 0f
     }
 
-    // Runs one finished gesture through the decision and navigates if it earned it. The ONE
-    // place onNavigate is called, so neither pointer handler below calls it directly.
-    // homeSwipeEnabled() is read per gesture, not cached: the host republishes the key the moment
-    // the setting changes, and a relaunch to pick that up would be a poor answer.
-    fun decide(finished: HomeSwipeGesture): Boolean {
+    // Runs legacy and watchdog completions through the decision and navigates if earned. Retained
+    // releases are decided by prepareHomeSwipeScroll and dispatched directly by the pointer handler.
+    // homeSwipeEnabled() is read for each pointer event or asynchronous completion, not cached:
+    // the host republishes the key when the setting changes, so a relaunch is unnecessary.
+    fun decide(finished: HomeSwipeGesture, enabled: Boolean = homeSwipeEnabled()): Boolean {
         val direction = endHomeSwipe(finished)
-        if (direction != null && homeSwipeEnabled()) {
+        if (direction != null && enabled) {
             onNavigate(direction)
             return true
         }
@@ -163,10 +164,11 @@ internal fun HomeSwipeSurface(
                 .onPointerEvent(PointerEventType.Scroll) { event ->
                     val change = event.changes.firstOrNull() ?: return@onPointerEvent
                     val rawPhase = phaseSource.raw()
+                    val enabled = homeSwipeEnabled()
                     val nativeWhen = (event.nativeEvent as? MouseEvent)?.`when`
                     val prepared = prepareHomeSwipeScroll(
-                        gesture, rawPhase, phaseSource.terminalHistory(), nativeWhen, contactGuard,
-                        phaseSource.isMac, homeSwipeEnabled(),
+                        gesture, rawPhase, phaseSource::terminalHistory, nativeWhen, contactGuard,
+                        phaseSource.isMac, enabled,
                     )
                     gesture = prepared.gesture
                     if (prepared.clearAffordance) {
@@ -178,7 +180,7 @@ internal fun HomeSwipeSurface(
                         return@onPointerEvent
                     }
                     val gate = prepared.gate
-                    if (rawPhase == "unavailable" && homeSwipeEnabled() && !runtime.reportedUnavailable) {
+                    if (rawPhase == "unavailable" && enabled && !runtime.reportedUnavailable) {
                         runtime.reportedUnavailable = true
                         homeSwipeLog.warning(
                             "Native home swipe unavailable. Check BOSS trackpad settings for release-detection status.",
@@ -205,10 +207,9 @@ internal fun HomeSwipeSurface(
                                 canGoBack = canGoBack,
                                 canGoForward = canGoForward,
                             )
-                        step.ended?.let(::decide)
+                        step.ended?.let { decide(it, enabled) }
                         gesture = step.gesture
                         legacyEventTick++
-                        val enabled = homeSwipeEnabled()
                         shown = step.direction.takeIf { enabled }
                         progress = step.progress
                         return@onPointerEvent
@@ -226,7 +227,6 @@ internal fun HomeSwipeSurface(
                         )
                     runtime.lastNativeEventNanos = System.nanoTime()
                     gesture = step.gesture
-                    val enabled = homeSwipeEnabled()
                     shown = step.direction.takeIf { enabled }
                     progress = step.progress
                 }
@@ -257,8 +257,7 @@ private fun HomeSwipeAffordance(
 ) {
     val eased by animateFloatAsState(progress, label = "homeSwipeProgress")
     val committed = eased >= 1f
-    val hiddenPx = with(androidx.compose.ui.platform.LocalDensity.current) { PUCK_HIDDEN_DP.toPx() }
-    val travelPx = with(androidx.compose.ui.platform.LocalDensity.current) { PUCK_TRAVEL_DP.toPx() }
+    val (hiddenPx, travelPx) = with(LocalDensity.current) { PUCK_HIDDEN_DP.toPx() to PUCK_TRAVEL_DP.toPx() }
     val sign = if (direction == HomeSwipeDirection.BACK) 1f else -1f
 
     Box(
