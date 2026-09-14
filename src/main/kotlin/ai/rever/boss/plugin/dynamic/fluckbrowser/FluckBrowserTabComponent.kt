@@ -1946,16 +1946,15 @@ internal enum class FullscreenExitPhase {
  * interceptor tears down the whole plugin: on 17 Aug a single Enter in the URL bar closed all 13
  * open browser tabs, while the orphaned Chromium process kept playing the video from one of them.
  *
- * The tab does not need the exception to recover - the validity poll rebuilds the browser within
- * 500ms - so it stops here, at the plugin's own boundary. What must not happen is the plugin
- * dying on the way.
+ * Engine-closed failures are reported with the failing handle so the validity poll can recover
+ * even when isValid stays true. Other failures remain contained at the plugin boundary.
  *
  * Cancellation is re-thrown: swallowing it inside a coroutine breaks structured concurrency, and
  * the tab-switch path cancels these scopes routinely.
  */
 internal inline fun <T> BrowserHandle?.onBrowser(
     op: String,
-    noinline onEngineDead: () -> Unit = {},
+    noinline onEngineDead: (BrowserHandle) -> Unit = {},
     block: (BrowserHandle) -> T,
 ): T? {
     val handle = this ?: return null
@@ -1972,7 +1971,7 @@ internal inline fun <T> BrowserHandle?.onBrowser(
         // (BossConsole#392). Swallowing the exception is what keeps the plugin alive; reporting
         // the death is what lets the poll rebuild the browser instead of leaving it wedged for
         // the rest of the tab's life.
-        if (BrowserLiveness.isEngineClosed(e)) onEngineDead()
+        if (BrowserLiveness.isEngineClosed(e)) onEngineDead(handle)
         null
     }
 }
@@ -2300,25 +2299,21 @@ internal class FluckBrowserTabState {
     @Volatile
     var scrollRestoreJob: kotlinx.coroutines.Job? = null
 
-    /**
-     * Set when a browser call caught the engine-closed throwable that [BrowserHandle.isValid] does
-     * not reflect (see [onBrowser]). The validity poll consults it through
-     * [BrowserLiveness.shouldRecover], so a browser that died with its IPC channel severed still
-     * triggers recovery instead of leaving the tab wedged (BossConsole#392). Reset on every handle
-     * transition ([adoptBrowserHandle], [releaseBrowserHandle]), so a report can only ever pertain
-     * to the handle that is current now.
-     *
-     * `@Volatile` for the same reason [scrollRestoreJob] is: onBrowser catches on whichever thread
-     * made the call - a click handler on Main, a fill on IO - while the poll reads it on Main.
-     * Visibility is all that is needed; a lost race just recovers on the next 500ms tick.
-     */
-    @Volatile
-    var engineDeathReported: Boolean = false
-        private set
+    // Each adoption owns a separate signal. An in-flight call may finish after replacement;
+    // updating its old signal must never mark the new browser dead (or clear its report).
+    private class EngineLiveness(val handle: BrowserHandle) {
+        @Volatile var dead = false
+    }
 
-    /** See [engineDeathReported]. The reporter [onBrowser] calls from its engine-closed branch. */
-    fun reportEngineDeath() {
-        engineDeathReported = true
+    @Volatile
+    private var engineLiveness: EngineLiveness? = null
+
+    val engineDeathReported: Boolean
+        get() = engineLiveness?.dead == true
+
+    fun reportEngineDeath(handle: BrowserHandle) {
+        val signal = engineLiveness ?: return
+        if (signal.handle === handle) signal.dead = true
     }
 
     var isLoading: Boolean by mutableStateOf(false)
@@ -2476,9 +2471,7 @@ internal class FluckBrowserTabState {
             disposeBrowserHandleOffThread(previous)
         }
         clearFullscreenState()
-        // A fresh handle starts alive; a report carried over from the handle it replaces would
-        // rebuild this one on the poll's next tick for no reason.
-        engineDeathReported = false
+        engineLiveness = EngineLiveness(handle)
         browserHandle = handle
     }
 
@@ -2529,11 +2522,23 @@ internal class FluckBrowserTabState {
         // exists - the "the tab says it is doing something it isn't" family this file is being
         // cleaned of. Adoption re-seeds it from the replacement.
         isLoading = false
-        // The report belonged to the handle now leaving. Clearing it here means the poll that is
-        // about to rebuild does not immediately re-trigger against the replacement, and a fresh
-        // handle that never dies is never rebuilt on a stale flag.
-        engineDeathReported = false
+        engineLiveness = null
         return ReleasedHandle(handle, pending)
+    }
+
+    /**
+     * Commit recovery before returning to the handle-keyed effect, which will be cancelled as
+     * soon as release recomposes it. Never suspend between release and scheduling initialization.
+     */
+    fun prepareBrowserRecovery(): ReleasedHandle {
+        val url = visiblePageUrl(urlBarText.text, loadedUrl)
+        val released = releaseBrowserHandle()
+        urlBarText = TextFieldValue(url, TextRange(url.length))
+        loadedUrl = url
+        error = null
+        initMessage = RECOVERING_MESSAGE
+        initNonce++
+        return released
     }
 
     /**
@@ -3505,42 +3510,11 @@ internal fun FluckBrowserTabContent(
                         recoveryAttempts++
                         println("[FluckBrowser] Browser invalid, triggering recovery (attempt $recoveryAttempts/$maxRecoveryAttempts)")
 
-                        // The page the tab was ON, not the URL-bar draft. Deliberate, and worth
-                        // stating because visiblePageUrl changes what this line used to mean: a
-                        // renderer that crashes WHILE loading B now recovers to A rather than to
-                        // B, since loadedUrl only advances on NavigationFinished. Recovering onto
-                        // the page that was actually rendering is the safer of the two - the load
-                        // that crashed is the one least worth immediately repeating - and
-                        // recovery re-seeds loadedUrl below so the recreation agrees with it.
-                        val currentUrl = pageUrl
-
-                        // Reset state to trigger reinitialization. Dispose the
-                        // invalid handle too — even a crashed/stale handle still
-                        // holds listener registrations and view state worth
-                        // releasing, and dispose() is safe on invalid handles.
-                        //
-                        // Fullscreen belongs to the handle, not the tab: the replacement
-                        // never reports onExitFullscreen for a session it wasn't part of,
-                        // so a stale `true` would strand the tab on FullscreenPlaceholder
-                        // with an exit button that can't do anything. releaseBrowserHandle
-                        // makes that structural rather than a line to remember here.
-                        disposeReleasedHandle(hoistedState.releaseBrowserHandle())
-                        // A recovery in progress belongs on the starting surface, not the error
-                        // one: the tab is about to rebuild its browser by itself, and the retry
-                        // below is what makes that true. `error` stays null so the rebuild can
-                        // render the page the moment it arrives.
-                        initMessage = RECOVERING_MESSAGE
-
-                        // Restore URL after small delay (home needs no restore)
-                        delay(100)
-                        if (!isHomeUrl(currentUrl)) {
-                            urlBarText = TextFieldValue(currentUrl, TextRange(currentUrl.length))
-                            // Both, so the recreation below resolves to this same URL rather than
-                            // to whatever loadedUrl held before the crash.
-                            loadedUrl = currentUrl
-                        }
-
-                        // Increment retry count to trigger LaunchedEffect
+                        // Save the committed URL and schedule the replacement synchronously.
+                        // Releasing changes this effect's key: a delay here would cancel the
+                        // coroutine before the retry was scheduled and leave a handle-less tab.
+                        disposeReleasedHandle(hoistedState.prepareBrowserRecovery())
+                        // Backoff belongs to the initialization effect, not this cancelled one.
                         retryCount++
                     } else {
                         // Max recovery attempts reached
@@ -3947,17 +3921,17 @@ internal fun FluckBrowserTabContent(
                             }
                             Key.Zero -> {
                                 // Reset zoom - Cmd+0 / Ctrl+0
-                                browserHandle.onBrowser("resetZoom") { it.resetZoom() }
+                                browserHandle.onBrowser("resetZoom", onEngineDead = hoistedState::reportEngineDeath) { it.resetZoom() }
                                 true
                             }
                             Key.Equals, Key.NumPadAdd -> {
                                 // Zoom in - Cmd++ or Cmd+= / Ctrl++ or Ctrl+=
-                                browserHandle.onBrowser("zoomIn") { it.zoomIn() }
+                                browserHandle.onBrowser("zoomIn", onEngineDead = hoistedState::reportEngineDeath) { it.zoomIn() }
                                 true
                             }
                             Key.Minus, Key.NumPadSubtract -> {
                                 // Zoom out - Cmd+- / Ctrl+-
-                                browserHandle.onBrowser("zoomOut") { it.zoomOut() }
+                                browserHandle.onBrowser("zoomOut", onEngineDead = hoistedState::reportEngineDeath) { it.zoomOut() }
                                 true
                             }
                             else -> false
@@ -4080,8 +4054,8 @@ internal fun FluckBrowserTabContent(
             },
             canGoBack = canGoBack,
             canGoForward = canGoForward,
-            onBack = { browserHandle.onBrowser("goBack") { it.goBack() } },
-            onForward = { browserHandle.onBrowser("goForward") { it.goForward() } },
+            onBack = { browserHandle.onBrowser("goBack", onEngineDead = hoistedState::reportEngineDeath) { it.goBack() } },
+            onForward = { browserHandle.onBrowser("goForward", onEngineDead = hoistedState::reportEngineDeath) { it.goForward() } },
             onReload = { browserHandle.onBrowser("reload", onEngineDead = hoistedState::reportEngineDeath) { it.reload() } },
             onStop = { browserHandle.onBrowser("stop", onEngineDead = hoistedState::reportEngineDeath) { it.stop() } },
             isLoading = isLoading,
@@ -4089,7 +4063,7 @@ internal fun FluckBrowserTabContent(
             zoomLevel = zoomLevel,
             onZoomChange = { level ->
                 zoomLevel = level
-                browserHandle.onBrowser("setZoomLevel") { it.setZoomLevel(level) }
+                browserHandle.onBrowser("setZoomLevel", onEngineDead = hoistedState::reportEngineDeath) { it.setZoomLevel(level) }
             },
             isBookmarked = isBookmarked,
             onBookmarkClick = {
@@ -4300,9 +4274,9 @@ internal fun FluckBrowserTabContent(
                         onNavigate = { direction ->
                             when (direction) {
                                 HomeSwipeDirection.BACK ->
-                                    browserHandle.onBrowser("goBack") { it.goBack() }
+                                    browserHandle.onBrowser("goBack", onEngineDead = hoistedState::reportEngineDeath) { it.goBack() }
                                 HomeSwipeDirection.FORWARD ->
-                                    browserHandle.onBrowser("goForward") { it.goForward() }
+                                    browserHandle.onBrowser("goForward", onEngineDead = hoistedState::reportEngineDeath) { it.goForward() }
                             }
                         },
                     ) {
@@ -4313,7 +4287,7 @@ internal fun FluckBrowserTabContent(
                         dashboardContentProvider?.DashboardContent(
                             onNavigate = { url ->
                                 coroutineScope.launch {
-                                    browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
+                                    browserHandle.onBrowser("loadUrl", onEngineDead = hoistedState::reportEngineDeath) { it.loadUrl(url) }
                                 }
                             }
                         )
@@ -4362,14 +4336,14 @@ internal fun FluckBrowserTabContent(
 
                                 when (browserMouseNavigationForButton(awtEvent?.button)) {
                                     BrowserMouseNavigation.BACK -> {
-                                        if (browserHandle.onBrowser("canGoBack") { it.canGoBack() } == true) {
-                                            browserHandle.onBrowser("goBack") { it.goBack() }
+                                        if (browserHandle.onBrowser("canGoBack", onEngineDead = hoistedState::reportEngineDeath) { it.canGoBack() } == true) {
+                                            browserHandle.onBrowser("goBack", onEngineDead = hoistedState::reportEngineDeath) { it.goBack() }
                                         }
                                         event.changes.forEach { it.consume() }
                                     }
                                     BrowserMouseNavigation.FORWARD -> {
-                                        if (browserHandle.onBrowser("canGoForward") { it.canGoForward() } == true) {
-                                            browserHandle.onBrowser("goForward") { it.goForward() }
+                                        if (browserHandle.onBrowser("canGoForward", onEngineDead = hoistedState::reportEngineDeath) { it.canGoForward() } == true) {
+                                            browserHandle.onBrowser("goForward", onEngineDead = hoistedState::reportEngineDeath) { it.goForward() }
                                         }
                                         event.changes.forEach { it.consume() }
                                     }
@@ -4438,11 +4412,12 @@ internal fun FluckBrowserTabContent(
                         val menuItems = buildContextMenuItems(
                             info = menuInfo,
                             browserHandle = browserHandle,
+                            onEngineDead = hoistedState::reportEngineDeath,
                             canGoBack = canGoBack,
                             canGoForward = canGoForward,
                             onNavigate = { url ->
                                 coroutineScope.launch {
-                                    browserHandle.onBrowser("loadUrl") { it.loadUrl(url) }
+                                    browserHandle.onBrowser("loadUrl", onEngineDead = hoistedState::reportEngineDeath) { it.loadUrl(url) }
                                 }
                             },
                             onOpenInNewTab = onOpenInNewTab,
@@ -5057,7 +5032,7 @@ internal fun FluckBrowserTabContent(
                                     lastUserEditTime = 0L
                                     typedSinceClaim = false
                                     coroutineScope.launch {
-                                        browserHandle.onBrowser("loadUrl") { it.loadUrl(entry.url) }
+                                        browserHandle.onBrowser("loadUrl", onEngineDead = hoistedState::reportEngineDeath) { it.loadUrl(entry.url) }
                                     }
                                 }
                                 .padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
@@ -5335,7 +5310,8 @@ internal fun buildContextMenuItems(
     onFillCredential: (SecretEntryData) -> Unit = {},
     // Offered only on a password box, and only when the suggestor is switched on.
     canSuggestPassword: Boolean = false,
-    onSuggestPassword: () -> Unit = {}
+    onSuggestPassword: () -> Unit = {},
+    onEngineDead: (BrowserHandle) -> Unit = {},
 ): List<ContextMenuItem> = buildList {
     // Check if form field is focused (editable element)
     if (info?.isEditable == true) {
@@ -5433,7 +5409,7 @@ internal fun buildContextMenuItems(
         // Reload
         add(ContextMenuItem(
             text = "Reload",
-            onClick = { browserHandle.onBrowser("reload") { it.reload() } }
+            onClick = { browserHandle.onBrowser("reload", onEngineDead) { it.reload() } }
         ))
 
         // Copy Page URL
@@ -5456,21 +5432,21 @@ internal fun buildContextMenuItems(
         if (canGoBack) {
             add(ContextMenuItem(
                 text = "Back",
-                onClick = { browserHandle.onBrowser("goBack") { it.goBack() } }
+                onClick = { browserHandle.onBrowser("goBack", onEngineDead) { it.goBack() } }
             ))
         }
 
         if (canGoForward) {
             add(ContextMenuItem(
                 text = "Forward",
-                onClick = { browserHandle.onBrowser("goForward") { it.goForward() } }
+                onClick = { browserHandle.onBrowser("goForward", onEngineDead) { it.goForward() } }
             ))
         }
 
         // Always show reload
         add(ContextMenuItem(
             text = "Reload",
-            onClick = { browserHandle.onBrowser("reload") { it.reload() } }
+            onClick = { browserHandle.onBrowser("reload", onEngineDead) { it.reload() } }
         ))
 
         add(ContextMenuItem(isDivider = true))
