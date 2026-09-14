@@ -39,14 +39,26 @@ internal enum class HomeSwipeDirection { BACK, FORWARD }
  */
 internal const val SWIPE_ENABLED_KEY = "BOSS_BROWSER_SWIPE_NAV"
 
-/** Native finger-contact phase published by the host process. */
+/**
+ * Append-only host wire contract (BossConsole#650): `id:active:beganAt` or
+ * `id:ended|cancelled:finalX:verticalPath:pageRejected:reversed`.
+ * beganAt is System.currentTimeMillis() on the CoreGraphics callback thread. AWT event time
+ * is also epoch milliseconds, but its native conversion can lag; allow GESTURE_GAP_MS skew.
+ * finalX and verticalPath are CoreGraphics POINT_DELTA_AXIS_2/1 totals, not DOM CSS pixels.
+ * pageRejected uses the page detector's thresholds; home applies its own tuned thresholds.
+ * The host must retain terminal evidence until the next contact begins. A single snapshot can
+ * still miss a release followed by another contact between polls: cancel rather than infer an
+ * unobserved release. Lossless reconciliation requires a host-side terminal history/API.
+ * Unknown trailing fields are ignored. `unavailable` fails closed on macOS; other platforms
+ * retain the legacy detector because this protocol describes macOS finger contacts only.
+ */
 internal const val SWIPE_PHASE_KEY = "boss.browser.swipe.phase"
 
 internal enum class HomeSwipePhaseSupport { LEGACY, NATIVE }
 
-/** Absence identifies an older host; every updated host publishes even when observation failed. */
-internal fun homeSwipePhaseSupport(raw: String?): HomeSwipePhaseSupport =
-    if (raw == null) HomeSwipePhaseSupport.LEGACY else HomeSwipePhaseSupport.NATIVE
+/** Non-macOS and older hosts use compatibility; macOS observation failure stays fail-closed. */
+internal fun homeSwipePhaseSupport(raw: String?, isMac: Boolean = true): HomeSwipePhaseSupport =
+    if (!isMac || raw == null) HomeSwipePhaseSupport.LEGACY else HomeSwipePhaseSupport.NATIVE
 
 internal enum class HomeSwipeNativeState { ACTIVE, ENDED, CANCELLED, UNAVAILABLE }
 
@@ -56,6 +68,7 @@ internal data class HomeSwipeNativePhase(
     val beganAtEpochMs: Long? = null,
     val finalX: Double? = null,
     val verticalPath: Double? = null,
+    /** Page-threshold rejection is intentionally not applied to the separately tuned home detector. */
     val pageRejected: Boolean = false,
     val reversed: Boolean = false,
 )
@@ -96,16 +109,18 @@ internal fun parseHomeSwipeNativePhase(raw: String?): HomeSwipeNativePhase {
             "cancelled" -> HomeSwipeNativeState.CANCELLED
             else -> HomeSwipeNativeState.UNAVAILABLE
         }
-    if (state == HomeSwipeNativeState.ACTIVE && parts.size == 3) {
+    if (state == HomeSwipeNativeState.ACTIVE && parts.size >= 3) {
         val beganAt = parts[2].toLongOrNull()
         if (beganAt != null) return HomeSwipeNativePhase(id, state, beganAtEpochMs = beganAt)
     }
-    if ((state == HomeSwipeNativeState.ENDED || state == HomeSwipeNativeState.CANCELLED) && parts.size == 6) {
+    if ((state == HomeSwipeNativeState.ENDED || state == HomeSwipeNativeState.CANCELLED) && parts.size >= 6) {
         val finalX = parts[2].toDoubleOrNull()
         val verticalPath = parts[3].toDoubleOrNull()
         val pageRejected = parts[4].toBooleanStrictOrNull()
         val reversed = parts[5].toBooleanStrictOrNull()
-        if (finalX != null && verticalPath != null && pageRejected != null && reversed != null) {
+        if (finalX != null && finalX.isFinite() && verticalPath != null && verticalPath.isFinite() &&
+            verticalPath >= 0 && pageRejected != null && reversed != null
+        ) {
             return HomeSwipeNativePhase(
                 id = id,
                 state = state,
@@ -124,9 +139,10 @@ internal fun homeSwipeEventBelongsToPhase(
     phase: HomeSwipeNativePhase,
 ): Boolean {
     val beganAt = phase.beganAtEpochMs ?: return false
-    // The two callbacks read epoch milliseconds on separate native/EDT threads; tolerate their
-    // one-millisecond boundary while still rejecting an event queued before this contact began.
-    return phase.state == HomeSwipeNativeState.ACTIVE && eventWhenEpochMs != null && eventWhenEpochMs + 1 >= beganAt
+    // AWT converts native timestamps independently of the host callback clock. Unknown times
+    // remain fail-closed: receipt time cannot distinguish a queued previous contact.
+    return phase.state == HomeSwipeNativeState.ACTIVE && eventWhenEpochMs != null &&
+        eventWhenEpochMs >= beganAt - GESTURE_GAP_MS
 }
 
 /**
@@ -168,7 +184,11 @@ internal fun parseHomeSwipeEnabled(raw: String?): Boolean? =
  */
 internal const val COMMIT_UNITS = 3.5f
 
-/** Host-normalized final displacement uses the page detector's CSS-pixel scale. */
+/**
+ * CoreGraphics point deltas to AWT wheel rotation, approximately 10:1 for precise macOS scroll.
+ * These are native point deltas, not Chromium-rescaled DOM deltas. Hardware calibration remains
+ * necessary; the active wire format contains no displacement to reconcile the preview with.
+ */
 private const val NATIVE_TO_HOME_UNITS = 0.1
 
 /** Apply release data that cannot be delayed behind Compose's pointer queue. */
@@ -278,8 +298,7 @@ internal data class HomeSwipeStep(
      * Not the same thing as [gesture], which is the fresh one this event begins. It exists because
      * the two ways a legacy-host gesture can end run on different clocks: [advanceHomeSwipe]
      * retires one after [GESTURE_GAP_MS], while [HomeSwipeSurface]'s compatibility timer fires at
-     * `GESTURE_GAP_MS + 60`. An event
-     * landing in that 60ms window cancels the pending timer AND discards the gesture here, so a
+     * `GESTURE_GAP_MS + 60`. An event landing in that 60ms window cancels the pending timer AND discards the gesture here, so a
      * swipe that had already earned a navigation was silently thrown away - reachable without a
      * second physical swipe, since a trackpad emits nothing while the fingers are still: swipe
      * past the threshold, hold ~150ms, nudge before releasing. Handing the retired gesture back
@@ -397,8 +416,8 @@ internal fun advanceHomeSwipe(
 /**
  * Decide whether a finished gesture navigates.
  *
- * Called when the gesture ENDS - a gap in the wheel stream, or the pointer leaving the surface -
- * never mid-swipe. [advanceHomeSwipe] only tracks progress and the two ways a gesture rules
+ * Called on native finger release, or a quiet gap on a legacy host. Pointer Exit cancels
+ * without calling this decision. [advanceHomeSwipe] only tracks progress and the two ways a gesture rules
  * itself out early (a direction flip, too much vertical); this is the one place "reached the
  * commit distance" turns into an actual navigation, so:
  *
@@ -421,4 +440,43 @@ internal fun endHomeSwipe(gesture: HomeSwipeGesture): HomeSwipeDirection? {
     val direction = gesture.direction ?: return null
     val progress = kotlin.math.abs(gesture.accumX) / COMMIT_UNITS
     return direction.takeIf { progress >= 1f }
+}
+
+/** Phase reads and platform selection shared by the event handler and both timer guards. */
+internal class HomeSwipePhaseSource(
+    private val read: () -> String? = { System.getProperty(SWIPE_PHASE_KEY) },
+    private val isMac: Boolean = ai.rever.boss.plugin.dynamic.fluckbrowser.menu.OsFamily.isMac,
+) {
+    fun raw(): String? = if (isMac) read() else null
+    fun support(): HomeSwipePhaseSupport = homeSwipePhaseSupport(raw(), isMac)
+    fun phase(): HomeSwipeNativePhase = parseHomeSwipeNativePhase(raw())
+}
+
+/** Cancellation is latched to a physical contact, including Exit before the first wheel event. */
+internal class HomeSwipeContactGuard {
+    private var rejectedId: String? = null
+
+    fun cancel(gesture: HomeSwipeGesture, phase: HomeSwipeNativePhase) {
+        rejectedId = gesture.nativeGestureId
+            ?: phase.id.takeIf { phase.state == HomeSwipeNativeState.ACTIVE } ?: rejectedId
+    }
+
+    fun accepts(phase: HomeSwipeNativePhase): Boolean =
+        phase.state == HomeSwipeNativeState.ACTIVE && phase.id != null && phase.id != rejectedId
+}
+
+/** An abandoned observer cancels after ten quiet seconds; it must never idle-commit. */
+internal const val NATIVE_STALE_MS = 10_000L
+
+internal fun homeSwipeNativeWatchdogAction(
+    gesture: HomeSwipeGesture,
+    phase: HomeSwipeNativePhase,
+    idleMs: Long,
+): HomeSwipePhaseAction {
+    val action = homeSwipePhaseAction(gesture, phase)
+    return if (action == HomeSwipePhaseAction.WAIT && idleMs >= NATIVE_STALE_MS) {
+        HomeSwipePhaseAction.CANCEL
+    } else {
+        action
+    }
 }

@@ -49,10 +49,10 @@ private val PUCK_SIZE = 52.dp
  * and this sees an unconsumed event exactly when nothing on the page wanted it. Moving this to
  * the Initial pass, or onto the same node as the scroller, would take the row's scrolling away.
  *
- * Current hosts publish [SWIPE_PHASE_KEY], including the explicit `unavailable` state, and only a
+ * On macOS, current hosts publish [SWIPE_PHASE_KEY], including `unavailable`, and only a
  * matching native Ended phase commits. Hosts from before that property existed are still within
  * this plugin's supported Boss range; absence alone selects the former quiet-gap detector for
- * compatibility. `unavailable` never does, because that would weaken release semantics on a host
+ * compatibility. Other platforms always retain that detector. On macOS `unavailable` never does, because that would weaken release semantics on a host
  * which attempted native observation and could not provide it.
  */
 @OptIn(ExperimentalComposeUiApi::class)
@@ -63,6 +63,9 @@ internal fun HomeSwipeSurface(
     onNavigate: (HomeSwipeDirection) -> Unit,
     content: @Composable () -> Unit,
 ) {
+    val phaseSource = remember { HomeSwipePhaseSource() }
+    val contactGuard = remember { HomeSwipeContactGuard() }
+    var lastNativeEventNanos by remember { mutableStateOf(0L) }
     var gesture by remember { mutableStateOf(HomeSwipeGesture()) }
     var shown by remember { mutableStateOf<HomeSwipeDirection?>(null) }
     var progress by remember { mutableStateOf(0f) }
@@ -70,7 +73,8 @@ internal fun HomeSwipeSurface(
     var legacyEventTick by remember { mutableStateOf(0L) }
 
     // Drops the gesture and its affordance without deciding anything. The abandon path.
-    fun cancelGesture() {
+    fun cancelGesture(rejectContact: Boolean = true) {
+        if (rejectContact) contactGuard.cancel(gesture, phaseSource.phase())
         gesture = HomeSwipeGesture()
         shown = null
         progress = 0f
@@ -102,12 +106,12 @@ internal fun HomeSwipeSurface(
     // explicit `unavailable` value belongs to an updated host and must remain fail-closed: using
     // quiet time there would reintroduce commits before a real finger release.
     LaunchedEffect(legacyEventTick) {
-        if (homeSwipePhaseSupport(System.getProperty(SWIPE_PHASE_KEY)) != HomeSwipePhaseSupport.LEGACY) {
+        if (phaseSource.support() != HomeSwipePhaseSupport.LEGACY) {
             return@LaunchedEffect
         }
         if (gesture.events > 0) {
             delay(GESTURE_GAP_MS + 60)
-            if (System.getProperty(SWIPE_PHASE_KEY) == null) endLegacyGesture()
+            if (phaseSource.support() == HomeSwipePhaseSupport.LEGACY) endLegacyGesture()
         }
     }
 
@@ -118,10 +122,16 @@ internal fun HomeSwipeSurface(
         if (gesture.nativeGestureId == null) return@LaunchedEffect
         while (isActive) {
             delay(16)
-            val phase = parseHomeSwipeNativePhase(System.getProperty(SWIPE_PHASE_KEY))
-            when (homeSwipePhaseAction(gesture, phase)) {
-                HomeSwipePhaseAction.DECIDE -> endGesture(phase)
-                HomeSwipePhaseAction.CANCEL -> cancelGesture()
+            val phase = phaseSource.phase()
+            when (homeSwipeNativeWatchdogAction(gesture, phase, (System.nanoTime() - lastNativeEventNanos) / 1_000_000)) {
+                HomeSwipePhaseAction.DECIDE -> {
+                    endGesture(phase)
+                    break
+                }
+                HomeSwipePhaseAction.CANCEL -> {
+                    cancelGesture()
+                    break
+                }
                 HomeSwipePhaseAction.WAIT -> Unit
             }
         }
@@ -133,7 +143,7 @@ internal fun HomeSwipeSurface(
                 .fillMaxSize()
                 .onPointerEvent(PointerEventType.Scroll) { event ->
                     val change = event.changes.firstOrNull() ?: return@onPointerEvent
-                    val rawPhase = System.getProperty(SWIPE_PHASE_KEY)
+                    val rawPhase = phaseSource.raw()
                     if (homeSwipePhaseSupport(rawPhase) == HomeSwipePhaseSupport.LEGACY) {
                         if (gesture.nativeGestureId != null) cancelGesture()
                         val step =
@@ -156,17 +166,17 @@ internal fun HomeSwipeSurface(
                     }
                     // Never carry progress across a capability transition. This is mostly startup
                     // hardening: an updated host initializes the property before plugins load.
-                    if (gesture.nativeGestureId == null && gesture.events > 0) cancelGesture()
+                    if (gesture.nativeGestureId == null && gesture.events > 0) cancelGesture(rejectContact = false)
                     val phase = parseHomeSwipeNativePhase(rawPhase)
-                    if (phase.state != HomeSwipeNativeState.ACTIVE || phase.id == null) {
+                    if (!contactGuard.accepts(phase)) {
                         return@onPointerEvent
                     }
-                    val nativeWhen = (event.nativeEvent as? java.awt.event.MouseWheelEvent)?.`when`
+                    val nativeWhen = (event.nativeEvent as? java.awt.event.MouseEvent)?.`when`
                     if (!homeSwipeEventBelongsToPhase(nativeWhen, phase)) {
                         return@onPointerEvent
                     }
                     if (gesture.nativeGestureId != null && gesture.nativeGestureId != phase.id) {
-                        cancelGesture()
+                        cancelGesture(rejectContact = false)
                     }
                     val step =
                         advanceHomeSwipe(
@@ -179,6 +189,7 @@ internal fun HomeSwipeSurface(
                             canGoForward = canGoForward,
                             nativeGestureId = phase.id,
                         )
+                    lastNativeEventNanos = System.nanoTime()
                     gesture = step.gesture
                     val enabled = homeSwipeEnabled()
                     shown = step.direction.takeIf { enabled }
