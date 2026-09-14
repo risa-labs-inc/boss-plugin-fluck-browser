@@ -87,16 +87,20 @@ internal fun HomeSwipeSurface(
     // place onNavigate is called, so neither pointer handler below calls it directly.
     // homeSwipeEnabled() is read per gesture, not cached: the host republishes the key the moment
     // the setting changes, and a relaunch to pick that up would be a poor answer.
-    fun decide(finished: HomeSwipeGesture) {
+    fun decide(finished: HomeSwipeGesture): Boolean {
         val direction = endHomeSwipe(finished)
-        if (direction != null && homeSwipeEnabled()) onNavigate(direction)
+        if (direction != null && homeSwipeEnabled()) {
+            onNavigate(direction)
+            return true
+        }
+        return false
     }
 
     // Ends the CURRENT gesture: decide, then clear.
-    fun endGesture(phase: HomeSwipeNativePhase) {
+    fun endGesture(phase: HomeSwipeNativePhase): Boolean {
         val finished = homeSwipeWithNativeFinal(gesture, phase)
         cancelGesture()
-        decide(finished)
+        return decide(finished)
     }
 
     fun endLegacyGesture() {
@@ -125,9 +129,11 @@ internal fun HomeSwipeSurface(
         val ownedId = gesture.nativeGestureId ?: return@LaunchedEffect
         while (isActive) {
             delay(16)
-            val phase = phaseSource.phase()
+            val phase = phaseSource.phase(ownedId)
             val idleMs = (System.nanoTime() - lastNativeEventNanos) / 1_000_000
-            val action = homeSwipeOwnedWatchdogAction(ownedId, gesture, phase, idleMs) ?: break
+            val action = homeSwipeOwnedWatchdogAction(
+                ownedId, gesture, phase, idleMs, reliableLifecycle = phaseSource.hasTerminalHistory(),
+            ) ?: break
             when (action) {
                 HomeSwipePhaseAction.DECIDE -> {
                     endGesture(phase)
@@ -149,8 +155,18 @@ internal fun HomeSwipeSurface(
                 .onPointerEvent(PointerEventType.Scroll) { event ->
                     val change = event.changes.firstOrNull() ?: return@onPointerEvent
                     val rawPhase = phaseSource.raw()
+                    // Reconcile before the new-contact gate can discard the previous accumulator.
+                    // The watchdog may not have run between Ended and this contact's first wheel.
+                    val previous = phaseSource.reconcile(gesture.nativeGestureId, rawPhase)
+                    when (homeSwipePhaseAction(gesture, previous)) {
+                        HomeSwipePhaseAction.DECIDE -> {
+                            if (endGesture(previous)) return@onPointerEvent
+                        }
+                        HomeSwipePhaseAction.CANCEL -> cancelGesture()
+                        HomeSwipePhaseAction.WAIT -> Unit
+                    }
                     val nativeWhen = (event.nativeEvent as? MouseEvent)?.`when`
-                    val gate = homeSwipeScrollGate(gesture, rawPhase, nativeWhen, contactGuard)
+                    val gate = homeSwipeScrollGate(gesture, rawPhase, nativeWhen, contactGuard, phaseSource.isMac)
                     if (gate.reset) cancelGesture()
                     if (!gate.accept) {
                         if (gate.timestampRejected && !reportedTimestampFailure) {

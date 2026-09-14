@@ -980,4 +980,55 @@ class HomeSwipeNavigationTest {
         assertEquals(HomeSwipeDirection.BACK, full.navigated)
         assertEquals(1f, full.last.progress, "the puck is fully filled in by the time the gesture ends")
     }
+
+    @Test
+    fun `terminal history recovers a release overwritten by rapid contacts`() {
+        val source = HomeSwipePhaseSource(
+            read = { "43:active:3000" },
+            isMac = true,
+            readTerminals = { "41:ended:-100:0:false:false;42:cancelled:-20:0:true:false" },
+        )
+        val first = HomeSwipeGesture(nativeGestureId = "41")
+        assertEquals(HomeSwipePhaseAction.DECIDE, homeSwipePhaseAction(first, source.phase("41")))
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipePhaseAction(first.copy(nativeGestureId = "42"), source.phase("42")))
+        // Repeated reads and another surface do not consume the retained release.
+        assertEquals(source.phase("41"), source.phase("41"))
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipePhaseAction(first.copy(nativeGestureId = "1"), source.phase("1")))
+    }
+
+    @Test
+    fun `terminal history never overrides current cancellation or unavailable observation`() {
+        val history = "41:ended:-100:0:false:false"
+        val gesture = HomeSwipeGesture(nativeGestureId = "41")
+        for (raw in listOf("41:cancelled:0:0:true:false", "unavailable", "bad")) {
+            val phase = homeSwipeReconciledPhase("41", raw, history)
+            assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipePhaseAction(gesture, phase))
+        }
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipePhaseAction(
+            gesture, homeSwipeReconciledPhase("41", "42:active:3000", "41:ended:broken"),
+        ))
+    }
+
+    @Test
+    fun `queued terminal tail preserves current accumulator until release decision`() {
+        val gesture = HomeSwipeGesture(nativeGestureId = "41")
+        val gate = homeSwipeScrollGate(gesture, "41:ended:-100:0:false:false", 2000, HomeSwipeContactGuard(), true)
+        assertEquals(HomeSwipeScrollGate(false, false, false), gate)
+        val malformed = homeSwipeScrollGate(gesture, "41:ended:bad", 2000, HomeSwipeContactGuard(), true)
+        assertEquals(HomeSwipeScrollGate(false, true, false), malformed)
+    }
+
+    @Test
+    fun `reliable native lifecycle preserves a stationary hold beyond the old watchdog`() {
+        val gesture = HomeSwipeGesture(nativeGestureId = "41")
+        val active = parseHomeSwipeNativePhase("41:active:1000")
+        assertEquals(HomeSwipePhaseAction.WAIT, homeSwipeOwnedWatchdogAction(
+            "41", gesture, active, 60_000, reliableLifecycle = true,
+        ))
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipeOwnedWatchdogAction("41", gesture, active, 60_000))
+        val ended = parseHomeSwipeNativePhase("41:ended:-100:0:false:false")
+        assertEquals(HomeSwipePhaseAction.DECIDE, homeSwipeOwnedWatchdogAction(
+            "41", gesture, ended, 60_000, reliableLifecycle = true,
+        ))
+    }
 }
