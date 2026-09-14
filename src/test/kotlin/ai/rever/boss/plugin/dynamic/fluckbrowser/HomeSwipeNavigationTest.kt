@@ -330,6 +330,16 @@ class HomeSwipeNavigationTest {
         assertEquals(1, gesture.events, "a new contact is free to begin")
     }
 
+    @Test
+    fun `native final data cannot erase vertical travel already observed locally`() {
+        val pending = HomeSwipeGesture(accumX = -10f, verticalPath = 3f, events = 12,
+            direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        val finished = homeSwipeWithNativeFinal(pending,
+            parseHomeSwipeNativePhase("41:ended:35:0:false:false"))
+        assertEquals(3f, finished.verticalPath)
+        assertNull(endHomeSwipe(finished), "local vertical evidence still rejects the narrowed release")
+    }
+
     /** One scroll event, as the surface would see it. */
     private data class Wheel(
         val dx: Float,

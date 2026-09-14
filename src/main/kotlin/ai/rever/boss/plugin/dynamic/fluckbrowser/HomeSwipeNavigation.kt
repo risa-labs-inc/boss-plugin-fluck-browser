@@ -46,7 +46,8 @@ internal const val SWIPE_ENABLED_KEY = "BOSS_BROWSER_SWIPE_NAV"
  * `id:ended|cancelled:finalX:verticalPath:pageRejected:reversed`.
  * beganAt is System.currentTimeMillis() on the CoreGraphics callback thread. AWT event time
  * is also epoch milliseconds, but its native conversion can lag; allow NATIVE_CLOCK_SKEW_MS skew.
- * finalX and verticalPath are CoreGraphics POINT_DELTA_AXIS_2/1 totals, not DOM CSS pixels.
+ * finalX is net CoreGraphics POINT_DELTA_AXIS_2 displacement; verticalPath is the sum of
+ * absolute POINT_DELTA_AXIS_1 deltas (Σ|dy|), never a signed net. Neither is DOM CSS pixels.
  * pageRejected uses the page detector's thresholds; home applies its own tuned thresholds.
  * The host must retain terminal evidence until the next contact begins. A single snapshot can
  * still miss a release followed by another contact between polls: cancel rather than infer an
@@ -201,12 +202,16 @@ internal fun homeSwipeWithNativeFinal(
     gesture: HomeSwipeGesture,
     phase: HomeSwipeNativePhase,
 ): HomeSwipeGesture {
-    val finalMagnitude = kotlin.math.abs(phase.finalX ?: return gesture) * NATIVE_TO_HOME_UNITS
+    val finalX = phase.finalX ?: return gesture
+    val finalMagnitude = kotlin.math.abs(finalX) * NATIVE_TO_HOME_UNITS
     val finalVertical = (phase.verticalPath ?: return gesture) * NATIVE_TO_HOME_UNITS
     // AWT CPlatformResponder inverts native wheel deltas. Do not compare these signs directly;
     // the host latches net-sign reversals over the entire native contact, independently of thresholds.
     val signed = if (gesture.direction == HomeSwipeDirection.BACK) -finalMagnitude else finalMagnitude
-    val updated = gesture.copy(accumX = signed.toFloat(), verticalPath = finalVertical.toFloat())
+    val updated = gesture.copy(
+        accumX = signed.toFloat(),
+        verticalPath = maxOf(gesture.verticalPath, finalVertical.toFloat()),
+    )
     return updated.copy(rejected = updated.rejected || phase.reversed || cancelledByVertical(updated))
 }
 
