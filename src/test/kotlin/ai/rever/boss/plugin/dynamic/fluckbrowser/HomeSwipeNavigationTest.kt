@@ -119,8 +119,8 @@ class HomeSwipeNavigationTest {
     @Test
     fun `queued wheel from before the active native contact is ignored`() {
         val active = parseHomeSwipeNativePhase("42:active:2000")
-        assertFalse(homeSwipeEventBelongsToPhase(2_000L - GESTURE_GAP_MS - 1, active))
-        assertTrue(homeSwipeEventBelongsToPhase(2_000L - GESTURE_GAP_MS, active))
+        assertFalse(homeSwipeEventBelongsToPhase(2_000L - NATIVE_CLOCK_SKEW_MS - 1, active))
+        assertTrue(homeSwipeEventBelongsToPhase(2_000L - NATIVE_CLOCK_SKEW_MS, active))
         assertTrue(homeSwipeEventBelongsToPhase(1_995L, active), "independent native clocks may differ by several milliseconds")
         assertTrue(homeSwipeEventBelongsToPhase(1_999L, active), "one millisecond clock boundary is tolerated")
         assertTrue(homeSwipeEventBelongsToPhase(2_000L, active))
@@ -295,6 +295,39 @@ class HomeSwipeNavigationTest {
             parseHomeSwipeNativePhase("41:ended:40:0:false:false"))))
         assertNull(endHomeSwipe(homeSwipeWithNativeFinal(back,
             parseHomeSwipeNativePhase("41:ended:40:0:false:true"))))
+    }
+
+    @Test
+    fun `native gate advance release and cancellation compose into one navigation`() {
+        val guard = HomeSwipeContactGuard()
+        var gesture = HomeSwipeGesture()
+        val navigated = mutableListOf<HomeSwipeDirection>()
+        fun wheel(id: String) {
+            val gate = homeSwipeScrollGate(gesture, "$id:active:1000", 1000, guard, true)
+            if (gate.reset) {
+                guard.cancel(gesture)
+                gesture = HomeSwipeGesture()
+            }
+            if (!gate.accept) return
+            gesture = advanceHomeSwipe(gesture, -1f, 0f, 1000, false, true, true, gate.nativeId).gesture
+        }
+        repeat(4) { wheel("41") }
+        val ended = parseHomeSwipeNativePhase("41:ended:40:0:false:false")
+        assertEquals(HomeSwipePhaseAction.DECIDE, homeSwipeOwnedWatchdogAction("41", gesture, ended, 0))
+        val finished = homeSwipeWithNativeFinal(gesture, ended)
+        guard.cancel(gesture)
+        gesture = HomeSwipeGesture()
+        endHomeSwipe(finished)?.let(navigated::add)
+        repeat(4) { wheel("41") }
+        assertEquals(0, gesture.events, "a completed contact cannot replay")
+        repeat(4) { wheel("42") }
+        guard.cancel(gesture) // Exit after observed movement abandons the entire contact.
+        gesture = HomeSwipeGesture()
+        repeat(4) { wheel("42") }
+        assertEquals(0, gesture.events)
+        assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
+        wheel("43")
+        assertEquals(1, gesture.events, "a new contact is free to begin")
     }
 
     /** One scroll event, as the surface would see it. */

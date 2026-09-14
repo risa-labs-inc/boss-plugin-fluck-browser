@@ -45,7 +45,7 @@ internal const val SWIPE_ENABLED_KEY = "BOSS_BROWSER_SWIPE_NAV"
  * Append-only host wire contract (BossConsole#650): `id:active:beganAt` or
  * `id:ended|cancelled:finalX:verticalPath:pageRejected:reversed`.
  * beganAt is System.currentTimeMillis() on the CoreGraphics callback thread. AWT event time
- * is also epoch milliseconds, but its native conversion can lag; allow GESTURE_GAP_MS skew.
+ * is also epoch milliseconds, but its native conversion can lag; allow NATIVE_CLOCK_SKEW_MS skew.
  * finalX and verticalPath are CoreGraphics POINT_DELTA_AXIS_2/1 totals, not DOM CSS pixels.
  * pageRejected uses the page detector's thresholds; home applies its own tuned thresholds.
  * The host must retain terminal evidence until the next contact begins. A single snapshot can
@@ -136,6 +136,9 @@ internal fun parseHomeSwipeNativePhase(raw: String?): HomeSwipeNativePhase {
     return HomeSwipeNativePhase(null, HomeSwipeNativeState.UNAVAILABLE)
 }
 
+/** Independent native/AWT epoch conversion tolerance, separate from legacy gesture timing. */
+internal const val NATIVE_CLOCK_SKEW_MS = 120L
+
 internal fun homeSwipeEventBelongsToPhase(
     eventWhenEpochMs: Long?,
     phase: HomeSwipeNativePhase,
@@ -144,7 +147,7 @@ internal fun homeSwipeEventBelongsToPhase(
     // AWT converts native timestamps independently of the host callback clock. Unknown times
     // remain fail-closed: receipt time cannot distinguish a queued previous contact.
     return phase.state == HomeSwipeNativeState.ACTIVE && eventWhenEpochMs != null &&
-        eventWhenEpochMs >= beganAt - GESTURE_GAP_MS
+        eventWhenEpochMs >= beganAt - NATIVE_CLOCK_SKEW_MS
 }
 
 /**
