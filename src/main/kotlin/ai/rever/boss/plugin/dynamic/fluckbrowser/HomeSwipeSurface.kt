@@ -136,12 +136,13 @@ internal fun HomeSwipeSurface(
     // whether fingers are still down. Quiet time never commits and momentum never extends a swipe.
     LaunchedEffect(gesture.nativeGestureId) {
         val ownedId = gesture.nativeGestureId ?: return@LaunchedEffect
+        val reliableLifecycle = phaseSource.hasTerminalHistory()
         while (isActive) {
             delay(16)
             val phase = phaseSource.phase(ownedId)
             val idleMs = (System.nanoTime() - runtime.lastNativeEventNanos) / 1_000_000
             val action = homeSwipeOwnedWatchdogAction(
-                ownedId, gesture, phase, idleMs, reliableLifecycle = phaseSource.hasTerminalHistory(),
+                ownedId, gesture, phase, idleMs, contactGuard, reliableLifecycle,
             ) ?: break
             when (action) {
                 HomeSwipePhaseAction.DECIDE -> {

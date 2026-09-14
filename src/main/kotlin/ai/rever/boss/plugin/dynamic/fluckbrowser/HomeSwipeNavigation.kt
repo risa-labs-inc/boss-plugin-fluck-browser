@@ -42,14 +42,18 @@ internal enum class HomeSwipeDirection { BACK, FORWARD }
 internal const val SWIPE_ENABLED_KEY = "BOSS_BROWSER_SWIPE_NAV"
 
 /**
- * Append-only host wire contract (BossConsole#650): `id:active:beganAt` or
- * `id:ended|cancelled:finalX:verticalPath:pageRejected:reversed`.
+ * Append-only host wire contract (BossConsole#650):
+ * `id:active:beganAt[:previousTerminatedAt]` or
+ * `id:ended|cancelled:finalX:verticalPath:nativeRejected:reversed`.
  * beganAt is System.currentTimeMillis() on the CoreGraphics callback thread. OpenJDK 17
  * CPlatformResponder also stamps wheel dispatch with System.currentTimeMillis(). Allow bounded
  * NATIVE_CLOCK_SKEW_MS tolerance while rejecting clearly old queued events.
  * finalX is net CoreGraphics POINT_DELTA_AXIS_2 displacement; verticalPath is the sum of
  * absolute POINT_DELTA_AXIS_1 deltas (Σ|dy|), never a signed net. Neither is DOM CSS pixels.
- * pageRejected uses the page detector's thresholds; home applies its own tuned thresholds.
+ * nativeRejected uses the native reducer's thresholds; home applies its own tuned thresholds.
+ * The optional active cutoff excludes AWT events stamped before or at the previous native
+ * termination callback. It cannot identify an old OS event that AWT stamps only after the new
+ * contact begins, so rapid-contact behavior remains part of physical validation.
  * Updated hosts also retain the last 32 terminal records in SWIPE_TERMINALS_KEY, separated
  * by semicolons. Read the current phase before that history so a newer contact cannot hide
  * its predecessor's release. Evicted or missing evidence cancels; quiet time never commits.
@@ -88,10 +92,11 @@ internal data class HomeSwipeNativePhase(
     val id: String?,
     val state: HomeSwipeNativeState,
     val beganAtEpochMs: Long? = null,
+    val previousTerminatedAtEpochMs: Long? = null,
     val finalX: Double? = null,
     val verticalPath: Double? = null,
-    /** Page-threshold rejection is intentionally not applied to the separately tuned home detector. */
-    val pageRejected: Boolean = false,
+    /** Native-threshold rejection is intentionally not applied to the separately tuned home detector. */
+    val nativeRejected: Boolean = false,
     val reversed: Boolean = false,
 )
 
@@ -133,12 +138,20 @@ internal fun parseHomeSwipeNativePhase(raw: String?): HomeSwipeNativePhase {
         }
     if (state == HomeSwipeNativeState.ACTIVE && parts.size >= 3) {
         val beganAt = parts[2].toLongOrNull()
-        if (beganAt != null) return HomeSwipeNativePhase(id, state, beganAtEpochMs = beganAt)
+        val previousTerminatedAt = parts.getOrNull(3)?.toLongOrNull()
+        if (beganAt != null && (parts.size == 3 || previousTerminatedAt != null)) {
+            return HomeSwipeNativePhase(
+                id,
+                state,
+                beganAtEpochMs = beganAt,
+                previousTerminatedAtEpochMs = previousTerminatedAt,
+            )
+        }
     }
     if ((state == HomeSwipeNativeState.ENDED || state == HomeSwipeNativeState.CANCELLED) && parts.size >= 6) {
         val finalX = parts[2].toDoubleOrNull()
         val verticalPath = parts[3].toDoubleOrNull()
-        val pageRejected = parts[4].toBooleanStrictOrNull() ?: false
+        val nativeRejected = parts[4].toBooleanStrictOrNull() ?: false
         val reversed = parts[5].toBooleanStrictOrNull()
         if (finalX != null && finalX.isFinite() && verticalPath != null && verticalPath.isFinite() &&
             verticalPath >= 0 && reversed != null
@@ -148,7 +161,7 @@ internal fun parseHomeSwipeNativePhase(raw: String?): HomeSwipeNativePhase {
                 state = state,
                 finalX = finalX,
                 verticalPath = verticalPath,
-                pageRejected = pageRejected,
+                nativeRejected = nativeRejected,
                 reversed = reversed,
             )
         }
@@ -169,7 +182,8 @@ internal fun homeSwipeEventBelongsToPhase(
     // The tolerance can admit trailing events from a contact released less than 120 ms earlier.
     // Event-count and travel checks mitigate accidental acceptance; hardware validation remains.
     return phase.state == HomeSwipeNativeState.ACTIVE && eventWhenEpochMs != null &&
-        eventWhenEpochMs >= beganAt - NATIVE_CLOCK_SKEW_MS
+        eventWhenEpochMs >= beganAt - NATIVE_CLOCK_SKEW_MS &&
+        phase.previousTerminatedAtEpochMs?.let { eventWhenEpochMs > it } != false
 }
 
 /**
@@ -491,21 +505,27 @@ internal class HomeSwipePhaseSource(
     fun support(): HomeSwipePhaseSupport = homeSwipePhaseSupport(raw(), isMac)
     fun terminalHistory(): String? = if (isMac) readTerminals() else null
     fun hasTerminalHistory(): Boolean = terminalHistory() != null
-    fun phase(gestureId: String? = null): HomeSwipeNativePhase = reconcile(gestureId, raw())
+    fun phase(gestureId: String?): HomeSwipeNativePhase = reconcile(gestureId, raw())
     fun reconcile(gestureId: String?, rawPhase: String?): HomeSwipeNativePhase =
         homeSwipeReconciledPhase(gestureId, rawPhase, ::terminalHistory)
 }
 
-/** Cancellation latches only the physical contact this surface has actually observed. */
+/** Monotonic native IDs make cancelling N reject every stale replay through N across surfaces. */
 internal class HomeSwipeContactGuard {
-    private var rejectedId: String? = null
+    private var rejectedThrough = Long.MIN_VALUE
+    private var rejectedNonNumeric: String? = null
 
     fun cancel(gesture: HomeSwipeGesture) {
-        rejectedId = gesture.nativeGestureId ?: rejectedId
+        val id = gesture.nativeGestureId ?: return
+        val numeric = id.toLongOrNull()
+        if (numeric != null) rejectedThrough = maxOf(rejectedThrough, numeric) else rejectedNonNumeric = id
     }
 
+    fun rejected(id: String?): Boolean =
+        id != null && (id.toLongOrNull()?.let { it <= rejectedThrough } ?: (id == rejectedNonNumeric))
+
     fun accepts(phase: HomeSwipeNativePhase): Boolean =
-        phase.state == HomeSwipeNativeState.ACTIVE && phase.id != null && phase.id != rejectedId
+        phase.state == HomeSwipeNativeState.ACTIVE && phase.id != null && !rejected(phase.id)
 }
 
 /** Older phase hosts lacked failure cancellation. Their watchdog cancels, never idle-commits.
@@ -534,9 +554,12 @@ internal fun homeSwipeOwnedWatchdogAction(
     gesture: HomeSwipeGesture,
     phase: HomeSwipeNativePhase,
     idleMs: Long,
+    guard: HomeSwipeContactGuard,
     reliableLifecycle: Boolean = false,
 ): HomeSwipePhaseAction? =
-    if (gesture.nativeGestureId == ownedId) homeSwipeNativeWatchdogAction(gesture, phase, idleMs, reliableLifecycle) else null
+    if (gesture.nativeGestureId != ownedId) null
+    else if (guard.rejected(ownedId)) HomeSwipePhaseAction.CANCEL
+    else homeSwipeNativeWatchdogAction(gesture, phase, idleMs, reliableLifecycle)
 
 internal data class HomeSwipeScrollGate(
     val legacy: Boolean,
@@ -589,7 +612,10 @@ internal fun prepareHomeSwipeScroll(
     var current = gesture
     var clear = false
     val previous = homeSwipeReconciledPhase(current.nativeGestureId, rawPhase, terminalHistory)
-    when (homeSwipePhaseAction(current, previous)) {
+    val previousAction =
+        if (guard.rejected(current.nativeGestureId)) HomeSwipePhaseAction.CANCEL
+        else homeSwipePhaseAction(current, previous)
+    when (previousAction) {
         HomeSwipePhaseAction.DECIDE -> {
             val navigation = endHomeSwipe(homeSwipeWithNativeFinal(current, previous)).takeIf { enabled }
             guard.cancel(current)
