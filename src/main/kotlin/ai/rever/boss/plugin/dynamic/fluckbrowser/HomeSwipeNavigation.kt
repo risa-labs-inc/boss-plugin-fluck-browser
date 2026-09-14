@@ -298,8 +298,8 @@ internal data class HomeSwipeStep(
      * Not the same thing as [gesture], which is the fresh one this event begins. It exists because
      * the two ways a legacy-host gesture can end run on different clocks: [advanceHomeSwipe]
      * retires one after [GESTURE_GAP_MS], while [HomeSwipeSurface]'s compatibility timer fires at
-     * `GESTURE_GAP_MS + 60`. An event landing in that 60ms window cancels the pending timer AND discards the gesture here, so a
-     * swipe that had already earned a navigation was silently thrown away - reachable without a
+     * `GESTURE_GAP_MS + 60`. An event landing in that 60ms window cancels the pending timer AND
+     * discards the gesture here, so a swipe that had already earned a navigation was silently thrown away - reachable without a
      * second physical swipe, since a trackpad emits nothing while the fingers are still: swipe
      * past the threshold, hold ~150ms, nudge before releasing. Handing the retired gesture back
      * lets the caller run it through [endHomeSwipe] instead of losing it.
@@ -335,19 +335,24 @@ internal fun advanceHomeSwipe(
     // on HomeSwipeStep.ended rather than being dropped. This is not the only thing that ends a
     // gesture on a legacy host - HomeSwipeSurface runs a compatibility quiescence timer too, and
     // the two cover different cases. Updated hosts pass nativeGestureId and never take this path.
+    // Capability changes reset even zero-event consumed/vertical state; neither clock may
+    // inherit or decide a gesture tracked by the other detector.
     // Native contact identity is authoritative when present. A pause with fingers still down is
     // the same gesture however long the wheel stream is quiet; a new id cancels stale progress.
     val continuing =
         if (nativeGestureId != null) {
-            gesture.nativeGestureId == null || gesture.nativeGestureId == nativeGestureId
+            gesture.nativeGestureId == nativeGestureId
         } else {
-            gesture.lastEventAtMs != 0L && nowMs - gesture.lastEventAtMs <= GESTURE_GAP_MS
+            gesture.nativeGestureId == null && gesture.lastEventAtMs != 0L &&
+                nowMs - gesture.lastEventAtMs <= GESTURE_GAP_MS
         }
     val base = if (continuing) gesture else HomeSwipeGesture()
     val stamped = base.copy(lastEventAtMs = nowMs, nativeGestureId = nativeGestureId)
     // A gesture that had actually started and is not being continued is retired by this event,
     // not discarded - see HomeSwipeStep.ended for the window that made the difference visible.
-    val retired = gesture.takeIf { nativeGestureId == null && !continuing && it.events > 0 }
+    val retired = gesture.takeIf {
+        nativeGestureId == null && it.nativeGestureId == null && !continuing && it.events > 0
+    }
 
     if (stamped.rejected) return HomeSwipeStep(stamped, ended = retired)
     // Something under the pointer scrolled. That is what the event was for.
@@ -417,8 +422,8 @@ internal fun advanceHomeSwipe(
  * Decide whether a finished gesture navigates.
  *
  * Called on native finger release, or a quiet gap on a legacy host. Pointer Exit cancels
- * without calling this decision. [advanceHomeSwipe] only tracks progress and the two ways a gesture rules
- * itself out early (a direction flip, too much vertical); this is the one place "reached the
+ * without calling this decision. [advanceHomeSwipe] only tracks progress and the two ways a
+ * gesture rules itself out early (a direction flip, too much vertical); this is the one place "reached the
  * commit distance" turns into an actual navigation, so:
  *
  * - a swipe that crosses the threshold and is still held does not navigate before release

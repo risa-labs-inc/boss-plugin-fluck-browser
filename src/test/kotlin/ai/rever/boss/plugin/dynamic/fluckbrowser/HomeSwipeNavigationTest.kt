@@ -222,6 +222,34 @@ class HomeSwipeNavigationTest {
             parseHomeSwipeNativePhase("41:ended:-40:0:true:false"))))
     }
 
+    @Test
+    fun `native capability transition clears legacy state even without horizontal events`() {
+        for (legacy in listOf(
+            HomeSwipeGesture(rejected = true, lastEventAtMs = 1_000L),
+            HomeSwipeGesture(verticalPath = 100f, lastEventAtMs = 1_000L),
+        )) {
+            val next = advanceHomeSwipe(legacy, -1f, 0f, 1_001L, false, true, true, "41")
+            assertFalse(next.gesture.rejected)
+            assertEquals(0f, next.gesture.verticalPath)
+            assertEquals(1, next.gesture.events)
+            assertEquals("41", next.gesture.nativeGestureId)
+            assertNull(next.ended)
+        }
+    }
+
+    @Test
+    fun `legacy capability transition neither continues nor decides a native contact`() {
+        val native = HomeSwipeGesture(accumX = -10f, events = 12,
+            lastEventAtMs = 1_000L, direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        for (now in listOf(1_001L, 2_000L)) {
+            val next = advanceHomeSwipe(native, -1f, 0f, now, false, true, true)
+            assertEquals(1, next.gesture.events)
+            assertEquals(-1f, next.gesture.accumX)
+            assertNull(next.gesture.nativeGestureId)
+            assertNull(next.ended, "a capability change is not native release evidence")
+        }
+    }
+
     /** One scroll event, as the surface would see it. */
     private data class Wheel(
         val dx: Float,

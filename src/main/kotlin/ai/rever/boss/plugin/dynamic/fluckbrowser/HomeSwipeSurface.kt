@@ -52,8 +52,8 @@ private val PUCK_SIZE = 52.dp
  * On macOS, current hosts publish [SWIPE_PHASE_KEY], including `unavailable`, and only a
  * matching native Ended phase commits. Hosts from before that property existed are still within
  * this plugin's supported Boss range; absence alone selects the former quiet-gap detector for
- * compatibility. Other platforms always retain that detector. On macOS `unavailable` never does, because that would weaken release semantics on a host
- * which attempted native observation and could not provide it.
+ * compatibility. Other platforms always retain that detector. On macOS `unavailable` never
+ * does, because that would weaken release semantics on a host which attempted native observation and could not provide it.
  */
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
