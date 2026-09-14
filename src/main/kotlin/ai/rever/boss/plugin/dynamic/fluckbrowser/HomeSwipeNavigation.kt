@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
+import ai.rever.boss.plugin.dynamic.fluckbrowser.menu.OsFamily
+
 /**
  * Two-finger swipe navigation on the home surface.
  *
@@ -57,7 +59,7 @@ internal const val SWIPE_PHASE_KEY = "boss.browser.swipe.phase"
 internal enum class HomeSwipePhaseSupport { LEGACY, NATIVE }
 
 /** Non-macOS and older hosts use compatibility; macOS observation failure stays fail-closed. */
-internal fun homeSwipePhaseSupport(raw: String?, isMac: Boolean = true): HomeSwipePhaseSupport =
+internal fun homeSwipePhaseSupport(raw: String?, isMac: Boolean = OsFamily.isMac): HomeSwipePhaseSupport =
     if (!isMac || raw == null) HomeSwipePhaseSupport.LEGACY else HomeSwipePhaseSupport.NATIVE
 
 internal enum class HomeSwipeNativeState { ACTIVE, ENDED, CANCELLED, UNAVAILABLE }
@@ -116,10 +118,10 @@ internal fun parseHomeSwipeNativePhase(raw: String?): HomeSwipeNativePhase {
     if ((state == HomeSwipeNativeState.ENDED || state == HomeSwipeNativeState.CANCELLED) && parts.size >= 6) {
         val finalX = parts[2].toDoubleOrNull()
         val verticalPath = parts[3].toDoubleOrNull()
-        val pageRejected = parts[4].toBooleanStrictOrNull()
+        val pageRejected = parts[4].toBooleanStrictOrNull() ?: false
         val reversed = parts[5].toBooleanStrictOrNull()
         if (finalX != null && finalX.isFinite() && verticalPath != null && verticalPath.isFinite() &&
-            verticalPath >= 0 && pageRejected != null && reversed != null
+            verticalPath >= 0 && reversed != null
         ) {
             return HomeSwipeNativePhase(
                 id = id,
@@ -198,6 +200,8 @@ internal fun homeSwipeWithNativeFinal(
 ): HomeSwipeGesture {
     val finalMagnitude = kotlin.math.abs(phase.finalX ?: return gesture) * NATIVE_TO_HOME_UNITS
     val finalVertical = (phase.verticalPath ?: return gesture) * NATIVE_TO_HOME_UNITS
+    // AWT CPlatformResponder inverts native wheel deltas. Do not compare these signs directly;
+    // the host latches net-sign reversals over the entire native contact, independently of thresholds.
     val signed = if (gesture.direction == HomeSwipeDirection.BACK) -finalMagnitude else finalMagnitude
     val updated = gesture.copy(accumX = signed.toFloat(), verticalPath = finalVertical.toFloat())
     return updated.copy(rejected = updated.rejected || phase.reversed || cancelledByVertical(updated))
@@ -450,20 +454,19 @@ internal fun endHomeSwipe(gesture: HomeSwipeGesture): HomeSwipeDirection? {
 /** Phase reads and platform selection shared by the event handler and both timer guards. */
 internal class HomeSwipePhaseSource(
     private val read: () -> String? = { System.getProperty(SWIPE_PHASE_KEY) },
-    private val isMac: Boolean = ai.rever.boss.plugin.dynamic.fluckbrowser.menu.OsFamily.isMac,
+    private val isMac: Boolean = OsFamily.isMac,
 ) {
     fun raw(): String? = if (isMac) read() else null
     fun support(): HomeSwipePhaseSupport = homeSwipePhaseSupport(raw(), isMac)
     fun phase(): HomeSwipeNativePhase = parseHomeSwipeNativePhase(raw())
 }
 
-/** Cancellation is latched to a physical contact, including Exit before the first wheel event. */
+/** Cancellation latches only the physical contact this surface has actually observed. */
 internal class HomeSwipeContactGuard {
     private var rejectedId: String? = null
 
-    fun cancel(gesture: HomeSwipeGesture, phase: HomeSwipeNativePhase) {
-        rejectedId = gesture.nativeGestureId
-            ?: phase.id.takeIf { phase.state == HomeSwipeNativeState.ACTIVE } ?: rejectedId
+    fun cancel(gesture: HomeSwipeGesture) {
+        rejectedId = gesture.nativeGestureId ?: rejectedId
     }
 
     fun accepts(phase: HomeSwipeNativePhase): Boolean =
@@ -484,4 +487,39 @@ internal fun homeSwipeNativeWatchdogAction(
     } else {
         action
     }
+}
+
+/** A stale effect must not act on the new contact before recomposition disposes it. */
+internal fun homeSwipeOwnedWatchdogAction(
+    ownedId: String,
+    gesture: HomeSwipeGesture,
+    phase: HomeSwipeNativePhase,
+    idleMs: Long,
+): HomeSwipePhaseAction? =
+    if (gesture.nativeGestureId == ownedId) homeSwipeNativeWatchdogAction(gesture, phase, idleMs) else null
+
+internal data class HomeSwipeScrollGate(
+    val legacy: Boolean,
+    val reset: Boolean,
+    val accept: Boolean,
+    val nativeId: String? = null,
+    val timestampRejected: Boolean = false,
+)
+
+/** One property snapshot determines the whole event gate, before any state is advanced. */
+internal fun homeSwipeScrollGate(
+    gesture: HomeSwipeGesture,
+    rawPhase: String?,
+    eventWhenMs: Long?,
+    guard: HomeSwipeContactGuard,
+    isMac: Boolean = OsFamily.isMac,
+): HomeSwipeScrollGate {
+    if (homeSwipePhaseSupport(rawPhase, isMac) == HomeSwipePhaseSupport.LEGACY) {
+        return HomeSwipeScrollGate(legacy = true, reset = gesture.nativeGestureId != null, accept = true)
+    }
+    val phase = parseHomeSwipeNativePhase(rawPhase)
+    val reset = gesture.nativeGestureId == null || gesture.nativeGestureId != phase.id
+    if (!guard.accepts(phase)) return HomeSwipeScrollGate(false, reset, false)
+    val belongs = homeSwipeEventBelongsToPhase(eventWhenMs, phase)
+    return HomeSwipeScrollGate(false, reset, belongs, phase.id, timestampRejected = !belongs)
 }

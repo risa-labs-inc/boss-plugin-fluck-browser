@@ -25,6 +25,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.unit.dp
+import java.awt.event.MouseEvent
+import java.util.logging.Logger
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
@@ -65,6 +67,7 @@ internal fun HomeSwipeSurface(
 ) {
     val phaseSource = remember { HomeSwipePhaseSource() }
     val contactGuard = remember { HomeSwipeContactGuard() }
+    var reportedTimestampFailure by remember { mutableStateOf(false) }
     var lastNativeEventNanos by remember { mutableStateOf(0L) }
     var gesture by remember { mutableStateOf(HomeSwipeGesture()) }
     var shown by remember { mutableStateOf<HomeSwipeDirection?>(null) }
@@ -73,8 +76,8 @@ internal fun HomeSwipeSurface(
     var legacyEventTick by remember { mutableStateOf(0L) }
 
     // Drops the gesture and its affordance without deciding anything. The abandon path.
-    fun cancelGesture(rejectContact: Boolean = true) {
-        if (rejectContact) contactGuard.cancel(gesture, phaseSource.phase())
+    fun cancelGesture() {
+        contactGuard.cancel(gesture)
         gesture = HomeSwipeGesture()
         shown = null
         progress = 0f
@@ -119,11 +122,13 @@ internal fun HomeSwipeSurface(
     // API dependency between host and plugin while preserving the one fact wheel events omit:
     // whether fingers are still down. Quiet time never commits and momentum never extends a swipe.
     LaunchedEffect(gesture.nativeGestureId) {
-        if (gesture.nativeGestureId == null) return@LaunchedEffect
+        val ownedId = gesture.nativeGestureId ?: return@LaunchedEffect
         while (isActive) {
             delay(16)
             val phase = phaseSource.phase()
-            when (homeSwipeNativeWatchdogAction(gesture, phase, (System.nanoTime() - lastNativeEventNanos) / 1_000_000)) {
+            val idleMs = (System.nanoTime() - lastNativeEventNanos) / 1_000_000
+            val action = homeSwipeOwnedWatchdogAction(ownedId, gesture, phase, idleMs) ?: break
+            when (action) {
                 HomeSwipePhaseAction.DECIDE -> {
                     endGesture(phase)
                     break
@@ -144,8 +149,20 @@ internal fun HomeSwipeSurface(
                 .onPointerEvent(PointerEventType.Scroll) { event ->
                     val change = event.changes.firstOrNull() ?: return@onPointerEvent
                     val rawPhase = phaseSource.raw()
-                    if (homeSwipePhaseSupport(rawPhase) == HomeSwipePhaseSupport.LEGACY) {
-                        if (gesture.nativeGestureId != null) cancelGesture()
+                    val nativeWhen = (event.nativeEvent as? MouseEvent)?.`when`
+                    val gate = homeSwipeScrollGate(gesture, rawPhase, nativeWhen, contactGuard)
+                    if (gate.reset) cancelGesture()
+                    if (!gate.accept) {
+                        if (gate.timestampRejected && !reportedTimestampFailure) {
+                            reportedTimestampFailure = true
+                            Logger.getLogger("HomeSwipeSurface").warning(
+                                "Native home swipe ignored: AWT event timestamp is missing or predates " +
+                                    "the host contact beyond the clock tolerance. Check host/AWT clock synchronization.",
+                            )
+                        }
+                        return@onPointerEvent
+                    }
+                    if (gate.legacy) {
                         val step =
                             advanceHomeSwipe(
                                 gesture = gesture,
@@ -164,20 +181,6 @@ internal fun HomeSwipeSurface(
                         progress = step.progress
                         return@onPointerEvent
                     }
-                    // Never carry progress across a capability transition. This is mostly startup
-                    // hardening: an updated host initializes the property before plugins load.
-                    if (gesture.nativeGestureId == null && gesture.events > 0) cancelGesture(rejectContact = false)
-                    val phase = parseHomeSwipeNativePhase(rawPhase)
-                    if (!contactGuard.accepts(phase)) {
-                        return@onPointerEvent
-                    }
-                    val nativeWhen = (event.nativeEvent as? java.awt.event.MouseEvent)?.`when`
-                    if (!homeSwipeEventBelongsToPhase(nativeWhen, phase)) {
-                        return@onPointerEvent
-                    }
-                    if (gesture.nativeGestureId != null && gesture.nativeGestureId != phase.id) {
-                        cancelGesture(rejectContact = false)
-                    }
                     val step =
                         advanceHomeSwipe(
                             gesture = gesture,
@@ -187,7 +190,7 @@ internal fun HomeSwipeSurface(
                             consumed = change.isConsumed,
                             canGoBack = canGoBack,
                             canGoForward = canGoForward,
-                            nativeGestureId = phase.id,
+                            nativeGestureId = gate.nativeId,
                         )
                     lastNativeEventNanos = System.nanoTime()
                     gesture = step.gesture

@@ -23,9 +23,9 @@ import kotlin.test.assertTrue
 class HomeSwipeNavigationTest {
     @Test
     fun `only an absent phase property selects legacy host compatibility`() {
-        assertEquals(HomeSwipePhaseSupport.LEGACY, homeSwipePhaseSupport(null))
-        assertEquals(HomeSwipePhaseSupport.NATIVE, homeSwipePhaseSupport("unavailable"))
-        assertEquals(HomeSwipePhaseSupport.NATIVE, homeSwipePhaseSupport("41:active:1000"))
+        assertEquals(HomeSwipePhaseSupport.LEGACY, homeSwipePhaseSupport(null, isMac = true))
+        assertEquals(HomeSwipePhaseSupport.NATIVE, homeSwipePhaseSupport("unavailable", isMac = true))
+        assertEquals(HomeSwipePhaseSupport.NATIVE, homeSwipePhaseSupport("41:active:1000", isMac = true))
     }
 
     @Test
@@ -161,10 +161,12 @@ class HomeSwipeNavigationTest {
     }
 
     @Test
-    fun `exit abandons the whole contact even before its first wheel`() {
+    fun `exit abandons an observed contact but not an unrelated global contact`() {
         val guard = HomeSwipeContactGuard()
         val phase = parseHomeSwipeNativePhase("41:active:1000")
-        guard.cancel(HomeSwipeGesture(), phase)
+        guard.cancel(HomeSwipeGesture())
+        assertTrue(guard.accepts(phase), "plain pointer Exit does not own a global contact")
+        guard.cancel(HomeSwipeGesture(nativeGestureId = "41"))
         repeat(20) { assertFalse(guard.accepts(phase)) }
         assertTrue(guard.accepts(parseHomeSwipeNativePhase("42:active:2000")))
         assertFalse(guard.accepts(parseHomeSwipeNativePhase("41:ended:-100:0:false:false")))
@@ -174,7 +176,7 @@ class HomeSwipeNavigationTest {
     fun `abandoning an old contact does not reject the next contact`() {
         val guard = HomeSwipeContactGuard()
         val next = parseHomeSwipeNativePhase("42:active:2000")
-        guard.cancel(HomeSwipeGesture(nativeGestureId = "41"), next)
+        guard.cancel(HomeSwipeGesture(nativeGestureId = "41"))
         assertTrue(guard.accepts(next))
         assertFalse(guard.accepts(parseHomeSwipeNativePhase("41:active:1000")))
     }
@@ -187,7 +189,7 @@ class HomeSwipeNavigationTest {
         assertEquals(HomeSwipePhaseAction.WAIT, homeSwipeNativeWatchdogAction(gesture, phase, NATIVE_STALE_MS - 1))
         assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipeNativeWatchdogAction(gesture, phase, NATIVE_STALE_MS))
         val guard = HomeSwipeContactGuard()
-        guard.cancel(gesture, phase)
+        guard.cancel(gesture)
         assertFalse(guard.accepts(phase))
         assertEquals(HomeSwipePhaseAction.DECIDE, homeSwipeNativeWatchdogAction(gesture,
             parseHomeSwipeNativePhase("41:ended:-100:0:false:false"), NATIVE_STALE_MS))
@@ -248,6 +250,51 @@ class HomeSwipeNavigationTest {
             assertNull(next.gesture.nativeGestureId)
             assertNull(next.ended, "a capability change is not native release evidence")
         }
+    }
+
+    @Test
+    fun `old watchdog cannot cancel or decide a replacement contact`() {
+        val next = HomeSwipeGesture(nativeGestureId = "42")
+        assertNull(homeSwipeOwnedWatchdogAction("41", next,
+            parseHomeSwipeNativePhase("unavailable"), NATIVE_STALE_MS))
+        assertNull(homeSwipeOwnedWatchdogAction("41", next,
+            parseHomeSwipeNativePhase("42:ended:40:0:false:false"), 0))
+    }
+
+    @Test
+    fun `scroll gate orders capability reset ownership and timestamp checks`() {
+        val guard = HomeSwipeContactGuard()
+        val legacy = HomeSwipeGesture(rejected = true)
+        assertEquals(HomeSwipeScrollGate(true, false, true), homeSwipeScrollGate(legacy, null, null, guard, true))
+        assertEquals(HomeSwipeScrollGate(false, true, true, "41"),
+            homeSwipeScrollGate(legacy, "41:active:1000", 1000, guard, true))
+        assertEquals(HomeSwipeScrollGate(false, true, false),
+            homeSwipeScrollGate(legacy, "unavailable", null, guard, true))
+        val native = HomeSwipeGesture(nativeGestureId = "41")
+        assertEquals(HomeSwipeScrollGate(true, true, true), homeSwipeScrollGate(native, null, null, guard, true))
+        assertEquals(HomeSwipeScrollGate(false, false, false, "41", true),
+            homeSwipeScrollGate(native, "41:active:1000", null, guard, true))
+        guard.cancel(native)
+        assertEquals(HomeSwipeScrollGate(false, false, false),
+            homeSwipeScrollGate(native, "41:active:1000", null, guard, true))
+        assertTrue(homeSwipeScrollGate(native, "42:active:2000", 2000, guard, true).accept)
+        assertTrue(homeSwipeScrollGate(native, "unavailable", null, guard, false).legacy)
+    }
+
+    @Test
+    fun `unused page rejection encoding does not invalidate native release`() {
+        assertEquals(HomeSwipeNativeState.ENDED, parseHomeSwipeNativePhase("41:ended:40:0:1:false").state)
+        assertEquals(HomeSwipeNativeState.UNAVAILABLE, parseHomeSwipeNativePhase("41:ended:40:0:1:True").state)
+    }
+
+    @Test
+    fun `native final direction is mapped from Compose rather than native coordinate sign`() {
+        val back = HomeSwipeGesture(accumX = -4f, events = 12,
+            direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        assertEquals(HomeSwipeDirection.BACK, endHomeSwipe(homeSwipeWithNativeFinal(back,
+            parseHomeSwipeNativePhase("41:ended:40:0:false:false"))))
+        assertNull(endHomeSwipe(homeSwipeWithNativeFinal(back,
+            parseHomeSwipeNativePhase("41:ended:40:0:false:true"))))
     }
 
     /** One scroll event, as the surface would see it. */
