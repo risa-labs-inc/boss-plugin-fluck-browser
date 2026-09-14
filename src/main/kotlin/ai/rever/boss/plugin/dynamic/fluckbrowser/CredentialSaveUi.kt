@@ -83,6 +83,44 @@ internal const val SAVED_NOTICE_DURATION_MS = 8_000L
 /** What the password card's copy control is currently reporting. See its use for why failure is a state. */
 internal enum class PasswordCopyState { IDLE, COPIED, FAILED }
 
+/** Each attempt has its own identity so repeated outcomes restart the feedback timer. */
+internal class PasswordCopyFeedback {
+    internal class Attempt(val copied: Boolean)
+
+    internal var attempt by mutableStateOf<Attempt?>(null)
+        private set
+
+    val state: PasswordCopyState
+        get() = when (attempt?.copied) {
+            true -> PasswordCopyState.COPIED
+            false -> PasswordCopyState.FAILED
+            null -> PasswordCopyState.IDLE
+        }
+
+    fun report(copied: Boolean) {
+        attempt = Attempt(copied)
+    }
+
+    internal fun expire(expected: Attempt) {
+        if (attempt === expected) attempt = null
+    }
+}
+
+@Composable
+internal fun rememberPasswordCopyFeedback(password: String): PasswordCopyFeedback {
+    // A regenerated password has never been copied, even while the previous tick is visible.
+    val feedback = remember(password) { PasswordCopyFeedback() }
+    val attempt = feedback.attempt
+    LaunchedEffect(feedback, attempt) {
+        if (attempt != null) {
+            delay(if (attempt.copied) 1600L else 4000L)
+            feedback.expire(attempt)
+        }
+    }
+    return feedback
+}
+
+
 /**
  * Offer a generated password beside a new-password field.
  *
@@ -164,18 +202,11 @@ internal fun PasswordSuggestionCard(
                 // below says it is only saved to Secret Manager when used. So a failure has to be
                 // visible, and it has to look different from success rather than just staying
                 // idle - an unchanged icon is what a missed click looks like too.
-                var copyState by remember { mutableStateOf(PasswordCopyState.IDLE) }
-                LaunchedEffect(copyState) {
-                    if (copyState != PasswordCopyState.IDLE) {
-                        // The failure lingers longer: it asks the user to do something (read the
-                        // password above, or try again), where the success only confirms.
-                        delay(if (copyState == PasswordCopyState.FAILED) 4000L else 1600L)
-                        copyState = PasswordCopyState.IDLE
-                    }
-                }
+                val copyFeedback = rememberPasswordCopyFeedback(password)
+                val copyState = copyFeedback.state
                 IconButton(
                     onClick = {
-                        copyState = if (onCopy()) PasswordCopyState.COPIED else PasswordCopyState.FAILED
+                        copyFeedback.report(onCopy())
                     },
                     modifier = Modifier.size(28.dp),
                 ) {
