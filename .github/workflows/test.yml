@@ -56,6 +56,5 @@ jobs:
 
       - name: Run DOM extractor jsdom tests
         run: |
-          npm install --no-save jsdom
+          npm install --no-save --package-lock=false jsdom@29.1.1
           node scripts/test/fluck-markdown/extractor.test.cjs
-

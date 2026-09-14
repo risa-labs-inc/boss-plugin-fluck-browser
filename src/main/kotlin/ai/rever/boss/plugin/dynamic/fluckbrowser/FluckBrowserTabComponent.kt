@@ -4455,10 +4455,10 @@ internal fun FluckBrowserTabContent(
                                     }
                                 }
                             },
-                            onCopyMarkdown = {
+                            onCopyMarkdown = { preferSelection ->
                                 coroutineScope.launch {
                                     browserHandle?.let { handle ->
-                                        val result = FluckMarkdownExtractor.extractMarkdown(handle)
+                                        val result = FluckMarkdownExtractor.extractMarkdown(handle, preferSelection = preferSelection)
                                         if (result.markdown.isNotBlank()) {
                                             FluckMarkdownExtractor.copyToClipboardSafe(result.markdown)
                                         }
@@ -5296,7 +5296,7 @@ internal fun buildContextMenuItems(
     // Offered only on a password box, and only when the suggestor is switched on.
     canSuggestPassword: Boolean = false,
     onSuggestPassword: () -> Unit = {},
-    onCopyMarkdown: (() -> Unit)? = null
+    onCopyMarkdown: ((preferSelection: Boolean) -> Unit)? = null
 ): List<ContextMenuItem> = buildList {
     // Check if form field is focused (editable element)
     if (info?.isEditable == true) {
@@ -5408,7 +5408,7 @@ internal fun buildContextMenuItems(
         if (onCopyMarkdown != null) {
             add(ContextMenuItem(
                 text = "Copy Page as Markdown for Agent",
-                onClick = onCopyMarkdown
+                onClick = { onCopyMarkdown(false) }
             ))
         }
 
@@ -5465,7 +5465,7 @@ internal fun buildContextMenuItems(
             if (onCopyMarkdown != null) {
                 add(ContextMenuItem(
                     text = "Copy Selection as Markdown for Agent",
-                    onClick = onCopyMarkdown
+                    onClick = { onCopyMarkdown(true) }
                 ))
             }
 
@@ -5518,7 +5518,7 @@ internal fun buildContextMenuItems(
         if (onCopyMarkdown != null) {
             add(ContextMenuItem(
                 text = "Copy Page as Markdown for Agent",
-                onClick = onCopyMarkdown
+                onClick = { onCopyMarkdown(false) }
             ))
         }
 

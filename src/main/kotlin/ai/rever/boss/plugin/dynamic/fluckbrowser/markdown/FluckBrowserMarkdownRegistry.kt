@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser.markdown
 
+import kotlinx.coroutines.Job
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -8,8 +9,8 @@ import java.util.concurrent.atomic.AtomicLong
  * Coordinates "Copy as Markdown for Agent" shortcut invocation to the focused or active
  * browser tab in a window.
  *
- * Implements panel-priority selection (favoring active split panels over background panels)
- * and atomic in-flight debouncing to prevent stacked executions on rapid key presses.
+ * Restricts selection to active split panels in the invoking window
+ * and uses atomic in-flight debouncing to prevent stacked executions on rapid key presses.
  */
 internal object FluckBrowserMarkdownRegistry {
 
@@ -20,7 +21,7 @@ internal object FluckBrowserMarkdownRegistry {
         val windowId: String,
         val panelActive: Boolean,
         val sequence: Long,
-        val copyAction: () -> Unit,
+        val copyAction: () -> Job,
     ) : Registration
 
     private val entries = ConcurrentHashMap.newKeySet<Entry>()
@@ -31,7 +32,7 @@ internal object FluckBrowserMarkdownRegistry {
         tabId: String,
         windowId: String,
         panelActive: Boolean,
-        copyAction: () -> Unit,
+        copyAction: () -> Job,
     ): Registration {
         val entry =
             Entry(
@@ -56,27 +57,25 @@ internal object FluckBrowserMarkdownRegistry {
      * Returns true if an active candidate was found and invoked, false otherwise.
      */
     fun copyActiveIn(windowId: String?): Boolean {
-        // Atomic in-flight debounce drops concurrent or rapid successive key repeats
+        if (windowId == null) return false
+        val candidate = entries
+            .filter { it.windowId == windowId && it.panelActive }
+            .maxByOrNull { it.sequence } ?: return false
         if (!inFlight.compareAndSet(false, true)) return false
 
-        return try {
-            val candidate =
-                entries
-                    .filter { windowId == null || it.windowId == windowId }
-                    .sortedWith(
-                        compareByDescending<Entry> { it.panelActive }
-                            .thenByDescending { it.sequence },
-                    ).firstOrNull() ?: return false
-
-            candidate.copyAction()
-            true
-        } finally {
+        try {
+            // launch returns before extraction completes. Hold the guard until its Job ends,
+            // including cancellation, so repeated chords cannot race clipboard writes.
+            candidate.copyAction().invokeOnCompletion { inFlight.set(false) }
+            return true
+        } catch (e: Exception) {
             inFlight.set(false)
+            return false
         }
     }
 
     fun clear() {
         entries.clear()
-        inFlight.set(false)
+        // An already running copy retains the guard until its completion.
     }
 }

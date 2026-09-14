@@ -138,4 +138,56 @@ class FluckMarkdownExtractorTest {
         assertEquals(0, result.estimatedTokens)
         assertFalse(result.isTruncated)
     }
+
+    @Test
+    fun `renderer execution is dispatched away from caller thread and receives page mode`() = runBlocking<Unit> {
+        val caller = Thread.currentThread()
+        FluckMarkdownExtractor.extractMarkdown(
+            createStubHandle(),
+            focusedFrameScriptRunner = { script ->
+                assertFalse(Thread.currentThread() === caller)
+                assertTrue(script.contains("const preferSelection = false;"))
+                """{"markdown":"content"}"""
+            },
+            preferSelection = false,
+        )
+    }
+
+    @Test
+    fun `cancellation escapes extraction`() = runBlocking<Unit> {
+        kotlin.test.assertFailsWith<kotlinx.coroutines.CancellationException> {
+            FluckMarkdownExtractor.extractMarkdown(createStubHandle(), focusedFrameScriptRunner = {
+                throw kotlinx.coroutines.CancellationException("cancelled")
+            })
+        }
+    }
+
+    @Test
+    fun `source attribution does not create executable links or raw html`() = runBlocking {
+        val result = FluckMarkdownExtractor.extractMarkdown(createStubHandle(
+            title = "<img src=x>", url = "javascript:alert(1)",
+            scriptResult = """{"markdown":"content"}""",
+        ))
+        assertFalse(result.markdown.contains("javascript:"))
+        assertFalse(result.markdown.contains("<img"))
+        assertTrue(result.markdown.contains("&lt;img src=x&gt;"))
+    }
+
+    @Test
+    fun `renderer truncation is reported and uses the captured document attribution`() = runBlocking {
+        val result = FluckMarkdownExtractor.extractMarkdown(createStubHandle(
+            title = "New navigation", url = "https://different.example/",
+            scriptResult = """{"markdown":"partial","isTruncated":true,"sourceTitle":"Captured page","sourceUrl":"https://example.com/original"}""",
+        ))
+        assertTrue(result.isTruncated)
+        assertTrue(result.markdown.contains("page extraction limit reached"))
+        assertTrue(result.markdown.contains("https://example.com/original"))
+        assertFalse(result.markdown.contains("different.example"))
+    }
+
+    @Test
+    fun `truncated quoted code is closed inside the same quote`() {
+        val text = "> ````kotlin\n> val x = 1"
+        assertEquals(text + "\n> ````", FluckMarkdownExtractor.repairUnclosedCodeFences(text))
+    }
 }

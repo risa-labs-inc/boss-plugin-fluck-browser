@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.dynamic.fluckbrowser.markdown.FluckBrowserMarkdownRegistry
+import kotlinx.coroutines.Job
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -24,6 +25,7 @@ class FluckMarkdownShortcutProviderTest {
         windowId: String,
     ) = FluckBrowserMarkdownRegistry.register(tabId, windowId, panelActive = true) {
         invocations.add(tabId)
+        Job().apply { complete() }
     }
 
     @Test

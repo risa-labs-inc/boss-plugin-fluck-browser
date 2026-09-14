@@ -206,4 +206,17 @@ class ContextMenuItemsTest {
         assertTrue(items.contains("Copy Selection as Markdown for Agent"))
         assertTrue(items.contains("Copy Page as Markdown for Agent"))
     }
+
+    @Test
+    fun `page and selection actions request distinct extraction modes`() {
+        val requests = mutableListOf<Boolean>()
+        val items = buildContextMenuItems(
+            info = BrowserContextMenuInfo(pageUrl = "https://example.com/", selectedText = "selected"),
+            browserHandle = null, canGoBack = false, canGoForward = false,
+            onNavigate = {}, onOpenInNewTab = {}, onCopyMarkdown = { requests.add(it) },
+        )
+        items.single { it.text == "Copy Page as Markdown for Agent" }.onClick?.invoke()
+        items.single { it.text == "Copy Selection as Markdown for Agent" }.onClick?.invoke()
+        kotlin.test.assertEquals(listOf(false, true), requests)
+    }
 }
