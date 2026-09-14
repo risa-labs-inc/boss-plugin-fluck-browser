@@ -44,8 +44,9 @@ internal const val SWIPE_ENABLED_KEY = "BOSS_BROWSER_SWIPE_NAV"
 /**
  * Append-only host wire contract (BossConsole#650): `id:active:beganAt` or
  * `id:ended|cancelled:finalX:verticalPath:pageRejected:reversed`.
- * beganAt is System.currentTimeMillis() on the CoreGraphics callback thread. AWT event time
- * is also epoch milliseconds, but its native conversion can lag; allow NATIVE_CLOCK_SKEW_MS skew.
+ * beganAt is System.currentTimeMillis() on the CoreGraphics callback thread. OpenJDK 17
+ * CPlatformResponder also stamps wheel dispatch with System.currentTimeMillis(). Allow bounded
+ * NATIVE_CLOCK_SKEW_MS tolerance while rejecting clearly old queued events.
  * finalX is net CoreGraphics POINT_DELTA_AXIS_2 displacement; verticalPath is the sum of
  * absolute POINT_DELTA_AXIS_1 deltas (Σ|dy|), never a signed net. Neither is DOM CSS pixels.
  * pageRejected uses the page detector's thresholds; home applies its own tuned thresholds.
@@ -137,7 +138,7 @@ internal fun parseHomeSwipeNativePhase(raw: String?): HomeSwipeNativePhase {
     return HomeSwipeNativePhase(null, HomeSwipeNativeState.UNAVAILABLE)
 }
 
-/** Independent native/AWT epoch conversion tolerance, separate from legacy gesture timing. */
+/** Host/AWT timestamp tolerance, separate from legacy gesture timing; both use epoch millis. */
 internal const val NATIVE_CLOCK_SKEW_MS = 120L
 
 internal fun homeSwipeEventBelongsToPhase(
@@ -145,8 +146,8 @@ internal fun homeSwipeEventBelongsToPhase(
     phase: HomeSwipeNativePhase,
 ): Boolean {
     val beganAt = phase.beganAtEpochMs ?: return false
-    // AWT converts native timestamps independently of the host callback clock. Unknown times
-    // remain fail-closed: receipt time cannot distinguish a queued previous contact.
+    // The host callback and AWT dispatch stamp at different points in event delivery. Unknown
+    // times remain fail-closed: receipt time cannot distinguish a queued previous contact.
     return phase.state == HomeSwipeNativeState.ACTIVE && eventWhenEpochMs != null &&
         eventWhenEpochMs >= beganAt - NATIVE_CLOCK_SKEW_MS
 }
