@@ -30,6 +30,15 @@ import java.util.logging.Logger
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
+private val homeSwipeLog = Logger.getLogger("HomeSwipeSurface")
+
+/** These values are read by event handlers and effects, never during composition. */
+private class HomeSwipeRuntime {
+    var reportedTimestampFailure = false
+    var reportedUnavailable = false
+    var lastNativeEventNanos = System.nanoTime()
+}
+
 /** How far the puck travels as it slides in from behind its edge. */
 private val PUCK_TRAVEL_DP = 66.dp
 
@@ -67,8 +76,7 @@ internal fun HomeSwipeSurface(
 ) {
     val phaseSource = remember { HomeSwipePhaseSource() }
     val contactGuard = HomeSwipeContacts.guard
-    var reportedTimestampFailure by remember { mutableStateOf(false) }
-    var lastNativeEventNanos by remember { mutableStateOf(System.nanoTime()) }
+    val runtime = remember { HomeSwipeRuntime() }
     var gesture by remember { mutableStateOf(HomeSwipeGesture()) }
     var shown by remember { mutableStateOf<HomeSwipeDirection?>(null) }
     var progress by remember { mutableStateOf(0f) }
@@ -130,7 +138,7 @@ internal fun HomeSwipeSurface(
         while (isActive) {
             delay(16)
             val phase = phaseSource.phase(ownedId)
-            val idleMs = (System.nanoTime() - lastNativeEventNanos) / 1_000_000
+            val idleMs = (System.nanoTime() - runtime.lastNativeEventNanos) / 1_000_000
             val action = homeSwipeOwnedWatchdogAction(
                 ownedId, gesture, phase, idleMs, reliableLifecycle = phaseSource.hasTerminalHistory(),
             ) ?: break
@@ -155,23 +163,31 @@ internal fun HomeSwipeSurface(
                 .onPointerEvent(PointerEventType.Scroll) { event ->
                     val change = event.changes.firstOrNull() ?: return@onPointerEvent
                     val rawPhase = phaseSource.raw()
-                    // Reconcile before the new-contact gate can discard the previous accumulator.
-                    // The watchdog may not have run between Ended and this contact's first wheel.
-                    val previous = phaseSource.reconcile(gesture.nativeGestureId, rawPhase)
-                    when (homeSwipePhaseAction(gesture, previous)) {
-                        HomeSwipePhaseAction.DECIDE -> {
-                            if (endGesture(previous)) return@onPointerEvent
-                        }
-                        HomeSwipePhaseAction.CANCEL -> cancelGesture()
-                        HomeSwipePhaseAction.WAIT -> Unit
-                    }
                     val nativeWhen = (event.nativeEvent as? MouseEvent)?.`when`
-                    val gate = homeSwipeScrollGate(gesture, rawPhase, nativeWhen, contactGuard, phaseSource.isMac)
-                    if (gate.reset) cancelGesture()
+                    val prepared = prepareHomeSwipeScroll(
+                        gesture, rawPhase, phaseSource.terminalHistory(), nativeWhen, contactGuard,
+                        phaseSource.isMac, homeSwipeEnabled(),
+                    )
+                    gesture = prepared.gesture
+                    if (prepared.clearAffordance) {
+                        shown = null
+                        progress = 0f
+                    }
+                    prepared.navigate?.let {
+                        onNavigate(it)
+                        return@onPointerEvent
+                    }
+                    val gate = prepared.gate
+                    if (rawPhase == "unavailable" && homeSwipeEnabled() && !runtime.reportedUnavailable) {
+                        runtime.reportedUnavailable = true
+                        homeSwipeLog.warning(
+                            "Native home swipe unavailable. Check BOSS trackpad settings for release-detection status.",
+                        )
+                    }
                     if (!gate.accept) {
-                        if (gate.timestampRejected && !reportedTimestampFailure) {
-                            reportedTimestampFailure = true
-                            Logger.getLogger("HomeSwipeSurface").warning(
+                        if (gate.timestampRejected && !runtime.reportedTimestampFailure) {
+                            runtime.reportedTimestampFailure = true
+                            homeSwipeLog.warning(
                                 "Native home swipe ignored: AWT event timestamp is missing or predates " +
                                     "the host contact beyond the clock tolerance. Check host/AWT clock synchronization.",
                             )
@@ -208,7 +224,7 @@ internal fun HomeSwipeSurface(
                             canGoForward = canGoForward,
                             nativeGestureId = gate.nativeId,
                         )
-                    lastNativeEventNanos = System.nanoTime()
+                    runtime.lastNativeEventNanos = System.nanoTime()
                     gesture = step.gesture
                     val enabled = homeSwipeEnabled()
                     shown = step.direction.takeIf { enabled }
@@ -218,7 +234,8 @@ internal fun HomeSwipeSurface(
                 // Exit is not a release: a macOS two-finger scroll moves no cursor, so the events
                 // that actually raise Exit mid-swipe are the cursor drifting off the home surface
                 // (onto the toolbar, under an overlay) - none of which mean the user let go.
-                // Native Ended is the only event that decides; Exit only removes stale UI.
+                // Native Ended is the only event that decides. Exit also latches cancellation
+                // process-wide, so moving to a sibling home surface cannot revive this contact.
                 .onPointerEvent(PointerEventType.Exit) { cancelGesture() },
     ) {
         content()

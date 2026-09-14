@@ -53,6 +53,8 @@ internal const val SWIPE_ENABLED_KEY = "BOSS_BROWSER_SWIPE_NAV"
  * Updated hosts also retain the last 32 terminal records in SWIPE_TERMINALS_KEY, separated
  * by semicolons. Read the current phase before that history so a newer contact cannot hide
  * its predecessor's release. Evicted or missing evidence cancels; quiet time never commits.
+ * Contact IDs increase for the host process lifetime, including across observer restarts.
+ * Once published, the host never clears either property: disable/failure writes `unavailable`.
  * Unknown trailing fields are ignored. `unavailable` fails closed on macOS; other platforms
  * retain the legacy detector because this protocol describes macOS finger contacts only.
  */
@@ -484,10 +486,11 @@ internal class HomeSwipePhaseSource(
 ) {
     fun raw(): String? = if (isMac) read() else null
     fun support(): HomeSwipePhaseSupport = homeSwipePhaseSupport(raw(), isMac)
-    fun hasTerminalHistory(): Boolean = isMac && readTerminals() != null
+    fun terminalHistory(): String? = if (isMac) readTerminals() else null
+    fun hasTerminalHistory(): Boolean = terminalHistory() != null
     fun phase(gestureId: String? = null): HomeSwipeNativePhase = reconcile(gestureId, raw())
     fun reconcile(gestureId: String?, rawPhase: String?): HomeSwipeNativePhase =
-        homeSwipeReconciledPhase(gestureId, rawPhase, if (isMac) readTerminals() else null)
+        homeSwipeReconciledPhase(gestureId, rawPhase, terminalHistory())
 }
 
 /** Cancellation latches only the physical contact this surface has actually observed. */
@@ -561,4 +564,52 @@ internal fun homeSwipeScrollGate(
 /** The host contact ID is process-wide, so cancellation must span split-view home surfaces. */
 internal object HomeSwipeContacts {
     val guard = HomeSwipeContactGuard()
+}
+
+/** The ordering-sensitive part of a pointer event, shared by the surface and regression tests. */
+internal data class PreparedHomeSwipeScroll(
+    val gesture: HomeSwipeGesture,
+    val gate: HomeSwipeScrollGate,
+    val clearAffordance: Boolean,
+    val navigate: HomeSwipeDirection? = null,
+)
+
+internal fun prepareHomeSwipeScroll(
+    gesture: HomeSwipeGesture,
+    rawPhase: String?,
+    terminalHistory: String?,
+    eventWhenMs: Long?,
+    guard: HomeSwipeContactGuard,
+    isMac: Boolean,
+    enabled: Boolean,
+): PreparedHomeSwipeScroll {
+    var current = gesture
+    var clear = false
+    val previous = homeSwipeReconciledPhase(current.nativeGestureId, rawPhase, terminalHistory)
+    when (homeSwipePhaseAction(current, previous)) {
+        HomeSwipePhaseAction.DECIDE -> {
+            val navigation = endHomeSwipe(homeSwipeWithNativeFinal(current, previous)).takeIf { enabled }
+            guard.cancel(current)
+            current = HomeSwipeGesture()
+            clear = true
+            // Once navigation starts, this event belongs to the surface being replaced. Do not
+            // advance a new contact on it. An unqualified prior release can continue below.
+            if (navigation != null) {
+                return PreparedHomeSwipeScroll(current, HomeSwipeScrollGate(false, false, false), true, navigation)
+            }
+        }
+        HomeSwipePhaseAction.CANCEL -> {
+            guard.cancel(current)
+            current = HomeSwipeGesture()
+            clear = true
+        }
+        HomeSwipePhaseAction.WAIT -> Unit
+    }
+    val gate = homeSwipeScrollGate(current, rawPhase, eventWhenMs, guard, isMac)
+    if (gate.reset) {
+        guard.cancel(current)
+        current = HomeSwipeGesture()
+        clear = true
+    }
+    return PreparedHomeSwipeScroll(current, gate, clear)
 }

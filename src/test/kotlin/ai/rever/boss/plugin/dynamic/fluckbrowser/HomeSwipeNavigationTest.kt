@@ -1031,4 +1031,59 @@ class HomeSwipeNavigationTest {
             "41", gesture, ended, 60_000, reliableLifecycle = true,
         ))
     }
+
+    @Test
+    fun `production pointer preparation decides retained release before resetting for new contact`() {
+        val gesture = HomeSwipeGesture(
+            accumX = -5f, events = 6, direction = HomeSwipeDirection.BACK, nativeGestureId = "41",
+        )
+        val guard = HomeSwipeContactGuard()
+        val first = prepareHomeSwipeScroll(
+            gesture, "42:active:2000", "41:ended:-100:0:false:false", 2000, guard, true, true,
+        )
+        assertEquals(HomeSwipeDirection.BACK, first.navigate)
+        assertTrue(first.clearAffordance)
+        assertFalse(first.gate.accept, "the event must not start a new contact after navigation")
+        assertEquals(HomeSwipeGesture(), first.gesture)
+        val duplicate = prepareHomeSwipeScroll(
+            first.gesture, "41:ended:-100:0:false:false", null, 2000, guard, true, true,
+        )
+        assertNull(duplicate.navigate)
+    }
+
+    @Test
+    fun `production pointer preparation keeps the first new sample when prior release did not qualify`() {
+        val gesture = HomeSwipeGesture(
+            accumX = -5f, events = 6, direction = HomeSwipeDirection.BACK, nativeGestureId = "41",
+        )
+        for (terminal in listOf("41:ended:-20:0:false:false", "41:cancelled:-100:0:false:false", "garbage")) {
+            val prepared = prepareHomeSwipeScroll(
+                gesture, "42:active:2000", terminal, 2000, HomeSwipeContactGuard(), true, true,
+            )
+            assertNull(prepared.navigate)
+            assertTrue(prepared.gate.accept)
+            assertEquals("42", prepared.gate.nativeId)
+            assertEquals(HomeSwipeGesture(), prepared.gesture)
+            assertTrue(prepared.clearAffordance)
+        }
+    }
+
+    @Test
+    fun `production pointer preparation preserves timestamp rejection and disabled release policy`() {
+        val gesture = HomeSwipeGesture(
+            accumX = -5f, events = 6, direction = HomeSwipeDirection.BACK, nativeGestureId = "41",
+        )
+        val early = prepareHomeSwipeScroll(
+            gesture, "41:active:2000", null, 1000, HomeSwipeContactGuard(), true, true,
+        )
+        assertEquals(gesture, early.gesture)
+        assertTrue(early.gate.timestampRejected)
+        assertFalse(early.clearAffordance)
+        val disabled = prepareHomeSwipeScroll(
+            gesture, "41:ended:-100:0:false:false", null, 2000, HomeSwipeContactGuard(), true, false,
+        )
+        assertNull(disabled.navigate)
+        assertFalse(disabled.gate.accept)
+        assertTrue(disabled.clearAffordance)
+    }
 }
