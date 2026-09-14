@@ -39,6 +39,96 @@ internal enum class HomeSwipeDirection { BACK, FORWARD }
  */
 internal const val SWIPE_ENABLED_KEY = "BOSS_BROWSER_SWIPE_NAV"
 
+/** Native finger-contact phase published by the host process. */
+internal const val SWIPE_PHASE_KEY = "boss.browser.swipe.phase"
+
+internal enum class HomeSwipePhaseSupport { LEGACY, NATIVE }
+
+/** Absence identifies an older host; every updated host publishes even when observation failed. */
+internal fun homeSwipePhaseSupport(raw: String?): HomeSwipePhaseSupport =
+    if (raw == null) HomeSwipePhaseSupport.LEGACY else HomeSwipePhaseSupport.NATIVE
+
+internal enum class HomeSwipeNativeState { ACTIVE, ENDED, CANCELLED, UNAVAILABLE }
+
+internal data class HomeSwipeNativePhase(
+    val id: String?,
+    val state: HomeSwipeNativeState,
+    val beganAtEpochMs: Long? = null,
+    val finalX: Double? = null,
+    val verticalPath: Double? = null,
+    val pageRejected: Boolean = false,
+    val reversed: Boolean = false,
+)
+
+internal enum class HomeSwipePhaseAction { WAIT, DECIDE, CANCEL }
+
+internal fun homeSwipePhaseAction(
+    gesture: HomeSwipeGesture,
+    phase: HomeSwipeNativePhase,
+): HomeSwipePhaseAction {
+    val gestureId = gesture.nativeGestureId
+    if (gestureId == null) return HomeSwipePhaseAction.WAIT
+    if (phase.id != gestureId) return HomeSwipePhaseAction.CANCEL
+    return when (phase.state) {
+        HomeSwipeNativeState.ACTIVE -> HomeSwipePhaseAction.WAIT
+        HomeSwipeNativeState.ENDED ->
+            if (phase.finalX != null && !phase.reversed) HomeSwipePhaseAction.DECIDE
+            else HomeSwipePhaseAction.CANCEL
+        HomeSwipeNativeState.CANCELLED,
+        HomeSwipeNativeState.UNAVAILABLE,
+        -> HomeSwipePhaseAction.CANCEL
+    }
+}
+
+internal fun parseHomeSwipeNativePhase(raw: String?): HomeSwipeNativePhase {
+    if (raw == null || raw == "unavailable") {
+        return HomeSwipeNativePhase(null, HomeSwipeNativeState.UNAVAILABLE)
+    }
+    val parts = raw.split(':')
+    if (parts.size < 2 || parts[0].isEmpty()) {
+        return HomeSwipeNativePhase(null, HomeSwipeNativeState.UNAVAILABLE)
+    }
+    val id = parts[0]
+    val state =
+        when (parts[1]) {
+            "active" -> HomeSwipeNativeState.ACTIVE
+            "ended" -> HomeSwipeNativeState.ENDED
+            "cancelled" -> HomeSwipeNativeState.CANCELLED
+            else -> HomeSwipeNativeState.UNAVAILABLE
+        }
+    if (state == HomeSwipeNativeState.ACTIVE && parts.size == 3) {
+        val beganAt = parts[2].toLongOrNull()
+        if (beganAt != null) return HomeSwipeNativePhase(id, state, beganAtEpochMs = beganAt)
+    }
+    if ((state == HomeSwipeNativeState.ENDED || state == HomeSwipeNativeState.CANCELLED) && parts.size == 6) {
+        val finalX = parts[2].toDoubleOrNull()
+        val verticalPath = parts[3].toDoubleOrNull()
+        val pageRejected = parts[4].toBooleanStrictOrNull()
+        val reversed = parts[5].toBooleanStrictOrNull()
+        if (finalX != null && verticalPath != null && pageRejected != null && reversed != null) {
+            return HomeSwipeNativePhase(
+                id = id,
+                state = state,
+                finalX = finalX,
+                verticalPath = verticalPath,
+                pageRejected = pageRejected,
+                reversed = reversed,
+            )
+        }
+    }
+    return HomeSwipeNativePhase(null, HomeSwipeNativeState.UNAVAILABLE)
+}
+
+internal fun homeSwipeEventBelongsToPhase(
+    eventWhenEpochMs: Long?,
+    phase: HomeSwipeNativePhase,
+): Boolean {
+    val beganAt = phase.beganAtEpochMs ?: return false
+    // The two callbacks read epoch milliseconds on separate native/EDT threads; tolerate their
+    // one-millisecond boundary while still rejecting an event queued before this contact began.
+    return phase.state == HomeSwipeNativeState.ACTIVE && eventWhenEpochMs != null && eventWhenEpochMs + 1 >= beganAt
+}
+
 /**
  * Whether the gesture is on, according to the host.
  *
@@ -77,6 +167,21 @@ internal fun parseHomeSwipeEnabled(raw: String?): Boolean? =
  * whole change exists to stop.
  */
 internal const val COMMIT_UNITS = 3.5f
+
+/** Host-normalized final displacement uses the page detector's CSS-pixel scale. */
+private const val NATIVE_TO_HOME_UNITS = 0.1
+
+/** Apply release data that cannot be delayed behind Compose's pointer queue. */
+internal fun homeSwipeWithNativeFinal(
+    gesture: HomeSwipeGesture,
+    phase: HomeSwipeNativePhase,
+): HomeSwipeGesture {
+    val finalMagnitude = kotlin.math.abs(phase.finalX ?: return gesture) * NATIVE_TO_HOME_UNITS
+    val finalVertical = (phase.verticalPath ?: return gesture) * NATIVE_TO_HOME_UNITS
+    val signed = if (gesture.direction == HomeSwipeDirection.BACK) -finalMagnitude else finalMagnitude
+    val updated = gesture.copy(accumX = signed.toFloat(), verticalPath = finalVertical.toFloat())
+    return updated.copy(rejected = updated.rejected || phase.reversed || cancelledByVertical(updated))
+}
 
 /** No scroll event for this long ends the gesture. Matches the page detector. */
 internal const val GESTURE_GAP_MS = 120L
@@ -150,6 +255,8 @@ internal data class HomeSwipeGesture(
     /** Ruled out; stays ruled out until the fingers lift, so a rejected swipe cannot come back. */
     val rejected: Boolean = false,
     val direction: HomeSwipeDirection? = null,
+    /** Host sequence which owns this gesture; null is retained for pure/legacy callers. */
+    val nativeGestureId: String? = null,
 )
 
 /**
@@ -169,8 +276,9 @@ internal data class HomeSwipeStep(
      * event fell outside [GESTURE_GAP_MS] of a gesture that had already started.
      *
      * Not the same thing as [gesture], which is the fresh one this event begins. It exists because
-     * the two ways a gesture can end run on different clocks: [advanceHomeSwipe] retires one after
-     * [GESTURE_GAP_MS], while [HomeSwipeSurface]'s timer fires at `GESTURE_GAP_MS + 60`. An event
+     * the two ways a legacy-host gesture can end run on different clocks: [advanceHomeSwipe]
+     * retires one after [GESTURE_GAP_MS], while [HomeSwipeSurface]'s compatibility timer fires at
+     * `GESTURE_GAP_MS + 60`. An event
      * landing in that 60ms window cancels the pending timer AND discards the gesture here, so a
      * swipe that had already earned a navigation was silently thrown away - reachable without a
      * second physical swipe, since a trackpad emits nothing while the fingers are still: swipe
@@ -202,18 +310,25 @@ internal fun advanceHomeSwipe(
     consumed: Boolean,
     canGoBack: Boolean,
     canGoForward: Boolean,
+    nativeGestureId: String? = null,
 ): HomeSwipeStep {
     // A gap in the stream is the end of the previous gesture, and the gesture it ends comes back
     // on HomeSwipeStep.ended rather than being dropped. This is not the only thing that ends a
-    // gesture - HomeSwipeSurface runs a quiescence timer too, and the two cover different cases:
-    // this one only fires when a NEXT event arrives, so a gesture that simply stops needs the
-    // timer. Pointer exit is neither; it cancels outright.
-    val continuing = gesture.lastEventAtMs != 0L && nowMs - gesture.lastEventAtMs <= GESTURE_GAP_MS
+    // gesture on a legacy host - HomeSwipeSurface runs a compatibility quiescence timer too, and
+    // the two cover different cases. Updated hosts pass nativeGestureId and never take this path.
+    // Native contact identity is authoritative when present. A pause with fingers still down is
+    // the same gesture however long the wheel stream is quiet; a new id cancels stale progress.
+    val continuing =
+        if (nativeGestureId != null) {
+            gesture.nativeGestureId == null || gesture.nativeGestureId == nativeGestureId
+        } else {
+            gesture.lastEventAtMs != 0L && nowMs - gesture.lastEventAtMs <= GESTURE_GAP_MS
+        }
     val base = if (continuing) gesture else HomeSwipeGesture()
-    val stamped = base.copy(lastEventAtMs = nowMs)
+    val stamped = base.copy(lastEventAtMs = nowMs, nativeGestureId = nativeGestureId)
     // A gesture that had actually started and is not being continued is retired by this event,
     // not discarded - see HomeSwipeStep.ended for the window that made the difference visible.
-    val retired = gesture.takeIf { !continuing && it.events > 0 }
+    val retired = gesture.takeIf { nativeGestureId == null && !continuing && it.events > 0 }
 
     if (stamped.rejected) return HomeSwipeStep(stamped, ended = retired)
     // Something under the pointer scrolled. That is what the event was for.
