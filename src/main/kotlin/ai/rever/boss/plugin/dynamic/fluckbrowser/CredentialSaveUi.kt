@@ -27,6 +27,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import kotlinx.coroutines.delay
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.runtime.Composable
@@ -73,6 +80,47 @@ internal data class SavedSecretNotice(
 /** Long enough to read and act on, short enough not to sit over the page. */
 internal const val SAVED_NOTICE_DURATION_MS = 8_000L
 
+/** What the password card's copy control is currently reporting. See its use for why failure is a state. */
+internal enum class PasswordCopyState { IDLE, COPIED, FAILED }
+
+/** Each attempt has its own identity so repeated outcomes restart the feedback timer. */
+internal class PasswordCopyFeedback {
+    internal class Attempt(val copied: Boolean)
+
+    internal var attempt by mutableStateOf<Attempt?>(null)
+        private set
+
+    val state: PasswordCopyState
+        get() = when (attempt?.copied) {
+            true -> PasswordCopyState.COPIED
+            false -> PasswordCopyState.FAILED
+            null -> PasswordCopyState.IDLE
+        }
+
+    fun report(copied: Boolean) {
+        attempt = Attempt(copied)
+    }
+
+    internal fun expire(expected: Attempt) {
+        if (attempt === expected) attempt = null
+    }
+}
+
+@Composable
+internal fun rememberPasswordCopyFeedback(password: String): PasswordCopyFeedback {
+    // A regenerated password has never been copied, even while the previous tick is visible.
+    val feedback = remember(password) { PasswordCopyFeedback() }
+    val attempt = feedback.attempt
+    LaunchedEffect(feedback, attempt) {
+        if (attempt != null) {
+            delay(if (attempt.copied) 1600L else 4000L)
+            feedback.expire(attempt)
+        }
+    }
+    return feedback
+}
+
+
 /**
  * Offer a generated password beside a new-password field.
  *
@@ -85,7 +133,7 @@ internal fun PasswordSuggestionCard(
     alphanumericOnly: Boolean,
     onUse: () -> Unit,
     onRegenerate: () -> Unit,
-    onCopy: () -> Unit,
+    onCopy: () -> Boolean,
     onDismiss: () -> Unit,
 ) {
     Card(
@@ -148,11 +196,40 @@ internal fun PasswordSuggestionCard(
                         modifier = Modifier.size(14.dp),
                     )
                 }
-                IconButton(onClick = onCopy, modifier = Modifier.size(28.dp)) {
+                // Three states, not two. A generated password is the one thing in this file
+                // where a silent copy failure costs something the user cannot get back: Copy is
+                // the path for taking the password WITHOUT filling the field, and the caption
+                // below says it is only saved to Secret Manager when used. So a failure has to be
+                // visible, and it has to look different from success rather than just staying
+                // idle - an unchanged icon is what a missed click looks like too.
+                val copyFeedback = rememberPasswordCopyFeedback(password)
+                val copyState = copyFeedback.state
+                IconButton(
+                    onClick = {
+                        copyFeedback.report(onCopy())
+                    },
+                    modifier = Modifier.size(28.dp),
+                ) {
                     Icon(
-                        Icons.Default.ContentCopy,
-                        contentDescription = "Copy password",
-                        tint = BossThemeColors.TextSecondary,
+                        when (copyState) {
+                            PasswordCopyState.COPIED -> Icons.Default.Check
+                            PasswordCopyState.FAILED -> Icons.Default.Warning
+                            PasswordCopyState.IDLE -> Icons.Default.ContentCopy
+                        },
+                        // Spoken by a screen reader, so the failure has to say what happened
+                        // rather than name an icon.
+                        contentDescription =
+                            when (copyState) {
+                                PasswordCopyState.COPIED -> "Password copied"
+                                PasswordCopyState.FAILED -> "Copy failed, the password is shown above"
+                                PasswordCopyState.IDLE -> "Copy password"
+                            },
+                        tint =
+                            when (copyState) {
+                                PasswordCopyState.COPIED -> BossThemeColors.SuccessColor
+                                PasswordCopyState.FAILED -> BossThemeColors.ErrorColor
+                                PasswordCopyState.IDLE -> BossThemeColors.TextSecondary
+                            },
                         modifier = Modifier.size(14.dp),
                     )
                 }
