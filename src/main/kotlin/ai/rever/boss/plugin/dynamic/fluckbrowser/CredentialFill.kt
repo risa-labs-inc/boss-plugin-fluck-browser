@@ -136,7 +136,8 @@ internal object CredentialFill {
      * [targetIndex] is the field's position in the eligible-login-field list, as reported by
      * [LOGIN_FIELD_PROBE_JS]. Passed when the suggestion list is anchored to a known box, omitted
      * for the right-click menu, where `document.activeElement` is the anchor instead. Either way
-     * the anchor decides which half is filled first, and its counterpart is looked up around it.
+     * the anchor decides which half is filled first, and its counterpart is looked up around it:
+     * within the anchor's group, from `groupOf` in [FIELD_ELIGIBILITY_JS], never in another form.
      */
     fun script(
         username: String,
@@ -202,13 +203,41 @@ internal object CredentialFill {
             for (i = 0; i < eligible.length; i++) { if (eligible[i] === active) anchor = eligible[i]; }
         }
 
+        // current-password before a bare password box, so a change-password form gets the old
+        // value rather than being handed it as the new one.
+        function preferredPassword(list) {
+            var j;
+            if (list.length === 0) return null;
+            for (j = 0; j < list.length; j++) {
+                if (hasToken(list[j], 'current-password')) return list[j];
+            }
+            for (j = 0; j < list.length; j++) {
+                if (!hasToken(list[j], 'new-password')) return list[j];
+            }
+            return list[0];
+        }
+
+        // Both halves come from one group, the anchor's. They used to be chosen independently from
+        // the whole page, so with a login form and a signup form side by side the username could go
+        // into one and the password into the other, both reported as filled. With no anchor, the
+        // password is still chosen from the whole page and the username is looked for beside it.
+        var basis = anchor;
+        if (!basis) {
+            var allPasswords = [];
+            for (i = 0; i < eligible.length; i++) {
+                if (isPassword(eligible[i])) allPasswords.push(eligible[i]);
+            }
+            basis = preferredPassword(allPasswords);
+        }
+        var group = groupOf(basis, eligible);
+
         var passwords = [];
-        for (i = 0; i < eligible.length; i++) {
-            if (isPassword(eligible[i])) passwords.push(eligible[i]);
+        for (i = 0; i < group.length; i++) {
+            if (isPassword(group[i])) passwords.push(group[i]);
         }
         var usernames = [];
-        for (i = 0; i < eligible.length; i++) {
-            if (!isPassword(eligible[i])) usernames.push(eligible[i]);
+        for (i = 0; i < group.length; i++) {
+            if (!isPassword(group[i])) usernames.push(group[i]);
         }
 
         function pickUsername() {
@@ -240,16 +269,7 @@ internal object CredentialFill {
 
         function pickPassword() {
             if (anchor && isPassword(anchor)) return anchor;
-            if (passwords.length === 0) return null;
-            // current-password before a bare password box, so a change-password form gets the old
-            // value rather than being handed it as the new one.
-            for (i = 0; i < passwords.length; i++) {
-                if (hasToken(passwords[i], 'current-password')) return passwords[i];
-            }
-            for (i = 0; i < passwords.length; i++) {
-                if (!hasToken(passwords[i], 'new-password')) return passwords[i];
-            }
-            return passwords[0];
+            return preferredPassword(passwords);
         }
 
         var uField = pickUsername();
@@ -327,10 +347,11 @@ internal object CredentialFill {
      * which loses the generated password unless they read it off the card first. Filling both means
      * the form is submittable as it stands.
      *
-     * The twin is "another password box that is not the target and is not `current-password`", which
-     * deliberately declines to guess between two remaining boxes: a form with three password
-     * fields is a change-password form whose third box the target's own `new-password` grouping
-     * cannot distinguish, so nothing beyond the first candidate is touched.
+     * The twin is "another password box in the target's group that is not the target and is not
+     * `current-password`", which deliberately declines to guess between two remaining boxes: a form
+     * with three password fields is a change-password form whose third box the target's own
+     * `new-password` grouping cannot distinguish, so nothing beyond the first candidate is touched.
+     * The group is what stops a login form elsewhere on the page from supplying that box.
      */
     fun newPasswordScript(
         password: String,
@@ -385,13 +406,18 @@ internal object CredentialFill {
             return JSON.stringify({ target: 'absent', confirm: 'absent', landed: null, username: null });
         }
 
+        // Only the target's own group (see groupOf) is searched, for the account name and for the
+        // twin below. Across the whole page, a login form above the signup form supplied both: its
+        // email as the account, and its password box as the "confirm" copy of the new password.
+        var group = groupOf(target, eligible);
+
         // The account this password is being chosen for: the last eligible non-password box before
         // the target that has something in it. Same rule as the fill's pickUsername and the capture
         // script's usernameFor, because "the first text input in the enclosing form" cannot work on
         // a page with no form element - which is most large signup pages.
         var username = null;
-        for (i = 0; i < eligible.length; i++) {
-            var cand = eligible[i];
+        for (i = 0; i < group.length; i++) {
+            var cand = group[i];
             if (isPassword(cand) || !cand.value) continue;
             if (hasToken(cand, 'username') || hasToken(cand, 'email')) { username = cand.value; continue; }
             var precedes = cand.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING;
@@ -399,8 +425,8 @@ internal object CredentialFill {
         }
 
         var confirm = null;
-        for (i = 0; i < eligible.length; i++) {
-            var el = eligible[i];
+        for (i = 0; i < group.length; i++) {
+            var el = group[i];
             if (el === target || !isPassword(el)) continue;
             if (hasToken(el, 'current-password')) continue;
             confirm = el;
