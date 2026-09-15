@@ -28,7 +28,7 @@ jobs:
       - name: Download boss-plugin-api
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          API_VERSION: 'latest'
+          API_VERSION: '1.0.93'
         run: |
           set -euo pipefail
           if [ "$API_VERSION" = "latest" ]; then
@@ -46,6 +46,27 @@ jobs:
       # the one downloaded above. Actions sets it anyway; set explicitly so the
       # dependency is visible rather than inherited.
       - name: Compile and run tests
-        run: ./gradlew test --no-daemon
+        run: ./gradlew test buildPluginJar --no-daemon
         env:
           CI: 'true'
+
+      # Check the shipped bytes, including processResources version expansion.
+      - name: Verify packaged compatibility gates
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import pathlib
+          import re
+          import zipfile
+          version = re.search(r'^version = "([^"]+)"', pathlib.Path('build.gradle.kts').read_text(), re.M).group(1)
+          jar = pathlib.Path(f'build/libs/boss-plugin-fluck-browser-{version}.jar')
+          with zipfile.ZipFile(jar) as archive:
+              name = 'META-INF/boss-plugin/plugin.json'
+              assert archive.namelist().count(name) == 1
+              manifest = json.loads(archive.read(name))
+          assert manifest['version'] == version, manifest
+          assert manifest['apiVersion'] == '1.0.93', manifest
+          assert manifest['minApiVersion'] == '1.0.93', manifest
+          assert manifest['minBossVersion'] == '9.5.18', manifest
+          print('Packaged plugin version and compatibility gates verified:', manifest)
+          PYTHON

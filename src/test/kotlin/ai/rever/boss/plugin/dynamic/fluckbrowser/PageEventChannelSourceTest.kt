@@ -98,42 +98,18 @@ class PageEventChannelSourceTest {
 
     @Test
     fun `the manifest floors match what the plugin actually requires`() {
-        // The floors and the reflection are one decision. Declaring 1.0.83 / 9.4.23 again would make
-        // the plugin unloadable below them for a feature it can now do without, and lowering them
-        // while calling directly would make it CRASH there instead. They move together or not at
-        // all.
-        //
-        // Every api symbol this plugin NAMES directly must therefore exist at 1.0.73. The list
-        // below is a HAND AUDIT recorded at review time, NOT something this test enforces - no
-        // assertion here mentions those symbols, and adding an above-floor one would not fail.
-        //
-        // Which is exactly why it is written down: CI builds against `boss_plugin_api_version:
-        // 'latest'` (.github/workflows/build.yml), so a green compileKotlin proves the symbols
-        // exist in the NEWEST api, never that they exist at the declared floor. Enforcing it
-        // would need a floor-version jar to reflect against, which nothing here fetches.
-        //
-        // Derived with `git grep <symbol> <tag>` over risa-labs-inc/boss-plugin-api's tags:
-        //   - registerShortcutActionProvider, unregisterShortcutActionProvider,
-        //     ShortcutActionProvider, PluginShortcutSpec, KeyChordSpec .... api 1.0.62
-        //   - LocalWindowIdProvider ................................................ api 1.0.16
-        //   - LocalIsPanelActive ................................................... api 1.0.38
-        // All at or below the floor when checked, so Cmd+L's registration is not what stops the
-        // jar loading. Note the exposure is wider than the registration: the shortcut calls sit
-        // inside a runCatching, but LocalWindowIdProvider and LocalIsPanelActive are touched
-        // from composition in AddressBarRegistration, outside any guard - so if the floor ever
-        // moves DOWN, that composable is the unprotected path.
-        //
-        // Anything added ABOVE the floor has to go through PageEventChannel-style reflection
-        // instead of a floor bump, and has to be checked the same way, by hand, because the
-        // build cannot see it.
+        // Page-event reflection remains optional, but exact-frame context menu commands now
+        // directly require the API 1.0.93 contract and the host implementation in BOSS 9.5.18.
+        // An API JAR upgrade alone cannot replace the host-owned BrowserHandle implementation.
+        // CI compiles against that exact API and also checks the packaged manifest.
         val root = assertNotNull(repoRoot(), "could not locate the plugin root")
         val manifest = File(root, "src/main/resources/META-INF/boss-plugin/plugin.json").readText()
         assertTrue(
-            manifest.contains("\"minApiVersion\": \"1.0.73\""),
+            manifest.contains("\"minApiVersion\": \"1.0.93\""),
             "minApiVersion is not the floor this plugin can honour: $manifest",
         )
         assertTrue(
-            manifest.contains("\"minBossVersion\": \"9.4.2\""),
+            manifest.contains("\"minBossVersion\": \"9.5.18\""),
             "minBossVersion is not the floor this plugin can honour: $manifest",
         )
     }
