@@ -2012,12 +2012,13 @@ internal suspend fun saveGeneratedPassword(
     onSecretsReloaded: (List<SecretEntryData>) -> Unit,
 ): SavedSecretNotice? {
     if (provider == null) return null
+    val pageDomain = extractMainDomain(domain) ?: return null
     // An existing row for this account is UPDATED, not duplicated. The change-password form is the
     // case that makes this necessary and it is one the card explicitly targets: the user already has
     // a secret for that site and account, so creating a second leaves two rows for one login - one
     // holding the dead password - and the fill list then offers both with nothing to tell them
     // apart.
-    val matches = matchSecretsForDomain(domain, knownSecrets)
+    val matches = matchSecretsForDomain(pageDomain, knownSecrets)
     val existing =
         if (username.isNotBlank()) {
             matches.firstOrNull { it.username.equals(username, ignoreCase = true) }
@@ -2044,7 +2045,7 @@ internal suspend fun saveGeneratedPassword(
     if (reloaded != null) onSecretsReloaded(reloaded)
     val id =
         reloaded
-            ?.let { matchSecretsForDomain(domain, it) }
+            ?.let { matchSecretsForDomain(pageDomain, it) }
             // ignoreCase, matching the lookup above. They disagreed: if the backend normalises the
             // username, the id resolved to null and Edit silently fell back to creating a duplicate
             // of the row it was meant to correct.
@@ -2171,11 +2172,19 @@ internal fun refusesTotpUpdate(secret: SecretEntryData): Boolean {
 internal suspend fun BrowserHandle?.fillCredential(
     secret: SecretEntryData,
     targetIndex: Int? = null,
+    automaticGuard: CredentialFill.AutomaticGuard? = null,
+    manualExpectedOrigin: String? = null,
 ): CredentialFill.Result =
     CredentialFill.parseResult(
         onBrowser("fillCredential") {
             it.executeJavaScript(
-                CredentialFill.script(secret.username, secret.password, targetIndex)
+                CredentialFill.script(
+                    secret.username,
+                    secret.password,
+                    targetIndex,
+                    automaticGuard,
+                    manualExpectedOrigin,
+                )
             ) as? String
         }
     )
@@ -2853,6 +2862,13 @@ internal fun FluckBrowserTabContent(
     // user has already waved away. See CredentialSuggestions.kt for the probe behind this.
     var focusedLoginField by remember { mutableStateOf<FocusedLoginField?>(null) }
     var dismissedSuggestionId by remember { mutableStateOf<String?>(null) }
+    // The latest automatic attempt. The probe runs every 300ms while a login box is focused, so
+    // relying on its next `hasValue` answer alone leaves a window in which the same credential can
+    // be injected more than once. Only the latest is needed: moving to another field changes the
+    // key, and returning to this one after that is a fresh user action. A single value also avoids
+    // retaining one entry for every login page this long-lived tab has visited.
+    var automaticFillAttempt by remember { mutableStateOf<String?>(null) }
+    var credentialsLoadedForField by remember { mutableStateOf<String?>(null) }
 
     // The probe's last full answer, and a counter that advances on every answer.
     //
@@ -3561,6 +3577,62 @@ internal fun FluckBrowserTabContent(
         }
     }
 
+    // Fill without making the user open either credential picker when there is one unambiguous
+    // account for the site. Multiple saved accounts deliberately remain a choice: selecting an
+    // arbitrary row from backend order could submit the wrong identity to the page.
+    LaunchedEffect(
+        focusedLoginField?.dismissId,
+        focusedLoginField?.documentEpoch,
+        credentialsLoadedForField,
+        allSecrets,
+    ) {
+        val field = focusedLoginField ?: return@LaunchedEffect
+        val fieldIndex = field.index ?: return@LaunchedEffect
+        val fieldLoadKey = "${field.dismissId}#${field.documentEpoch}"
+        if (credentialsLoadedForField != fieldLoadKey) return@LaunchedEffect
+        if (field.hasValue || field.isNewPassword) return@LaunchedEffect
+        val origin = automaticFillOrigin(field.pageUrl) ?: return@LaunchedEffect
+        val secret = automaticFillCandidate(field.pageUrl, allSecrets) ?: return@LaunchedEffect
+        val attemptId = "${field.dismissId}#${field.documentEpoch}#${secret.id}#${secret.updatedAt}"
+        if (attemptId == automaticFillAttempt) return@LaunchedEffect
+        automaticFillAttempt = attemptId
+        val handle = browserHandle
+        // Automatic failures stay silent: unlike a click, there is no user action that needs a
+        // failure acknowledgement. The page-side guard makes stale origin/field state a no-op.
+        withContext(Dispatchers.IO) {
+            handle.fillCredential(
+                secret,
+                targetIndex = fieldIndex,
+                automaticGuard =
+                    CredentialFill.AutomaticGuard(
+                        expectedOrigin = origin,
+                        expectedDocumentEpoch = field.documentEpoch,
+                        expectedTargetIndex = fieldIndex,
+                        expectedFieldName = field.fieldName,
+                        expectedFieldId = field.fieldId,
+                        expectedInputType = field.inputType,
+                        expectedAutocomplete = field.autocomplete,
+                    ),
+            )
+        }
+    }
+
+    // The vault API is not reactive. Re-read when the user enters a different login field so a
+    // credential created, changed, or deleted in Secret Manager is not held for the tab's entire
+    // lifetime. This is one RPC per focus transition, never one per 300ms probe.
+    LaunchedEffect(secretDataProvider, focusedLoginField?.dismissId, focusedLoginField?.documentEpoch) {
+        val field = focusedLoginField ?: return@LaunchedEffect
+        val expectedField = "${field.dismissId}#${field.documentEpoch}"
+        credentialsLoadedForField = null
+        reloadSecrets(secretDataProvider) {
+            val current = focusedLoginField
+            if (current != null && "${current.dismissId}#${current.documentEpoch}" == expectedField) {
+                allSecrets = it
+                credentialsLoadedForField = expectedField
+            }
+        }
+    }
+
     // Install the credential-capture script, and take it back down when the setting is off.
     //
     // This is the only path by which a page value the user typed reaches the plugin, and it only
@@ -3643,6 +3715,7 @@ internal fun FluckBrowserTabContent(
             // wrong site entirely. The host reads its URL inside the page's own event dispatch,
             // before any of that.
             val domain = extractMainDomain(event.url) ?: continue
+            val credentialWebsite = credentialPageOrigin(event.url) ?: continue
             if (domain in neverSaveDomains) continue
             pendingSave =
                 CredentialSavePolicy.Pending(
@@ -3651,6 +3724,7 @@ internal fun FluckBrowserTabContent(
                     password = captured.password,
                     wasFilledByBoss = captured.wasFilledByBoss,
                     capturedAtMs = System.currentTimeMillis(),
+                    website = credentialWebsite,
                 )
             // The observation the outcome has to be NEWER than. Without this the prompt would fire
             // on submit rather than on success, because the probe's last answer still describes the
@@ -4331,6 +4405,7 @@ internal fun FluckBrowserTabContent(
                 // the menu we are building.
                 val requestId = contextMenuRequest
                 val menuInfo = contextMenuInfo
+                val menuExpectedOrigin = menuInfo?.pageUrl?.let(::credentialPageOrigin)
                 // Read the pointer before the request is eligible to be consumed. Inside the
                 // run, a null here (headless, or the pointer on no screen device) would burn
                 // the request without ever showing anything — and unlike a cancelled run,
@@ -4354,7 +4429,6 @@ internal fun FluckBrowserTabContent(
                         } else {
                             emptyList<SecretEntryData>()
                         }
-
                         val menuItems = buildContextMenuItems(
                             info = menuInfo,
                             browserHandle = browserHandle,
@@ -4377,10 +4451,16 @@ internal fun FluckBrowserTabContent(
                             },
                             onFillCredential = { secret ->
                                 coroutineScope.launch {
-                                    // No target index: the host reported this menu against the
-                                    // clicked field, and the page's own activeElement is what
-                                    // identifies it.
-                                    showFillNotice(browserHandle.fillCredential(secret))
+                                    // Retain the manual path's existing activeElement behaviour:
+                                    // the named credential rows already worked through it. A
+                                    // periodically sampled probe index can be stale and must not be
+                                    // promoted into a stronger claim about the right-click target.
+                                    showFillNotice(
+                                        browserHandle.fillCredential(
+                                            secret,
+                                            manualExpectedOrigin = menuExpectedOrigin,
+                                        )
+                                    )
                                 }
                             },
                             canSuggestPassword = suggestPasswordsEnabled,
@@ -4514,6 +4594,7 @@ internal fun FluckBrowserTabContent(
                                         browserHandle.fillCredential(
                                             secret,
                                             targetIndex = suggestionField.index,
+                                            manualExpectedOrigin = credentialPageOrigin(suggestionField.pageUrl),
                                         )
                                     )
                                 }
@@ -4621,14 +4702,14 @@ internal fun FluckBrowserTabContent(
                                         fillNoticeSeq++
                                         return@launch
                                     }
-                                    val domain =
-                                        extractMainDomain(generatorField.pageUrl)
-                                            ?: extractMainDomain(currentUrl)
+                                    val website =
+                                        credentialPageOrigin(generatorField.pageUrl)
+                                            ?: credentialPageOrigin(currentUrl)
                                             ?: return@launch
                                     savedSecretNotice =
                                         saveGeneratedPassword(
                                             provider = secretDataProvider,
-                                            domain = domain,
+                                            domain = website,
                                             username = result.username.orEmpty(),
                                             password = landed,
                                             knownSecrets = allSecrets,
@@ -4696,7 +4777,7 @@ internal fun FluckBrowserTabContent(
                                             storeCredential(
                                                 provider = secretDataProvider,
                                                 decision = decision,
-                                                domain = pending.domain,
+                                                domain = pending.website,
                                                 username = saveUsernameDraft,
                                                 password = pending.password,
                                             )
@@ -4847,7 +4928,7 @@ internal fun FluckBrowserTabContent(
                     browserHandle = browserHandle,
                     coroutineScope = coroutineScope,
                     onDismiss = { showAllSecretsDialog = false },
-                    onAddNewSecret = { websitePrefill ->
+                onAddNewSecret = { websitePrefill ->
                         showAllSecretsDialog = false
                         quickCreateWebsitePrefill = websitePrefill
                         showQuickCreateDialog = true
@@ -5289,39 +5370,32 @@ internal fun buildContextMenuItems(
         if (formFieldInfo != null) {
             val domain = extractMainDomain(info.pageUrl)
 
-            // Header
-            add(ContextMenuItem(
-                text = "🔑 Fill Credential",
-                onClick = {}  // Header, non-clickable
-            ))
+            val matchedSecrets =
+                if (domain == null) emptyList() else matchSecretsForDomain(domain, secrets)
 
-            if (domain != null && secrets.isNotEmpty()) {
-                val matchedSecrets = matchSecretsForDomain(domain, secrets)
-
-                if (matchedSecrets.isNotEmpty()) {
-                    add(ContextMenuItem(isDivider = true))
-
-                    // Add matched secrets
-                    matchedSecrets.forEach { secret ->
-                        val displayName = getDisplayName(secret.website)
-                        val usernamePreview = if (secret.username.length > 25) {
-                            secret.username.take(22) + "..."
-                        } else {
-                            secret.username
-                        }
-
-                        add(ContextMenuItem(
-                            text = "$displayName ($usernamePreview)",
-                            onClick = { onFillCredential(secret) }
-                        ))
+            if (matchedSecrets.isNotEmpty()) {
+                // The named rows are the fill actions. Do not put a second, inert "Fill
+                // Credential" row above them: it looked actionable and was the reported failure.
+                matchedSecrets.forEach { secret ->
+                    val displayName = getDisplayName(secret.website)
+                    val usernamePreview = if (secret.username.length > 25) {
+                        secret.username.take(22) + "..."
+                    } else {
+                        secret.username
                     }
-                } else {
-                    // No matches for this domain
+
                     add(ContextMenuItem(
-                        text = "No matching secrets for $domain",
-                        onClick = {}  // Informational
+                        text = "$displayName ($usernamePreview)",
+                        onClick = { onFillCredential(secret) }
                     ))
                 }
+            } else {
+                // With no site match, the generic action is a real escape hatch to the full
+                // picker. It used to be a no-op label, which is why it appeared broken.
+                add(ContextMenuItem(
+                    text = "🔑 Fill Credential...",
+                    onClick = onShowAllSecrets,
+                ))
             }
 
             add(ContextMenuItem(isDivider = true))
@@ -5344,7 +5418,9 @@ internal fun buildContextMenuItems(
             // "Add New Secret" option (with domain pre-filled)
             add(ContextMenuItem(
                 text = "Add New Secret",
-                onClick = { onAddNewSecret(domain ?: "") }
+                onClick = {
+                    onAddNewSecret(credentialPageOrigin(info.pageUrl) ?: domain.orEmpty())
+                }
             ))
 
             add(ContextMenuItem(isDivider = true))
@@ -6637,6 +6713,7 @@ private fun SecretSelectionDialog(
 
     // Extract domain for highlighting matched secrets
     val currentDomain = remember(currentUrl) { extractMainDomain(currentUrl) }
+    val currentOrigin = remember(currentUrl) { credentialPageOrigin(currentUrl) }
 
     BossDialog(onDismissRequest = onDismiss) {
         Card(
@@ -6772,7 +6849,7 @@ private fun SecretSelectionDialog(
                             if (currentDomain != null) {
                                 Spacer(modifier = Modifier.height(24.dp))
                                 Button(onClick = {
-                                    onAddNewSecret(currentDomain)
+                                    onAddNewSecret(currentOrigin ?: currentDomain)
                                 }) {
                                     Icon(Icons.Default.Add, contentDescription = null)
                                     Spacer(modifier = Modifier.width(8.dp))
@@ -6798,7 +6875,11 @@ private fun SecretSelectionDialog(
                                     secretMatchesDomain(currentDomain, secret),
                                 onClick = {
                                     coroutineScope.launch {
-                                        val result = browserHandle.fillCredential(secret)
+                                        val result =
+                                            browserHandle.fillCredential(
+                                                secret,
+                                                manualExpectedOrigin = currentOrigin,
+                                            )
                                         onDismiss()
                                         onFillResult(result)
                                     }
@@ -6824,7 +6905,7 @@ private fun SecretSelectionDialog(
                     )
 
                     if (currentDomain != null) {
-                        TextButton(onClick = { onAddNewSecret(currentDomain) }) {
+                        TextButton(onClick = { onAddNewSecret(currentOrigin ?: currentDomain) }) {
                             Icon(
                                 Icons.Default.Add,
                                 contentDescription = null,

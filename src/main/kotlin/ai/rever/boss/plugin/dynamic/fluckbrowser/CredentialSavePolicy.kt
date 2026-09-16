@@ -29,6 +29,8 @@ internal object CredentialSavePolicy {
         val password: String,
         val wasFilledByBoss: Boolean,
         val capturedAtMs: Long,
+        /** Exact canonical origin used for new rows; [domain] remains the outcome/dedupe key. */
+        val website: String = domain,
     )
 
     /** What to do about a [Pending] once the login looks like it worked. */

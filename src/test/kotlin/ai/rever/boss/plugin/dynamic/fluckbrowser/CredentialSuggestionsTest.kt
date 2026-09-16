@@ -205,6 +205,23 @@ class CredentialSuggestionsTest {
         assertEquals("[A-Za-z0-9]+", field.pattern)
     }
 
+    @Test
+    fun `the focus probe carries the document and field identity used by guarded fill`() {
+        val json =
+            """
+            {"key":"0|email|login|email","isPassword":false,"pageUrl":"https://example.com/login",
+             "documentEpoch":1234.5,"fieldName":"email","fieldId":"login","inputType":"email",
+             "autocomplete":"username","hasValue":false,
+             "left":10.0,"top":20.0,"width":200.0,"height":30.0}
+            """.trimIndent()
+        val field = assertIs<LoginFieldProbe.Focused>(parseLoginFieldProbe(json)).field
+        assertEquals(1234.5, field.documentEpoch)
+        assertEquals("email", field.fieldName)
+        assertEquals("login", field.fieldId)
+        assertEquals("email", field.inputType)
+        assertEquals("username", field.autocomplete)
+    }
+
     private fun newPasswordField(
         maxLength: Int = -1,
         hasValue: Boolean = false,

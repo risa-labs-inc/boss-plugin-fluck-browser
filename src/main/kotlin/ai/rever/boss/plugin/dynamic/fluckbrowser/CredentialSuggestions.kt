@@ -67,6 +67,12 @@ internal data class FocusedLoginField(
     val pattern: String? = null,
     /** `location.href`, read from the page rather than the URL bar, which the user may be editing. */
     val pageUrl: String,
+    /** Navigation-scoped epoch; unlike URL/origin it changes on a same-origin document reload. */
+    val documentEpoch: Double = 0.0,
+    val fieldName: String = "",
+    val fieldId: String = "",
+    val inputType: String = "",
+    val autocomplete: String = "",
     /** Whether the box already has something in it. The value itself never leaves the page. */
     val hasValue: Boolean,
     val left: Double,
@@ -308,6 +314,11 @@ $FIELD_ELIGIBILITY_JS
             maxLength: (typeof el.maxLength === 'number' ? el.maxLength : -1),
             pattern: el.getAttribute('pattern'),
             pageUrl: location.href,
+            documentEpoch: (performance && performance.timeOrigin) ? performance.timeOrigin : 0,
+            fieldName: el.name || '',
+            fieldId: el.id || '',
+            inputType: el.type || '',
+            autocomplete: el.getAttribute('autocomplete') || '',
             hasValue: !!(el.value && el.value.length > 0),
             left: r.left,
             top: r.top,

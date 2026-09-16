@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.api.SecretEntryData
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -19,11 +20,14 @@ class SecretDomainMatchTest {
     private fun secret(
         website: String,
         username: String = "someone@example.com",
+        password: String = "unused",
+        tags: List<String> = emptyList(),
     ) = SecretEntryData(
         id = website + "|" + username,
         website = website,
         username = username,
-        password = "unused",
+        password = password,
+        tags = tags,
         createdAt = "",
         updatedAt = "",
     )
@@ -106,6 +110,120 @@ class SecretDomainMatchTest {
     fun `an unrelated site is not offered`() {
         val secrets = listOf(secret("github.com"), secret("linkedin.com"), secret("ac.in"))
         assertTrue(matchSecretsForDomain("google.com", secrets).isEmpty())
+    }
+
+    // ---------------------------------------------------------- automaticFillCandidate
+
+    @Test
+    fun `one matching credential is safe to auto fill`() {
+        val only = secret("example.com", "me@example.com")
+        assertEquals(only, automaticFillCandidate("https://example.com/login", listOf(only)))
+    }
+
+    @Test
+    fun `multiple matching accounts require a human choice`() {
+        val secrets =
+            listOf(
+                secret("example.com", "personal@example.com"),
+                secret("https://example.com/account", "work@example.com"),
+            )
+        assertNull(automaticFillCandidate("https://example.com/login", secrets))
+    }
+
+    @Test
+    fun `a blank password is not auto filled`() {
+        val unusable = secret("example.com", "me@example.com", password = "")
+        assertNull(automaticFillCandidate("https://example.com/login", listOf(unusable)))
+    }
+
+    @Test
+    fun `automatic fill never crosses to a sibling host`() {
+        val account = secret("accounts.example.com", "me@example.com")
+        assertNull(automaticFillCandidate("https://app.example.com/login", listOf(account)))
+        // The broader manual matching policy is deliberately unchanged.
+        assertEquals(account, matchSecretsForDomain("example.com", listOf(account)).single())
+    }
+
+    @Test
+    fun `a captured subdomain origin can auto fill only that same subdomain`() {
+        val capturedWebsite = assertNotNull(credentialPageOrigin("https://accounts.example.com/login"))
+        val stored = secret(capturedWebsite, "me@example.com")
+
+        assertEquals(
+            stored,
+            automaticFillCandidate("https://accounts.example.com/challenge", listOf(stored)),
+        )
+        assertNull(automaticFillCandidate("https://app.example.com/login", listOf(stored)))
+    }
+
+    @Test
+    fun `ordinary http pages cannot receive an automatic credential`() {
+        val account = secret("https://example.com", "me@example.com")
+        assertNull(automaticFillCandidate("http://example.com/login", listOf(account)))
+    }
+
+    @Test
+    fun `userinfo URLs are not automatic credential origins`() {
+        val account = secret("https://user@example.com", "me@example.com")
+        assertNull(automaticFillCandidate("https://example.com/login", listOf(account)))
+        assertNull(automaticFillOrigin("https://user@example.com/login"))
+    }
+
+    @Test
+    fun `an explicit secret origin respects scheme and effective port`() {
+        val defaultHttps = secret("https://example.com/account", "default@example.com")
+        val alternatePort = secret("https://example.com:8443/account", "alternate@example.com")
+
+        assertEquals("https://example.com", automaticFillOrigin("https://example.com:443/login"))
+        assertEquals("https://example.com:8443", automaticFillOrigin("https://example.com:8443/login"))
+        assertEquals(
+            defaultHttps,
+            automaticFillCandidate("https://example.com:443/login", listOf(defaultHttps)),
+        )
+        assertNull(automaticFillCandidate("https://example.com:8443/login", listOf(defaultHttps)))
+        assertEquals(
+            alternatePort,
+            automaticFillCandidate("https://example.com:8443/login", listOf(alternatePort)),
+        )
+        assertNull(
+            automaticFillCandidate(
+                "http://localhost:3000/login",
+                listOf(secret("https://localhost:3000", "local@example.com")),
+            ),
+        )
+    }
+
+    @Test
+    fun `explicit http is allowed only for the same loopback origin`() {
+        val local = secret("http://127.0.0.1:3000/account", "local@example.com")
+        assertEquals(
+            local,
+            automaticFillCandidate("http://127.0.0.1:3000/login", listOf(local)),
+        )
+        assertNull(automaticFillCandidate("http://127.0.0.1:4000/login", listOf(local)))
+    }
+
+    @Test
+    fun `ineligible rows cannot hide a second usable account`() {
+        val first = secret("example.com", "first@example.com")
+        val blank = secret("example.com", "", password = "")
+        val second = secret("example.com", "second@example.com")
+
+        assertNull(
+            automaticFillCandidate(
+                "https://example.com/login",
+                listOf(first, blank, second),
+            ),
+        )
+    }
+
+    @Test
+    fun `api key and ai provider entries are never automatic login candidates`() {
+        val apiKey = secret("example.com", "OPENAI_API_KEY", tags = listOf("api_key"))
+        val provider = secret("example.com", "provider", tags = listOf("AI-PROVIDER"))
+
+        assertNull(automaticFillCandidate("https://example.com/login", listOf(apiKey)))
+        assertNull(automaticFillCandidate("https://example.com/login", listOf(provider)))
     }
 
     @Test

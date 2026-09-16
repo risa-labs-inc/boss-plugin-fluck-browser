@@ -22,6 +22,87 @@ class CredentialFillTest {
         password: String,
     ) = """{"username":"$username","password":"$password","usernameField":"identifier","passwordField":null}"""
 
+    private fun credentialSandbox(
+        origin: String = "https://accounts.example.com",
+        epoch: Double = 1234.5,
+        usernameValue: String = "",
+        passwordValue: String = "",
+        passwordName: String = "password",
+        passwordAutocomplete: String = "current-password",
+    ): JsSandbox =
+        JsSandbox().also { sandbox ->
+            sandbox.eval(
+                """
+                var location = { origin: ${CredentialFill.jsLiteral(origin)} };
+                var performance = { timeOrigin: $epoch };
+                var Node = { DOCUMENT_POSITION_FOLLOWING: 4 };
+                window.innerWidth = 1200; window.innerHeight = 800;
+                window.getComputedStyle = function () {
+                    return { display:'block', visibility:'visible', opacity:'1' };
+                };
+                function Event(type, init) { this.type = type; this.bubbles = !!(init && init.bubbles); }
+                function FocusEvent(type, init) { Event.call(this, type, init); }
+                function KeyboardEvent(type, init) { Event.call(this, type, init); }
+                function HTMLInputElement(props) {
+                    this.tagName = 'INPUT'; this.disabled = false; this.readOnly = false;
+                    this.name = props.name || ''; this.id = props.id || '';
+                    this.type = props.type || 'text'; this.placeholder = props.placeholder || '';
+                    this._value = props.value || ''; this._autocomplete = props.autocomplete || '';
+                    this._index = props.index;
+                }
+                Object.defineProperty(HTMLInputElement.prototype, 'value', {
+                    get: function () { return this._value; },
+                    set: function (v) { this._value = String(v); }
+                });
+                HTMLInputElement.prototype.getClientRects = function () { return [1]; };
+                HTMLInputElement.prototype.getBoundingClientRect = function () {
+                    return { left:10, top:10, right:210, bottom:40, width:200, height:30 };
+                };
+                HTMLInputElement.prototype.getAttribute = function (name) {
+                    if (name === 'autocomplete') return this._autocomplete;
+                    if (name === 'aria-label' || name === 'aria-hidden') return '';
+                    return '';
+                };
+                HTMLInputElement.prototype.setAttribute = function () {};
+                HTMLInputElement.prototype.dispatchEvent = function () { return true; };
+                HTMLInputElement.prototype.focus = function () { document.activeElement = this; };
+                HTMLInputElement.prototype.compareDocumentPosition = function (other) {
+                    return this._index < other._index ? Node.DOCUMENT_POSITION_FOLLOWING : 0;
+                };
+                window.HTMLInputElement = HTMLInputElement;
+                var username = new HTMLInputElement({
+                    name:'email', id:'login', type:'email', autocomplete:'username',
+                    value:${CredentialFill.jsLiteral(usernameValue)}, index:0
+                });
+                var password = new HTMLInputElement({
+                    name:${CredentialFill.jsLiteral(passwordName)}, id:'password', type:'password',
+                    autocomplete:${CredentialFill.jsLiteral(passwordAutocomplete)},
+                    value:${CredentialFill.jsLiteral(passwordValue)}, index:1
+                });
+                document.inputs = [username, password];
+                document.querySelectorAll = function () { return document.inputs; };
+                document.activeElement = username;
+                document.hasFocus = function () { return true; };
+                """.trimIndent(),
+                "credential-dom",
+            )
+        }
+
+    private fun automaticGuard(
+        origin: String = "https://accounts.example.com",
+        epoch: Double = 1234.5,
+        fieldId: String = "login",
+    ) =
+        CredentialFill.AutomaticGuard(
+            expectedOrigin = origin,
+            expectedDocumentEpoch = epoch,
+            expectedTargetIndex = 0,
+            expectedFieldName = "email",
+            expectedFieldId = fieldId,
+            expectedInputType = "email",
+            expectedAutocomplete = "username",
+        )
+
     // ------------------------------------------------------------------ parseResult
 
     @Test
@@ -186,6 +267,109 @@ class CredentialFillTest {
         val script = CredentialFill.script("a\"b", "c\\d", targetIndex = null)
         assertTrue(script.contains("var USERNAME = \"a\\\"b\";"))
         assertTrue(script.contains("var PASSWORD = \"c\\\\d\";"))
+    }
+
+    @Test
+    fun `automatic fill rechecks origin and exact field before writing`() {
+        val script =
+            CredentialFill.script(
+                username = "me@example.com",
+                password = "secret",
+                targetIndex = 2,
+                automaticGuard =
+                    CredentialFill.AutomaticGuard(
+                        expectedOrigin = "https://accounts.example.com",
+                        expectedDocumentEpoch = 1234.5,
+                        expectedTargetIndex = 2,
+                        expectedFieldName = "email",
+                        expectedFieldId = "login",
+                        expectedInputType = "email",
+                        expectedAutocomplete = "username",
+                    ),
+            )
+
+        assertTrue(script.contains("var AUTOMATIC = true;"))
+        assertTrue(script.contains("location.origin !== EXPECTED_ORIGIN"))
+        assertTrue(script.contains("performance.timeOrigin !== EXPECTED_DOCUMENT_EPOCH"))
+        assertTrue(script.contains("anchor !== document.activeElement"))
+        assertTrue(script.contains("!targetMatches(anchor, activeIndex)"))
+        assertTrue(script.contains("return AUTOMATIC ? null : passwords[0];"))
+        assertTrue(script.contains("passwords.length > 1"))
+    }
+
+    @Test
+    fun `manual fill keeps explicit overwrite and legacy target behaviour`() {
+        val script = CredentialFill.script("u", "p", targetIndex = null)
+        assertTrue(script.contains("var AUTOMATIC = false;"))
+        assertTrue(script.contains("var EXPECTED_ORIGIN = \"\";"))
+        assertTrue(script.contains("var EXPECTED_TARGET_INDEX = -1;"))
+    }
+
+    @Test
+    fun `manual menu fill refuses a credential after cross-origin navigation`() {
+        credentialSandbox().use { sandbox ->
+            sandbox.eval(
+                CredentialFill.script(
+                    username = "me@example.com",
+                    password = "saved-password",
+                    manualExpectedOrigin = "https://site-that-opened-the-menu.example",
+                ),
+            )
+            assertEquals("", sandbox.eval("username.value"))
+            assertEquals("", sandbox.eval("password.value"))
+        }
+    }
+
+    @Test
+    fun `automatic guard executes and fills only the authorised empty login form`() {
+        credentialSandbox().use { sandbox ->
+            val raw =
+                sandbox.eval(
+                    CredentialFill.script("me@example.com", "saved-password", 0, automaticGuard()),
+                    "credential-fill",
+                ) as String
+            assertTrue(CredentialFill.parseResult(raw).filledSomething)
+            assertEquals("me@example.com", sandbox.eval("username.value"))
+            assertEquals("saved-password", sandbox.eval("password.value"))
+        }
+    }
+
+    @Test
+    fun `automatic guard rejects wrong origin document and field identity`() {
+        listOf(
+            automaticGuard(origin = "https://other.example.com"),
+            automaticGuard(epoch = 999.0),
+            automaticGuard(fieldId = "other-field"),
+        ).forEach { guard ->
+            credentialSandbox().use { sandbox ->
+                sandbox.eval(CredentialFill.script("me@example.com", "saved-password", 0, guard))
+                assertEquals("", sandbox.eval("username.value"))
+                assertEquals("", sandbox.eval("password.value"))
+            }
+        }
+    }
+
+    @Test
+    fun `automatic fill is atomic when either login field already has a value`() {
+        credentialSandbox(passwordValue = "typed-by-human").use { sandbox ->
+            sandbox.eval(CredentialFill.script("me@example.com", "saved-password", 0, automaticGuard()))
+            assertEquals("", sandbox.eval("username.value"))
+            assertEquals("typed-by-human", sandbox.eval("password.value"))
+        }
+    }
+
+    @Test
+    fun `username focus never fills a signup password field`() {
+        listOf(
+            "new_password" to "new-password",
+            "create_password" to "",
+        ).forEach { (name, autocomplete) ->
+            credentialSandbox(passwordName = name, passwordAutocomplete = autocomplete).use { sandbox ->
+                sandbox.eval(CredentialFill.script("me@example.com", "saved-password", 0, automaticGuard()))
+                assertEquals("", sandbox.eval("username.value"))
+                assertEquals("", sandbox.eval("password.value"))
+            }
+        }
     }
 
     // ---------------------------------------------------- the generated-password fill

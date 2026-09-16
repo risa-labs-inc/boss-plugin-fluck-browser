@@ -25,6 +25,23 @@ import kotlinx.serialization.json.Json
  * (BossConsole#215, boss-plugin-api).
  */
 internal object CredentialFill {
+    /**
+     * Conditions captured when an automatic fill was authorised.
+     *
+     * They are checked again in the same JavaScript turn that writes the values. A navigation or
+     * DOM replacement between the focus probe and execution therefore turns into a no-op instead
+     * of applying one site's credential to whatever now occupies the same field index.
+     */
+    data class AutomaticGuard(
+        val expectedOrigin: String,
+        val expectedDocumentEpoch: Double,
+        val expectedTargetIndex: Int,
+        val expectedFieldName: String,
+        val expectedFieldId: String,
+        val expectedInputType: String,
+        val expectedAutocomplete: String,
+    )
+
     /** What happened to one of the two fields. */
     enum class FieldOutcome {
         /** Filled. */
@@ -142,13 +159,21 @@ internal object CredentialFill {
         username: String,
         password: String,
         targetIndex: Int? = null,
+        automaticGuard: AutomaticGuard? = null,
+        manualExpectedOrigin: String? = null,
     ): String =
         """
         (function() {
         $FIELD_ELIGIBILITY_JS
-        var USERNAME = ${jsLiteral(username)};
-        var PASSWORD = ${jsLiteral(password)};
         var TARGET = ${targetIndex ?: -1};
+        var EXPECTED_ORIGIN = ${jsLiteral(automaticGuard?.expectedOrigin ?: manualExpectedOrigin.orEmpty())};
+        var EXPECTED_DOCUMENT_EPOCH = ${automaticGuard?.expectedDocumentEpoch ?: -1.0};
+        var EXPECTED_TARGET_INDEX = ${automaticGuard?.expectedTargetIndex ?: -1};
+        var EXPECTED_FIELD_NAME = ${jsLiteral(automaticGuard?.expectedFieldName.orEmpty())};
+        var EXPECTED_FIELD_ID = ${jsLiteral(automaticGuard?.expectedFieldId.orEmpty())};
+        var EXPECTED_INPUT_TYPE = ${jsLiteral(automaticGuard?.expectedInputType.orEmpty())};
+        var EXPECTED_AUTOCOMPLETE = ${jsLiteral(automaticGuard?.expectedAutocomplete.orEmpty())};
+        var AUTOMATIC = ${automaticGuard != null};
 
         // React 16+ compares against its own value tracker and ignores a plain assignment, so the
         // value goes in through the prototype's native setter with `input` dispatched after it.
@@ -172,9 +197,9 @@ internal object CredentialFill {
                 // Deliberately NOT compared against the value we set: a site that reformats or
                 // masks on input has still accepted it, and calling that a failure would warn the
                 // user about a fill that worked.
-                return el.value.length > 0;
+                return el.value.length > 0 ? 'filled' : 'failed';
             } catch (e) {
-                return false;
+                return 'failed';
             }
         }
         function label(el) {
@@ -200,6 +225,33 @@ internal object CredentialFill {
         } else {
             var active = document.activeElement;
             for (i = 0; i < eligible.length; i++) { if (eligible[i] === active) anchor = eligible[i]; }
+        }
+
+        function targetMatches(el, index) {
+            return index === EXPECTED_TARGET_INDEX &&
+                (el.name || '') === EXPECTED_FIELD_NAME &&
+                (el.id || '') === EXPECTED_FIELD_ID &&
+                (el.type || '') === EXPECTED_INPUT_TYPE &&
+                (el.getAttribute('autocomplete') || '') === EXPECTED_AUTOCOMPLETE;
+        }
+
+        // Re-authorise at the write boundary. `TARGET` by itself is only a list position and can
+        // point at an unrelated element after navigation or a DOM reorder.
+        if (EXPECTED_ORIGIN && location.origin !== EXPECTED_ORIGIN) {
+            return JSON.stringify({username:'absent', password:'absent'});
+        }
+        if (AUTOMATIC) {
+            if (!document.hasFocus() ||
+                !performance || performance.timeOrigin !== EXPECTED_DOCUMENT_EPOCH) {
+                return JSON.stringify({username:'absent', password:'absent'});
+            }
+            var activeIndex = -1;
+            for (i = 0; i < eligible.length; i++) {
+                if (eligible[i] === document.activeElement) activeIndex = i;
+            }
+            if (!anchor || anchor !== document.activeElement || !targetMatches(anchor, activeIndex)) {
+                return JSON.stringify({username:'absent', password:'absent'});
+            }
         }
 
         var passwords = [];
@@ -249,14 +301,46 @@ internal object CredentialFill {
             for (i = 0; i < passwords.length; i++) {
                 if (!hasToken(passwords[i], 'new-password')) return passwords[i];
             }
-            return passwords[0];
+            // A saved password must never become a proposed new password without an explicit
+            // selection. In automatic mode, a form containing only new-password boxes has no
+            // password target at all.
+            return AUTOMATIC ? null : passwords[0];
         }
 
         var uField = pickUsername();
         var pField = pickPassword();
+        if (AUTOMATIC) {
+            var hasNewPasswordField = false;
+            for (i = 0; i < passwords.length; i++) {
+                var candidate = passwords[i];
+                if (!hasToken(candidate, 'current-password')) {
+                    var words = [
+                        candidate.name, candidate.id, candidate.placeholder,
+                        candidate.getAttribute('aria-label'), candidate.getAttribute('autocomplete')
+                    ].join(' ').toLowerCase();
+                    if (hasToken(candidate, 'new-password') || passwords.length > 1 ||
+                        /new|confirm|repeat|retype|register|sign-?up|create/.test(words)) {
+                        hasNewPasswordField = true;
+                    }
+                }
+            }
+            // Treat the pair as one decision. Mixing a stored password with a username the human
+            // already typed (or vice versa) is worse than doing nothing, and a multi-password form
+            // is a signup/change-password flow rather than an ordinary login.
+            if (hasNewPasswordField ||
+                (pField && hasToken(pField, 'new-password')) ||
+                (uField && uField.value && uField.value.length > 0) ||
+                (pField && pField.value && pField.value.length > 0)) {
+                return JSON.stringify({username:'absent', password:'absent'});
+            }
+        }
+        // Keep credential constants below every automatic guard. A rejected stale fill never
+        // evaluates a statement containing the values.
+        var USERNAME = ${jsLiteral(username)};
+        var PASSWORD = ${jsLiteral(password)};
         var report = {
-            username: uField ? (fill(uField, USERNAME) ? 'filled' : 'failed') : 'absent',
-            password: pField ? (fill(pField, PASSWORD) ? 'filled' : 'failed') : 'absent',
+            username: uField ? fill(uField, USERNAME) : 'absent',
+            password: pField ? fill(pField, PASSWORD) : 'absent',
             usernameField: uField ? label(uField) : null,
             passwordField: pField ? label(pField) : null
         };

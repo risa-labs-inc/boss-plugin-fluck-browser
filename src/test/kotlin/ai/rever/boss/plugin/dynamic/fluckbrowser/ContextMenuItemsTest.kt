@@ -1,6 +1,9 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
+import ai.rever.boss.plugin.browser.FormFieldInfo
+import ai.rever.boss.plugin.browser.FormFieldType
+import ai.rever.boss.plugin.api.SecretEntryData
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -17,7 +20,8 @@ class ContextMenuItemsTest {
         info: BrowserContextMenuInfo?,
         canGoBack: Boolean = false,
         canGoForward: Boolean = false,
-        isBookmarked: Boolean = false
+        isBookmarked: Boolean = false,
+        secrets: List<SecretEntryData> = emptyList(),
     ): List<String> =
         buildContextMenuItems(
             info = info,
@@ -26,8 +30,31 @@ class ContextMenuItemsTest {
             canGoForward = canGoForward,
             onNavigate = {},
             onOpenInNewTab = {},
-            isBookmarked = isBookmarked
+            isBookmarked = isBookmarked,
+            secrets = secrets,
         ).filterNot { it.isDivider }.map { it.text }
+
+    private val loginField =
+        FormFieldInfo(
+            fieldType = FormFieldType.USERNAME,
+            fieldName = "username",
+            fieldId = "login",
+            fieldPlaceholder = "Email",
+            fieldValue = "",
+            parentFormAction = null,
+            inputType = "email",
+            autocomplete = "username",
+        )
+
+    private fun secret(website: String, username: String) =
+        SecretEntryData(
+            id = "$website|$username",
+            website = website,
+            username = username,
+            password = "password",
+            createdAt = "",
+            updatedAt = "",
+        )
 
     @Test
     fun `plain page offers page actions and no link or image actions`() {
@@ -124,6 +151,45 @@ class ContextMenuItemsTest {
         assertFalse(items.contains("Back"))
         assertFalse(items.contains("Forward"))
         assertFalse(items.contains("Add Bookmark"))
+    }
+
+    @Test
+    fun `matching credential rows replace the generic fill action`() {
+        val items =
+            labels(
+                BrowserContextMenuInfo(
+                    isEditable = true,
+                    pageUrl = "https://accounts.example.com/login",
+                    formFieldInfo = loginField,
+                ),
+                secrets = listOf(secret("example.com", "me@example.com")),
+            )
+
+        assertTrue(items.contains("Example.com (me@example.com)"))
+        assertFalse(items.any { it.startsWith("🔑 Fill Credential") })
+    }
+
+    @Test
+    fun `generic fill action opens the picker when the site has no match`() {
+        var pickerOpened = false
+        val items =
+            buildContextMenuItems(
+                info = BrowserContextMenuInfo(
+                    isEditable = true,
+                    pageUrl = "https://example.com/login",
+                    formFieldInfo = loginField,
+                ),
+                browserHandle = null,
+                canGoBack = false,
+                canGoForward = false,
+                onNavigate = {},
+                onOpenInNewTab = {},
+                secrets = listOf(secret("elsewhere.test", "other")),
+                onShowAllSecrets = { pickerOpened = true },
+            ).first { it.text == "🔑 Fill Credential..." }
+
+        items.onClick()
+        assertTrue(pickerOpened)
     }
 
     @Test
