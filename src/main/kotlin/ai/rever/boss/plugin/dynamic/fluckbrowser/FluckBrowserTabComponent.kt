@@ -1180,6 +1180,15 @@ internal object TabHibernation {
          * same mistake.
          */
         USER_INPUT("tab holds unsubmitted typing"),
+
+        /**
+         * A Fluck agent is driving this tab - see [AgentKeepAlive].
+         *
+         * Like [USER_INPUT] and unlike [PLAYING_MEDIA], this does not drain on its own, so it
+         * routinely reaches the [MAX_RECHECKS] "left alone" ending. That is the point: an agent
+         * mid-task is work in progress, and releasing its renderer costs the task, not a reload.
+         */
+        AGENT_ROUTED("tab is routed to a Fluck agent"),
     }
 
     /**
@@ -1194,7 +1203,12 @@ internal object TabHibernation {
         fullscreenBlocks: Boolean,
         handle: BrowserHandle?,
         popOutEnabled: Boolean = autoPopOutEnabled(),
+        tabId: String? = null,
+        agentKeptAlive: Boolean = AgentKeepAlive.isKeptAlive(tabId),
     ): BusyState {
+        // First, and ahead of the handle-null shortcut: this is the one state answered without
+        // asking the page anything, and a quiet page is exactly how an agent-driven tab looks.
+        if (agentKeptAlive) return BusyState.AGENT_ROUTED
         if (fullscreenBlocks) return BusyState.FULLSCREEN
         if (handle == null) return BusyState.IDLE
         // Dispatchers.IO is what carries the weight here: poppedOutOrNull is a blocking
@@ -3802,6 +3816,7 @@ internal fun FluckBrowserTabContent(
                                 TabHibernation.busyStateFor(
                                     hoistedState.fullscreenBlocksHibernation,
                                     browserHandle,
+                                    tabId = tabId,
                                 )
                             },
                             onWait = { delay(it) },
