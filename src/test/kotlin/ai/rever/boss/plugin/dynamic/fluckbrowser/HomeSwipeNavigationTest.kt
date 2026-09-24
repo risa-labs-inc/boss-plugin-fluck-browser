@@ -21,6 +21,413 @@ import kotlin.test.assertTrue
  * whole physical gesture and then ends it, mirroring what [HomeSwipeSurface] actually does.
  */
 class HomeSwipeNavigationTest {
+    @Test
+    fun `only an absent phase property selects legacy host compatibility`() {
+        assertEquals(HomeSwipePhaseSupport.LEGACY, homeSwipePhaseSupport(null, isMac = true))
+        assertEquals(HomeSwipePhaseSupport.NATIVE, homeSwipePhaseSupport("unavailable", isMac = true))
+        assertEquals(HomeSwipePhaseSupport.NATIVE, homeSwipePhaseSupport("41:active:1000", isMac = true))
+    }
+
+    @Test
+    fun `updated host unavailable fails closed and active contact keeps waiting`() {
+        val completed =
+            HomeSwipeGesture(
+                accumX = -COMMIT_UNITS * 2,
+                events = 12,
+                direction = HomeSwipeDirection.BACK,
+                nativeGestureId = "41",
+            )
+        assertEquals(
+            HomeSwipePhaseAction.CANCEL,
+            homeSwipePhaseAction(completed, parseHomeSwipeNativePhase("unavailable")),
+        )
+        assertEquals(
+            HomeSwipePhaseAction.WAIT,
+            homeSwipePhaseAction(completed, parseHomeSwipeNativePhase("41:active:1000")),
+            "crossing the threshold while fingers remain down must never commit",
+        )
+    }
+
+    @Test
+    fun `native phase contract distinguishes release cancellation and unavailable`() {
+        assertEquals(
+            HomeSwipeNativePhase("41", HomeSwipeNativeState.ACTIVE, beganAtEpochMs = 1_000L),
+            parseHomeSwipeNativePhase("41:active:1000"),
+        )
+        assertEquals(
+            HomeSwipeNativePhase(
+                "42",
+                HomeSwipeNativeState.ACTIVE,
+                beganAtEpochMs = 2_000L,
+                previousTerminatedAtEpochMs = 1_960L,
+            ),
+            parseHomeSwipeNativePhase("42:active:2000:1960"),
+        )
+        assertEquals(
+            HomeSwipeNativePhase(
+                "41",
+                HomeSwipeNativeState.ENDED,
+                finalX = -120.0,
+                verticalPath = 8.0,
+                nativeRejected = false,
+                reversed = false,
+            ),
+            parseHomeSwipeNativePhase("41:ended:-120.0:8.0:false:false"),
+        )
+        assertEquals(
+            HomeSwipeNativePhase(
+                "41",
+                HomeSwipeNativeState.CANCELLED,
+                finalX = -120.0,
+                verticalPath = 8.0,
+                nativeRejected = true,
+                reversed = true,
+            ),
+            parseHomeSwipeNativePhase("41:cancelled:-120.0:8.0:true:true"),
+        )
+        assertEquals(HomeSwipeNativeState.UNAVAILABLE, parseHomeSwipeNativePhase("unavailable").state)
+        assertEquals(HomeSwipeNativeState.UNAVAILABLE, parseHomeSwipeNativePhase("broken").state)
+        assertEquals(HomeSwipeNativeState.UNAVAILABLE, parseHomeSwipeNativePhase("42:active:2000:broken").state)
+    }
+
+    @Test
+    fun `only a matching native end decides`() {
+        val back = HomeSwipeGesture(direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        assertEquals(
+            HomeSwipePhaseAction.DECIDE,
+            homeSwipePhaseAction(back, parseHomeSwipeNativePhase("41:ended:-120:0:false:false")),
+        )
+        assertEquals(
+            HomeSwipePhaseAction.CANCEL,
+            homeSwipePhaseAction(back, parseHomeSwipeNativePhase("41:cancelled:-120:0:true:true")),
+        )
+        assertEquals(
+            HomeSwipePhaseAction.CANCEL,
+            homeSwipePhaseAction(back, parseHomeSwipeNativePhase("42:active:2000")),
+            "a new contact id must cancel stale progress",
+        )
+        assertEquals(
+            HomeSwipePhaseAction.CANCEL,
+            homeSwipePhaseAction(back, parseHomeSwipeNativePhase("unavailable")),
+        )
+        assertEquals(
+            HomeSwipePhaseAction.WAIT,
+            homeSwipePhaseAction(back, parseHomeSwipeNativePhase("41:active:1000")),
+        )
+        assertEquals(
+            HomeSwipePhaseAction.CANCEL,
+            homeSwipePhaseAction(back, parseHomeSwipeNativePhase("41:ended:120:0:false:true")),
+            "native final reversal cancels even if queued Compose events still point back",
+        )
+        assertEquals(
+            HomeSwipePhaseAction.DECIDE,
+            homeSwipePhaseAction(back, parseHomeSwipeNativePhase("41:ended:-20:0:false:false")),
+            "the matching release reaches the normal home-distance decision",
+        )
+    }
+
+    @Test
+    fun `queued wheel from before the active native contact is ignored`() {
+        val active = parseHomeSwipeNativePhase("42:active:2000")
+        assertFalse(homeSwipeEventBelongsToPhase(2_000L - NATIVE_CLOCK_SKEW_MS - 1, active))
+        assertTrue(homeSwipeEventBelongsToPhase(2_000L - NATIVE_CLOCK_SKEW_MS, active))
+        assertTrue(homeSwipeEventBelongsToPhase(1_995L, active), "independent native clocks may differ by several milliseconds")
+        assertTrue(homeSwipeEventBelongsToPhase(1_999L, active), "one millisecond clock boundary is tolerated")
+        assertTrue(homeSwipeEventBelongsToPhase(2_000L, active))
+        assertFalse(homeSwipeEventBelongsToPhase(null, active), "unknown event time fails closed")
+    }
+
+    @Test
+    fun `native final distance overrides queued Compose progress at release`() {
+        val pending =
+            HomeSwipeGesture(
+                accumX = -COMMIT_UNITS * 2,
+                events = 12,
+                direction = HomeSwipeDirection.BACK,
+                nativeGestureId = "41",
+            )
+        val eased = homeSwipeWithNativeFinal(pending, parseHomeSwipeNativePhase("41:ended:-20:0:false:false"))
+        assertNull(endHomeSwipe(eased), "20 native points are only 2 home units")
+
+        val committed = homeSwipeWithNativeFinal(pending, parseHomeSwipeNativePhase("41:ended:-40:0:false:false"))
+        assertEquals(HomeSwipeDirection.BACK, endHomeSwipe(committed))
+    }
+
+    @Test
+    fun `phase source uses the same capability gate for events and timers`() {
+        var raw: String? = null
+        val source = HomeSwipePhaseSource(read = { raw }, isMac = true)
+        assertEquals(HomeSwipePhaseSupport.LEGACY, source.support())
+        assertNull(source.raw())
+        raw = "41:active:1000"
+        assertEquals(HomeSwipePhaseSupport.NATIVE, source.support())
+        assertEquals("41", source.phase(null).id)
+        raw = "unavailable"
+        assertEquals(HomeSwipePhaseSupport.NATIVE, source.support())
+        assertEquals(HomeSwipeNativeState.UNAVAILABLE, source.phase(null).state)
+        val otherPlatform = HomeSwipePhaseSource(read = { raw }, isMac = false)
+        assertEquals(HomeSwipePhaseSupport.LEGACY, otherPlatform.support())
+        assertNull(otherPlatform.raw())
+    }
+
+    @Test
+    fun `exit abandons an observed contact but not an unrelated global contact`() {
+        val guard = HomeSwipeContactGuard()
+        val phase = parseHomeSwipeNativePhase("41:active:1000")
+        guard.cancel(HomeSwipeGesture())
+        assertTrue(guard.accepts(phase), "plain pointer Exit does not own a global contact")
+        guard.cancel(HomeSwipeGesture(nativeGestureId = "41"))
+        repeat(20) { assertFalse(guard.accepts(phase)) }
+        assertTrue(guard.accepts(parseHomeSwipeNativePhase("42:active:2000")))
+        assertFalse(guard.accepts(parseHomeSwipeNativePhase("41:ended:-100:0:false:false")))
+    }
+
+    @Test
+    fun `abandoning an old contact does not reject the next contact`() {
+        val guard = HomeSwipeContactGuard()
+        val next = parseHomeSwipeNativePhase("42:active:2000")
+        guard.cancel(HomeSwipeGesture(nativeGestureId = "41"))
+        assertTrue(guard.accepts(next))
+        assertFalse(guard.accepts(parseHomeSwipeNativePhase("41:active:1000")))
+    }
+
+    @Test
+    fun `watchdog cancels a missing release without navigation or resurrection`() {
+        val gesture = HomeSwipeGesture(accumX = -10f, events = 12,
+            direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        val phase = parseHomeSwipeNativePhase("41:active:1000")
+        assertEquals(HomeSwipePhaseAction.WAIT, homeSwipeNativeWatchdogAction(gesture, phase, NATIVE_STALE_MS - 1))
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipeNativeWatchdogAction(gesture, phase, NATIVE_STALE_MS))
+        val guard = HomeSwipeContactGuard()
+        guard.cancel(gesture)
+        assertFalse(guard.accepts(phase))
+        assertEquals(HomeSwipePhaseAction.DECIDE, homeSwipeNativeWatchdogAction(gesture,
+            parseHomeSwipeNativePhase("41:ended:-100:0:false:false"), NATIVE_STALE_MS))
+    }
+
+    @Test
+    fun `phase format permits additive extensions but rejects invalid displacement`() {
+        assertEquals(
+            parseHomeSwipeNativePhase("41:active:1000:900"),
+            parseHomeSwipeNativePhase("41:active:1000:900:extra"),
+        )
+        assertEquals(parseHomeSwipeNativePhase("41:ended:-40:0:false:false"),
+            parseHomeSwipeNativePhase("41:ended:-40:0:false:false:extra"))
+        for (raw in listOf("41:ended:NaN:0:false:false", "41:ended:-40:Infinity:false:false", "41:ended:-40:-1:false:false")) {
+            assertEquals(HomeSwipeNativeState.UNAVAILABLE, parseHomeSwipeNativePhase(raw).state)
+        }
+    }
+
+    @Test
+    fun `native release preserves forward direction and consumed rejection`() {
+        val forward = HomeSwipeGesture(accumX = 4f, events = 12,
+            direction = HomeSwipeDirection.FORWARD, nativeGestureId = "41")
+        val phase = parseHomeSwipeNativePhase("41:ended:40:0:false:false")
+        assertEquals(HomeSwipeDirection.FORWARD, endHomeSwipe(homeSwipeWithNativeFinal(forward, phase)))
+        assertNull(endHomeSwipe(homeSwipeWithNativeFinal(forward.copy(rejected = true), phase)))
+        assertNull(endHomeSwipe(homeSwipeWithNativeFinal(forward,
+            parseHomeSwipeNativePhase("41:ended:40:100:false:false"))))
+    }
+
+    @Test
+    fun `home applies its own thresholds instead of page rejection`() {
+        val back = HomeSwipeGesture(accumX = -4f, events = 12,
+            direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        assertEquals(HomeSwipeDirection.BACK, endHomeSwipe(homeSwipeWithNativeFinal(back,
+            parseHomeSwipeNativePhase("41:ended:-40:0:true:false"))))
+    }
+
+    @Test
+    fun `native capability transition clears legacy state even without horizontal events`() {
+        for (legacy in listOf(
+            HomeSwipeGesture(rejected = true, lastEventAtMs = 1_000L),
+            HomeSwipeGesture(verticalPath = 100f, lastEventAtMs = 1_000L),
+        )) {
+            val next = advanceHomeSwipe(legacy, -1f, 0f, 1_001L, false, true, true, "41")
+            assertFalse(next.gesture.rejected)
+            assertEquals(0f, next.gesture.verticalPath)
+            assertEquals(1, next.gesture.events)
+            assertEquals("41", next.gesture.nativeGestureId)
+            assertNull(next.ended)
+        }
+    }
+
+    @Test
+    fun `legacy capability transition neither continues nor decides a native contact`() {
+        val native = HomeSwipeGesture(accumX = -10f, events = 12,
+            lastEventAtMs = 1_000L, direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        for (now in listOf(1_001L, 2_000L)) {
+            val next = advanceHomeSwipe(native, -1f, 0f, now, false, true, true)
+            assertEquals(1, next.gesture.events)
+            assertEquals(-1f, next.gesture.accumX)
+            assertNull(next.gesture.nativeGestureId)
+            assertNull(next.ended, "a capability change is not native release evidence")
+        }
+    }
+
+    @Test
+    fun `old watchdog cannot cancel or decide a replacement contact`() {
+        val next = HomeSwipeGesture(nativeGestureId = "42")
+        assertNull(homeSwipeOwnedWatchdogAction("41", next,
+            parseHomeSwipeNativePhase("unavailable"), NATIVE_STALE_MS, HomeSwipeContactGuard()))
+        assertNull(homeSwipeOwnedWatchdogAction("41", next,
+            parseHomeSwipeNativePhase("42:ended:40:0:false:false"), 0, HomeSwipeContactGuard()))
+    }
+
+    @Test
+    fun `scroll gate orders capability reset ownership and timestamp checks`() {
+        val guard = HomeSwipeContactGuard()
+        val legacy = HomeSwipeGesture(rejected = true)
+        assertEquals(HomeSwipeScrollGate(true, false, true), homeSwipeScrollGate(legacy, null, null, guard, true))
+        assertEquals(HomeSwipeScrollGate(false, true, true, "41"),
+            homeSwipeScrollGate(legacy, "41:active:1000", 1000, guard, true))
+        assertEquals(HomeSwipeScrollGate(false, true, false),
+            homeSwipeScrollGate(legacy, "unavailable", null, guard, true))
+        val native = HomeSwipeGesture(nativeGestureId = "41")
+        assertEquals(HomeSwipeScrollGate(true, true, true), homeSwipeScrollGate(native, null, null, guard, true))
+        assertEquals(HomeSwipeScrollGate(false, false, false, "41", true),
+            homeSwipeScrollGate(native, "41:active:1000", null, guard, true))
+        guard.cancel(native)
+        assertEquals(HomeSwipeScrollGate(false, false, false),
+            homeSwipeScrollGate(native, "41:active:1000", null, guard, true))
+        assertTrue(homeSwipeScrollGate(native, "42:active:2000", 2000, guard, true).accept)
+        assertTrue(homeSwipeScrollGate(native, "unavailable", null, guard, false).legacy)
+    }
+
+    @Test
+    fun `active cutoff rejects prior contact tail and accepts later dispatch`() {
+        val phase = parseHomeSwipeNativePhase("42:active:2000:1960")
+        assertFalse(homeSwipeEventBelongsToPhase(1_920, phase))
+        assertFalse(homeSwipeEventBelongsToPhase(1_960, phase), "the termination boundary is exclusive")
+        assertTrue(homeSwipeEventBelongsToPhase(1_961, phase))
+        assertTrue(homeSwipeEventBelongsToPhase(2_000, phase))
+        val rolledBackClock = parseHomeSwipeNativePhase("42:active:1900:1960")
+        assertFalse(homeSwipeEventBelongsToPhase(1_950, rolledBackClock))
+        assertTrue(homeSwipeEventBelongsToPhase(1_961, rolledBackClock))
+    }
+
+    @Test
+    fun `unused native rejection encoding does not invalidate native release`() {
+        assertEquals(HomeSwipeNativeState.ENDED, parseHomeSwipeNativePhase("41:ended:40:0:1:false").state)
+        assertEquals(HomeSwipeNativeState.UNAVAILABLE, parseHomeSwipeNativePhase("41:ended:40:0:1:True").state)
+    }
+
+    @Test
+    fun `native final direction is mapped from Compose rather than native coordinate sign`() {
+        val back = HomeSwipeGesture(accumX = -4f, events = 12,
+            direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        assertEquals(HomeSwipeDirection.BACK, endHomeSwipe(homeSwipeWithNativeFinal(back,
+            parseHomeSwipeNativePhase("41:ended:40:0:false:false"))))
+        assertNull(endHomeSwipe(homeSwipeWithNativeFinal(back,
+            parseHomeSwipeNativePhase("41:ended:40:0:false:true"))))
+    }
+
+    @Test
+    fun `native gate advance release and cancellation compose into one navigation`() {
+        val guard = HomeSwipeContactGuard()
+        var gesture = HomeSwipeGesture()
+        val navigated = mutableListOf<HomeSwipeDirection>()
+        fun wheel(id: String) {
+            val gate = homeSwipeScrollGate(gesture, "$id:active:1000", 1000, guard, true)
+            if (gate.reset) {
+                guard.cancel(gesture)
+                gesture = HomeSwipeGesture()
+            }
+            if (!gate.accept) return
+            gesture = advanceHomeSwipe(gesture, -1f, 0f, 1000, false, true, true, gate.nativeId).gesture
+        }
+        repeat(4) { wheel("41") }
+        val ended = parseHomeSwipeNativePhase("41:ended:40:0:false:false")
+        assertEquals(HomeSwipePhaseAction.DECIDE, homeSwipeOwnedWatchdogAction("41", gesture, ended, 0, guard))
+        val finished = homeSwipeWithNativeFinal(gesture, ended)
+        guard.cancel(gesture)
+        gesture = HomeSwipeGesture()
+        endHomeSwipe(finished)?.let(navigated::add)
+        repeat(4) { wheel("41") }
+        assertEquals(0, gesture.events, "a completed contact cannot replay")
+        repeat(4) { wheel("42") }
+        guard.cancel(gesture) // Exit after observed movement abandons the entire contact.
+        gesture = HomeSwipeGesture()
+        repeat(4) { wheel("42") }
+        assertEquals(0, gesture.events)
+        assertEquals(listOf(HomeSwipeDirection.BACK), navigated)
+        wheel("43")
+        assertEquals(1, gesture.events, "a new contact is free to begin")
+    }
+
+    @Test
+    fun `previous cutoff prevents opposite tail from choosing the new contact direction`() {
+        fun navigate(activeWire: String): HomeSwipeDirection? {
+            val guard = HomeSwipeContactGuard()
+            var gesture = HomeSwipeGesture()
+            fun sample(deltaX: Float, whenMs: Long) {
+                val prepared = prepareHomeSwipeScroll(
+                    gesture, activeWire, { "41:ended:100:0:false:false" },
+                    whenMs, guard, true, true,
+                )
+                gesture = prepared.gesture
+                if (!prepared.gate.accept) return
+                gesture = advanceHomeSwipe(
+                    gesture, deltaX, 0f, whenMs, false, true, true, prepared.gate.nativeId,
+                ).gesture
+            }
+            repeat(3) { sample(2f, 1_920) }
+            repeat(5) { sample(-1f, 2_010 + it.toLong()) }
+            return prepareHomeSwipeScroll(
+                gesture, "42:ended:-100:0:false:false", { null }, null, guard, true, true,
+            ).navigate
+        }
+
+        assertEquals(
+            HomeSwipeDirection.FORWARD,
+            navigate("42:active:2000"),
+            "the old protocol demonstrates the queued-tail direction contamination",
+        )
+        assertEquals(
+            HomeSwipeDirection.BACK,
+            navigate("42:active:2000:1960"),
+            "the cutoff admits only contact 42's backward samples",
+        )
+    }
+
+    @Test
+    fun `rejected contact cannot decide from replayed state on pointer or watchdog paths`() {
+        val guard = HomeSwipeContactGuard()
+        val original = HomeSwipeGesture(
+            accumX = -5f, events = 6, direction = HomeSwipeDirection.BACK, nativeGestureId = "41",
+        )
+        guard.cancel(original)
+        guard.cancel(original.copy(nativeGestureId = "42"))
+        assertTrue(guard.rejected("41"), "newer cancellation must not forget an older contact")
+        val phase = parseHomeSwipeNativePhase("41:ended:-100:0:false:false")
+        val replay = prepareHomeSwipeScroll(original, "43:active:3000", { "41:ended:-100:0:false:false" },
+            3_000, guard, true, true)
+        assertNull(replay.navigate)
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipeOwnedWatchdogAction(
+            "41", original, phase, 0, guard, reliableLifecycle = true,
+        ))
+    }
+
+    @Test
+    fun `native final data cannot erase vertical travel already observed locally`() {
+        val pending = HomeSwipeGesture(accumX = -10f, verticalPath = 3f, events = 12,
+            direction = HomeSwipeDirection.BACK, nativeGestureId = "41")
+        val finished = homeSwipeWithNativeFinal(pending,
+            parseHomeSwipeNativePhase("41:ended:35:0:false:false"))
+        assertEquals(3f, finished.verticalPath)
+        assertNull(endHomeSwipe(finished), "local vertical evidence still rejects the narrowed release")
+    }
+
+    @Test
+    fun `split-view cancellation rejects the same contact on another home surface`() {
+        val firstSurface = HomeSwipeContacts.guard
+        val secondSurface = HomeSwipeContacts.guard
+        firstSurface.cancel(HomeSwipeGesture(nativeGestureId = "split-41"))
+        val tail = homeSwipeScrollGate(HomeSwipeGesture(), "split-41:active:1000", 1000, secondSurface, true)
+        assertFalse(tail.accept, "a second surface cannot use the cancelled contact's full displacement")
+        assertTrue(homeSwipeScrollGate(HomeSwipeGesture(), "split-42:active:2000", 2000, secondSurface, true).accept)
+    }
+
     /** One scroll event, as the surface would see it. */
     private data class Wheel(
         val dx: Float,
@@ -35,7 +442,7 @@ class HomeSwipeNavigationTest {
         val last: HomeSwipeStep,
     )
 
-    /** Fold one continuous physical gesture and end it, exactly as [HomeSwipeSurface] would on a timeout or pointer exit. */
+    /** Fold one gesture and end it as legacy compatibility or a matching native release would. */
     private fun run(
         events: List<Wheel>,
         canGoBack: Boolean = true,
@@ -62,9 +469,8 @@ class HomeSwipeNavigationTest {
     }
 
     /**
-     * Like [run], but modelling [HomeSwipeSurface]'s own end-of-gesture GATE as well as the
-     * decision - the surface does not call [endHomeSwipe] unconditionally, it arms a timer that
-     * fires only under a condition, and that condition is the part [run] cannot see.
+     * Like [run], but modelling the legacy-host compatibility timer's gate as well as its
+     * decision. Native-capable hosts do not use this timer.
      *
      * Worth a second harness because the gate is where a whole gesture can be lost without
      * [endHomeSwipe] ever being asked: the gate used to be "something is drawn", which an event
@@ -97,7 +503,7 @@ class HomeSwipeNavigationTest {
     }
 
     private companion object {
-        /** What [HomeSwipeSurface]'s `LaunchedEffect` arms on today. */
+        /** What the legacy-host compatibility effect arms on. */
         val ARMED_FROM_GESTURE: (HomeSwipeGesture, HomeSwipeStep) -> Boolean = { gesture, _ -> gesture.events > 0 }
 
         /**
@@ -115,8 +521,8 @@ class HomeSwipeNavigationTest {
     }
 
     /**
-     * Models [HomeSwipeSurface]'s Scroll handler end to end: fold each event, decide any gesture
-     * the event's own lateness retired, and apply the end-of-gesture gate once the stream stops.
+     * Models [HomeSwipeSurface]'s legacy-host Scroll handler end to end: fold each event, decide
+     * any gesture the event's own lateness retired, and apply the timer gate once the stream stops.
      * Returns every navigation in order.
      *
      * The difference from [runGestures] is the whole point. That harness ends each gesture itself
@@ -161,7 +567,7 @@ class HomeSwipeNavigationTest {
      * Unlike [run], state is NOT reset to a fresh [HomeSwipeGesture] between calls: the point is
      * to prove [advanceHomeSwipe]'s own gap check (`continuing`) recognises the second swipe's
      * first event arrives after [GESTURE_GAP_MS] and starts it clean on its own, the same way
-     * production relies on it rather than on [HomeSwipeSurface] having reset first.
+     * legacy compatibility relies on it rather than on [HomeSwipeSurface] having reset first.
      */
     private fun runGestures(vararg physicalGestures: List<Wheel>): List<HomeSwipeDirection> {
         var gesture = HomeSwipeGesture()
@@ -203,7 +609,75 @@ class HomeSwipeNavigationTest {
         startMs: Long = 1_000L,
     ) = (0 until count).map { Wheel(steps * step, dySteps * step, consumed, startMs + it) }
 
+    @Test
+    fun `quiet time does not split one native finger contact`() {
+        var gesture = HomeSwipeGesture()
+        swipe(5, -1f, startMs = 1_000L).forEach { event ->
+            gesture =
+                advanceHomeSwipe(
+                    gesture,
+                    event.dx,
+                    event.dy,
+                    event.atMs,
+                    event.consumed,
+                    canGoBack = true,
+                    canGoForward = true,
+                    nativeGestureId = "7",
+                ).gesture
+        }
+        val afterPause =
+            advanceHomeSwipe(
+                gesture,
+                deltaX = -step,
+                deltaY = 0f,
+                nowMs = 1_000L + GESTURE_GAP_MS + 500,
+                consumed = false,
+                canGoBack = true,
+                canGoForward = true,
+                nativeGestureId = "7",
+            )
+        assertEquals(6, afterPause.gesture.events)
+        assertNull(afterPause.ended, "native contact identity, not idle time, ends the gesture")
+    }
+
+    @Test
+    fun `a changed native id cancels stale progress without deciding it`() {
+        var gesture = HomeSwipeGesture()
+        swipe(12, -1f).forEach { event ->
+            gesture =
+                advanceHomeSwipe(
+                    gesture,
+                    event.dx,
+                    event.dy,
+                    event.atMs,
+                    event.consumed,
+                    canGoBack = true,
+                    canGoForward = true,
+                    nativeGestureId = "7",
+                ).gesture
+        }
+        val next =
+            advanceHomeSwipe(
+                gesture,
+                deltaX = step,
+                deltaY = 0f,
+                nowMs = 2_000L,
+                consumed = false,
+                canGoBack = true,
+                canGoForward = true,
+                nativeGestureId = "8",
+            )
+        assertEquals("8", next.gesture.nativeGestureId)
+        assertEquals(1, next.gesture.events)
+        assertNull(next.ended, "an id change cancels; only matching ended may decide")
+    }
+
     // --- gestures that navigate ---------------------------------------------------------------
+
+    @Test
+    fun `legacy timeout harness navigates without native contact identity`() {
+        assertEquals(listOf(HomeSwipeDirection.BACK), runSurface(swipe(12, -1f)))
+    }
 
     @Test
     fun `a real swipe goes back once`() {
@@ -451,12 +925,12 @@ class HomeSwipeNavigationTest {
         assertEquals(HomeSwipeDirection.BACK, run(swipe(MIN_EVENTS, -5f)).navigated)
     }
 
-    // --- the window between advanceHomeSwipe retiring a gesture and the timer firing -----------
+    // --- legacy host: the window between retiring a gesture and the timer firing ---------------
 
     /**
-     * `advanceHomeSwipe` retires a gesture at [GESTURE_GAP_MS]; the surface's timer fires 60ms
-     * later. An event arriving in between cancels the pending timer and starts a fresh gesture, so
-     * a swipe that had already earned its navigation used to vanish.
+     * On a legacy host, `advanceHomeSwipe` retires a gesture at [GESTURE_GAP_MS] and the
+     * compatibility timer fires 60ms later. An event arriving between them cancels the pending
+     * timer and starts a fresh gesture, so a swipe that earned navigation used to vanish.
      *
      * Not a two-swipe edge case: a trackpad emits nothing at all while the fingers are stationary,
      * so this is swipe past the threshold, hold ~150ms, nudge once before letting go.
@@ -583,5 +1057,166 @@ class HomeSwipeNavigationTest {
         val full = run(swipe(10, -1f))
         assertEquals(HomeSwipeDirection.BACK, full.navigated)
         assertEquals(1f, full.last.progress, "the puck is fully filled in by the time the gesture ends")
+    }
+
+    @Test
+    fun `terminal history recovers a release overwritten by rapid contacts`() {
+        val source = HomeSwipePhaseSource(
+            read = { "43:active:3000" },
+            isMac = true,
+            readTerminals = { "41:ended:-100:0:false:false;42:cancelled:-20:0:true:false" },
+        )
+        val first = HomeSwipeGesture(nativeGestureId = "41")
+        assertEquals(HomeSwipePhaseAction.DECIDE, homeSwipePhaseAction(first, source.phase("41")))
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipePhaseAction(first.copy(nativeGestureId = "42"), source.phase("42")))
+        // Repeated reads and another surface do not consume the retained release.
+        assertEquals(source.phase("41"), source.phase("41"))
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipePhaseAction(first.copy(nativeGestureId = "1"), source.phase("1")))
+    }
+
+    @Test
+    fun `phase source reads raw before lazy history and skips history on early paths`() {
+        val reads = mutableListOf<String>()
+        var raw = "41:active:1000"
+        val source = HomeSwipePhaseSource(
+            read = { reads += "raw"; raw },
+            isMac = true,
+            readTerminals = { reads += "history"; "41:ended:-100:0:false:false" },
+        )
+
+        source.phase("41")
+        assertEquals(listOf("raw"), reads)
+        reads.clear()
+        raw = "42:active:2000"
+        assertEquals(HomeSwipeNativeState.ENDED, source.phase("41").state)
+        assertEquals(listOf("raw", "history"), reads)
+        reads.clear()
+        source.phase(null)
+        assertEquals(listOf("raw"), reads)
+        reads.clear()
+        raw = "unavailable"
+        source.phase("41")
+        assertEquals(listOf("raw"), reads)
+    }
+
+    @Test
+    fun `terminal history never overrides current cancellation or unavailable observation`() {
+        val history = "41:ended:-100:0:false:false"
+        val gesture = HomeSwipeGesture(nativeGestureId = "41")
+        for (raw in listOf("41:cancelled:0:0:true:false", "unavailable", "bad")) {
+            val phase = homeSwipeReconciledPhase("41", raw) { history }
+            assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipePhaseAction(gesture, phase))
+        }
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipePhaseAction(
+            gesture, homeSwipeReconciledPhase("41", "42:active:3000") { "41:ended:broken" },
+        ))
+    }
+
+    @Test
+    fun `queued terminal tail preserves current accumulator until release decision`() {
+        val gesture = HomeSwipeGesture(nativeGestureId = "41")
+        val gate = homeSwipeScrollGate(gesture, "41:ended:-100:0:false:false", 2000, HomeSwipeContactGuard(), true)
+        assertEquals(HomeSwipeScrollGate(false, false, false), gate)
+        val malformed = homeSwipeScrollGate(gesture, "41:ended:bad", 2000, HomeSwipeContactGuard(), true)
+        assertEquals(HomeSwipeScrollGate(false, true, false), malformed)
+    }
+
+    @Test
+    fun `reliable native lifecycle preserves a stationary hold beyond the old watchdog`() {
+        val gesture = HomeSwipeGesture(nativeGestureId = "41")
+        val active = parseHomeSwipeNativePhase("41:active:1000")
+        assertEquals(HomeSwipePhaseAction.WAIT, homeSwipeOwnedWatchdogAction(
+            "41", gesture, active, 60_000, HomeSwipeContactGuard(), reliableLifecycle = true,
+        ))
+        assertEquals(HomeSwipePhaseAction.CANCEL, homeSwipeOwnedWatchdogAction(
+            "41", gesture, active, 60_000, HomeSwipeContactGuard(),
+        ))
+        val ended = parseHomeSwipeNativePhase("41:ended:-100:0:false:false")
+        assertEquals(HomeSwipePhaseAction.DECIDE, homeSwipeOwnedWatchdogAction(
+            "41", gesture, ended, 60_000, HomeSwipeContactGuard(), reliableLifecycle = true,
+        ))
+    }
+
+    @Test
+    fun `empty terminal history marks first stationary hold as reliable`() {
+        val source = HomeSwipePhaseSource(
+            read = { "41:active:1000" },
+            isMac = true,
+            readTerminals = { "" },
+        )
+        val gesture = HomeSwipeGesture(nativeGestureId = "41")
+        assertTrue(source.hasTerminalHistory())
+        assertEquals(HomeSwipePhaseAction.WAIT, homeSwipeOwnedWatchdogAction(
+            "41", gesture, source.phase("41"), 60_000, HomeSwipeContactGuard(),
+            reliableLifecycle = source.hasTerminalHistory(),
+        ))
+    }
+
+    @Test
+    fun `production pointer preparation decides retained release before resetting for new contact`() {
+        val gesture = HomeSwipeGesture(
+            accumX = -5f, events = 6, direction = HomeSwipeDirection.BACK, nativeGestureId = "41",
+        )
+        val guard = HomeSwipeContactGuard()
+        val first = prepareHomeSwipeScroll(
+            gesture, "42:active:2000", { "41:ended:-100:0:false:false" }, 2000, guard, true, true,
+        )
+        assertEquals(HomeSwipeDirection.BACK, first.navigate)
+        assertTrue(first.clearAffordance)
+        assertFalse(first.gate.accept, "the event must not start a new contact after navigation")
+        assertEquals(HomeSwipeGesture(), first.gesture)
+        val duplicate = prepareHomeSwipeScroll(
+            first.gesture, "41:ended:-100:0:false:false", { null }, 2000, guard, true, true,
+        )
+        assertNull(duplicate.navigate)
+    }
+
+    @Test
+    fun `retained terminal release navigates despite missing current event timestamp`() {
+        val gesture = HomeSwipeGesture(
+            accumX = -5f, events = 6, direction = HomeSwipeDirection.BACK, nativeGestureId = "41",
+        )
+        val prepared = prepareHomeSwipeScroll(
+            gesture, "42:active:2000", { "41:ended:-100:0:false:false" }, null,
+            HomeSwipeContactGuard(), true, true,
+        )
+        assertEquals(HomeSwipeDirection.BACK, prepared.navigate)
+        assertFalse(prepared.gate.accept)
+    }
+
+    @Test
+    fun `production pointer preparation keeps the first new sample when prior release did not qualify`() {
+        val gesture = HomeSwipeGesture(
+            accumX = -5f, events = 6, direction = HomeSwipeDirection.BACK, nativeGestureId = "41",
+        )
+        for (terminal in listOf("41:ended:-20:0:false:false", "41:cancelled:-100:0:false:false", "garbage")) {
+            val prepared = prepareHomeSwipeScroll(
+                gesture, "42:active:2000", { terminal }, 2000, HomeSwipeContactGuard(), true, true,
+            )
+            assertNull(prepared.navigate)
+            assertTrue(prepared.gate.accept)
+            assertEquals("42", prepared.gate.nativeId)
+            assertEquals(HomeSwipeGesture(), prepared.gesture)
+            assertTrue(prepared.clearAffordance)
+        }
+    }
+
+    @Test
+    fun `production pointer preparation preserves timestamp rejection and disabled release policy`() {
+        val gesture = HomeSwipeGesture(
+            accumX = -5f, events = 6, direction = HomeSwipeDirection.BACK, nativeGestureId = "41",
+        )
+        val early = prepareHomeSwipeScroll(
+            gesture, "41:active:2000", { null }, 1000, HomeSwipeContactGuard(), true, true,
+        )
+        assertEquals(gesture, early.gesture)
+        assertTrue(early.gate.timestampRejected)
+        assertFalse(early.clearAffordance)
+        val disabled = prepareHomeSwipeScroll(
+            gesture, "41:ended:-100:0:false:false", { null }, 2000, HomeSwipeContactGuard(), true, false,
+        )
+        assertNull(disabled.navigate)
+        assertFalse(disabled.gate.accept)
+        assertTrue(disabled.clearAffordance)
     }
 }

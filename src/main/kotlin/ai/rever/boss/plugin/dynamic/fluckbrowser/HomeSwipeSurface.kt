@@ -24,8 +24,21 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import java.awt.event.MouseEvent
+import java.util.logging.Logger
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+
+private val homeSwipeLog = Logger.getLogger("HomeSwipeSurface")
+
+/** These values are read by event handlers and effects, never during composition. */
+private class HomeSwipeRuntime {
+    var reportedTimestampFailure = false
+    var reportedUnavailable = false
+    var lastNativeEventNanos = System.nanoTime()
+}
 
 /** How far the puck travels as it slides in from behind its edge. */
 private val PUCK_TRAVEL_DP = 66.dp
@@ -47,6 +60,12 @@ private val PUCK_SIZE = 52.dp
  * horizontally scrolling tool row consumes while it has room and stops consuming at its edge,
  * and this sees an unconsumed event exactly when nothing on the page wanted it. Moving this to
  * the Initial pass, or onto the same node as the scroller, would take the row's scrolling away.
+ *
+ * On macOS, current hosts publish [SWIPE_PHASE_KEY], including `unavailable`, and only a
+ * matching native Ended phase commits. Hosts from before that property existed are still within
+ * this plugin's supported Boss range; absence alone selects the former quiet-gap detector for
+ * compatibility. Other platforms always retain that detector. On macOS `unavailable` never
+ * does, because that would weaken release semantics on a host which attempted native observation and could not provide it.
  */
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
@@ -56,51 +75,86 @@ internal fun HomeSwipeSurface(
     onNavigate: (HomeSwipeDirection) -> Unit,
     content: @Composable () -> Unit,
 ) {
+    val phaseSource = remember { HomeSwipePhaseSource() }
+    val contactGuard = HomeSwipeContacts.guard
+    val runtime = remember { HomeSwipeRuntime() }
     var gesture by remember { mutableStateOf(HomeSwipeGesture()) }
     var shown by remember { mutableStateOf<HomeSwipeDirection?>(null) }
     var progress by remember { mutableStateOf(0f) }
-    // Bumped on every scroll event so the clear below re-arms rather than accumulating.
-    var lastEventTick by remember { mutableStateOf(0L) }
+    // Used only by hosts predating the native phase property. Updated hosts never idle-commit.
+    var legacyEventTick by remember { mutableStateOf(0L) }
 
     // Drops the gesture and its affordance without deciding anything. The abandon path.
     fun cancelGesture() {
+        contactGuard.cancel(gesture)
         gesture = HomeSwipeGesture()
         shown = null
         progress = 0f
     }
 
-    // Runs one finished gesture through the decision and navigates if it earned it. The ONE
-    // place onNavigate is called, so neither pointer handler below calls it directly.
-    // homeSwipeEnabled() is read per gesture, not cached: the host republishes the key the moment
-    // the setting changes, and a relaunch to pick that up would be a poor answer.
-    fun decide(finished: HomeSwipeGesture) {
+    // Runs legacy and watchdog completions through the decision and navigates if earned. Retained
+    // releases are decided by prepareHomeSwipeScroll and dispatched directly by the pointer handler.
+    // homeSwipeEnabled() is read for each pointer event or asynchronous completion, not cached:
+    // the host republishes the key when the setting changes, so a relaunch is unnecessary.
+    fun decide(finished: HomeSwipeGesture, enabled: Boolean = homeSwipeEnabled()): Boolean {
         val direction = endHomeSwipe(finished)
-        if (direction != null && homeSwipeEnabled()) onNavigate(direction)
+        if (direction != null && enabled) {
+            onNavigate(direction)
+            return true
+        }
+        return false
     }
 
     // Ends the CURRENT gesture: decide, then clear.
-    fun endGesture() {
+    fun endGesture(phase: HomeSwipeNativePhase): Boolean {
+        val finished = homeSwipeWithNativeFinal(gesture, phase)
+        cancelGesture()
+        return decide(finished)
+    }
+
+    fun endLegacyGesture() {
         val finished = gesture
         cancelGesture()
         decide(finished)
     }
 
-    // The affordance's own end-of-gesture timer, and the ONLY place a swipe held past the commit
-    // distance actually navigates - see endHomeSwipe's KDoc for why that decision waits for here
-    // rather than firing the moment progress reaches 1 inside the Scroll handler below. The gap
-    // check inside advanceHomeSwipe cannot do this alone: it only runs when a NEXT event arrives,
-    // so a swipe held or abandoned would never end on its own. Keyed on the tick, so each event
-    // cancels the pending end and starts a new one.
-    // Gated on the GESTURE, not on the affordance. Gating on `shown` made ending the gesture
-    // depend on what the most recent event happened to look like: one event the detector had
-    // nothing to draw for (see advanceHomeSwipe's vertical-only branch) left the timer unarmed
-    // and nothing else ever ends a gesture, so the swipe died silently. `events > 0` is true for
-    // the whole life of any gesture that has seen a horizontal delta, which is every gesture
-    // endHomeSwipe could possibly say yes to.
-    LaunchedEffect(lastEventTick) {
+    // Compatibility for supported older hosts which publish no phase property at all. The
+    // explicit `unavailable` value belongs to an updated host and must remain fail-closed: using
+    // quiet time there would reintroduce commits before a real finger release.
+    LaunchedEffect(legacyEventTick) {
+        if (phaseSource.support() != HomeSwipePhaseSupport.LEGACY) {
+            return@LaunchedEffect
+        }
         if (gesture.events > 0) {
             delay(GESTURE_GAP_MS + 60)
-            endGesture()
+            if (phaseSource.support() == HomeSwipePhaseSupport.LEGACY) endLegacyGesture()
+        }
+    }
+
+    // The host observes the real macOS contact phase. Polling a process-local property avoids an
+    // API dependency between host and plugin while preserving the one fact wheel events omit:
+    // whether fingers are still down. Quiet time never commits and momentum never extends a swipe.
+    LaunchedEffect(gesture.nativeGestureId) {
+        val ownedId = gesture.nativeGestureId ?: return@LaunchedEffect
+        val reliableLifecycle = phaseSource.hasTerminalHistory()
+        while (isActive) {
+            delay(16)
+            val phase = phaseSource.phase(ownedId)
+            val idleMs = (System.nanoTime() - runtime.lastNativeEventNanos) / 1_000_000
+            val action = homeSwipeOwnedWatchdogAction(
+                ownedId, gesture, phase, idleMs, contactGuard, reliableLifecycle,
+            ) ?: break
+            when (action) {
+                HomeSwipePhaseAction.DECIDE -> {
+                    endGesture(phase)
+                    break
+                }
+                HomeSwipePhaseAction.CANCEL -> {
+                    cancelGesture()
+                    break
+                }
+                HomeSwipePhaseAction.WAIT -> Unit
+            }
         }
     }
 
@@ -110,6 +164,57 @@ internal fun HomeSwipeSurface(
                 .fillMaxSize()
                 .onPointerEvent(PointerEventType.Scroll) { event ->
                     val change = event.changes.firstOrNull() ?: return@onPointerEvent
+                    val rawPhase = phaseSource.raw()
+                    val enabled = homeSwipeEnabled()
+                    val nativeWhen = (event.nativeEvent as? MouseEvent)?.`when`
+                    val prepared = prepareHomeSwipeScroll(
+                        gesture, rawPhase, phaseSource::terminalHistory, nativeWhen, contactGuard,
+                        phaseSource.isMac, enabled,
+                    )
+                    gesture = prepared.gesture
+                    if (prepared.clearAffordance) {
+                        shown = null
+                        progress = 0f
+                    }
+                    prepared.navigate?.let {
+                        onNavigate(it)
+                        return@onPointerEvent
+                    }
+                    val gate = prepared.gate
+                    if (rawPhase == "unavailable" && enabled && !runtime.reportedUnavailable) {
+                        runtime.reportedUnavailable = true
+                        homeSwipeLog.warning(
+                            "Native home swipe unavailable. Check BOSS trackpad settings for release-detection status.",
+                        )
+                    }
+                    if (!gate.accept) {
+                        if (gate.timestampRejected && !runtime.reportedTimestampFailure) {
+                            runtime.reportedTimestampFailure = true
+                            homeSwipeLog.warning(
+                                "Native home swipe ignored: AWT event timestamp is missing or predates " +
+                                    "the host contact beyond the clock tolerance. Check host/AWT clock synchronization.",
+                            )
+                        }
+                        return@onPointerEvent
+                    }
+                    if (gate.legacy) {
+                        val step =
+                            advanceHomeSwipe(
+                                gesture = gesture,
+                                deltaX = change.scrollDelta.x,
+                                deltaY = change.scrollDelta.y,
+                                nowMs = System.currentTimeMillis(),
+                                consumed = change.isConsumed,
+                                canGoBack = canGoBack,
+                                canGoForward = canGoForward,
+                            )
+                        step.ended?.let { decide(it, enabled) }
+                        gesture = step.gesture
+                        legacyEventTick++
+                        shown = step.direction.takeIf { enabled }
+                        progress = step.progress
+                        return@onPointerEvent
+                    }
                     val step =
                         advanceHomeSwipe(
                             gesture = gesture,
@@ -119,27 +224,19 @@ internal fun HomeSwipeSurface(
                             consumed = change.isConsumed,
                             canGoBack = canGoBack,
                             canGoForward = canGoForward,
+                            nativeGestureId = gate.nativeId,
                         )
-                    // A gesture retired by THIS event's lateness has to be decided here: the
-                    // timer that would otherwise have ended it is about to be cancelled by the
-                    // tick below, and advanceHomeSwipe has already replaced it with a fresh one.
-                    // The window is real - advanceHomeSwipe retires at GESTURE_GAP_MS while the
-                    // timer fires 60ms later - and a trackpad emits nothing while the fingers are
-                    // still, so "swipe past the threshold, hold, nudge before releasing" lands in
-                    // it without any second physical swipe.
-                    step.ended?.let { decide(it) }
+                    runtime.lastNativeEventNanos = System.nanoTime()
                     gesture = step.gesture
-                    lastEventTick++
-                    val enabled = homeSwipeEnabled()
                     shown = step.direction.takeIf { enabled }
                     progress = step.progress
                 }
                 // A pointer that leaves the surface CANCELS the gesture; it does not end it.
                 // Exit is not a release: a macOS two-finger scroll moves no cursor, so the events
                 // that actually raise Exit mid-swipe are the cursor drifting off the home surface
-                // (onto the toolbar, under an overlay) - none of which mean the user let go. The
-                // GESTURE_GAP_MS timer above already covers every real release, so treating Exit
-                // as one only adds navigations nobody asked for.
+                // (onto the toolbar, under an overlay) - none of which mean the user let go.
+                // Native Ended is the only event that decides. Exit also latches cancellation
+                // process-wide, so moving to a sibling home surface cannot revive this contact.
                 .onPointerEvent(PointerEventType.Exit) { cancelGesture() },
     ) {
         content()
@@ -161,8 +258,7 @@ private fun HomeSwipeAffordance(
 ) {
     val eased by animateFloatAsState(progress, label = "homeSwipeProgress")
     val committed = eased >= 1f
-    val hiddenPx = with(androidx.compose.ui.platform.LocalDensity.current) { PUCK_HIDDEN_DP.toPx() }
-    val travelPx = with(androidx.compose.ui.platform.LocalDensity.current) { PUCK_TRAVEL_DP.toPx() }
+    val (hiddenPx, travelPx) = with(LocalDensity.current) { PUCK_HIDDEN_DP.toPx() to PUCK_TRAVEL_DP.toPx() }
     val sign = if (direction == HomeSwipeDirection.BACK) 1f else -1f
 
     Box(
