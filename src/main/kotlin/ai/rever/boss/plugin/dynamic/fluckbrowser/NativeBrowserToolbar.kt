@@ -26,8 +26,6 @@ internal fun NativeBrowserToolbar(
     share: (() -> Unit)?,
     address: BrowserAddressBarState,
 ): Boolean {
-    val windowId = LocalWindowIdProvider.current?.getWindowId()
-    val hostedWindow = windowId?.let(BrowserTitleBarBridge::isWindowHosted) == true
     if (handleId == null) return false
     val owner = remember(handleId) { Any() }
     SideEffect {
@@ -39,5 +37,15 @@ internal fun NativeBrowserToolbar(
     DisposableEffect(handleId) {
         onDispose { BrowserTitleBarBridge.remove(handleId, owner) }
     }
-    return BrowserTitleBarBridge.isHosted(handleId) || hostedWindow
+    return isNativeBrowserToolbarHosted(handleId)
+}
+
+/** The native bar follows the focused pane; inactive split panes share its window claim.
+ * Snapshot-backed bridge reads recompose both the toolbar and its popup on claim changes.
+ */
+@Composable
+internal fun isNativeBrowserToolbarHosted(handleId: String?): Boolean {
+    val windowId = LocalWindowIdProvider.current?.getWindowId()
+    return handleId != null && (BrowserTitleBarBridge.isHosted(handleId) ||
+        windowId?.let(BrowserTitleBarBridge::isWindowHosted) == true)
 }

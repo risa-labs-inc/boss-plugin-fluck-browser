@@ -4931,7 +4931,7 @@ internal fun FluckBrowserTabContent(
         // the list must follow the URL bar instead. focusable = false for the same reason - the field
         // has to keep focus for typing to keep filtering, and it owns the arrow keys and Escape.
         if (showUrlSuggestions && urlSuggestions.isNotEmpty() &&
-            browserHandle?.id?.let(BrowserTitleBarBridge::isHosted) != true) {
+            !isNativeBrowserToolbarHosted(browserHandle?.id)) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth(0.5f)
