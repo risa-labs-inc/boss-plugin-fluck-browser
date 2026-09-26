@@ -34,6 +34,7 @@ import ai.rever.boss.plugin.browser.BrowserConfig
 import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
 import ai.rever.boss.plugin.browser.BrowserHandle
 import ai.rever.boss.plugin.browser.BrowserService
+import ai.rever.boss.plugin.browser.BrowserTitleBarBridge
 import ai.rever.boss.plugin.browser.PopupNavigation
 import ai.rever.boss.plugin.dynamic.fluckbrowser.share.BrowserShareManager
 import androidx.compose.foundation.BorderStroke
@@ -148,6 +149,7 @@ import kotlin.math.abs
 private fun AddressBarRegistration(
     tabId: String,
     focusRequester: FocusRequester,
+    browserHandleId: String?,
     onFocus: () -> Unit,
 ) {
     // The effect keys on (tabId, windowId, panelActive) but CAPTURES onFocus, which is a fresh
@@ -155,6 +157,7 @@ private fun AddressBarRegistration(
     // remembered MutableState or lives on hoistedState - an argument about the caller, not about
     // this code. One line makes the effect independent of it.
     val currentOnFocus by rememberUpdatedState(onFocus)
+    val currentHandleId by rememberUpdatedState(browserHandleId)
     // A plain call, not a snapshot state read, and used as a DisposableEffect key: a window id
     // that changed WITHOUT a recomposition would leave a stale entry. Safe only because a tab
     // changing windows rebuilds this composition (the same fact the registry's identity keying is
@@ -196,7 +199,9 @@ private fun AddressBarRegistration(
                 // left is attach timing (the effect runs before the field is laid out on the first
                 // frame) and any future change that gates the toolbar, which is why the throw is
                 // caught rather than assumed away.
-                focusRequester.requestFocus()
+                if (currentHandleId?.let(BrowserTitleBarBridge::focus) != true) {
+                    focusRequester.requestFocus()
+                }
                 currentOnFocus()
             }
         onDispose { AddressBarFocusRegistry.unregister(token) }
@@ -658,7 +663,7 @@ private suspend fun resolveMiddleClickTarget(
  * - Domain-like patterns (github.com, example.org)
  * - Search queries (anything else)
  */
-private fun processUrlInput(input: String): String {
+internal fun processUrlInput(input: String): String {
     val trimmed = input.trim()
     val lowerTrimmed = trimmed.lowercase()
 
@@ -2806,6 +2811,7 @@ internal fun FluckBrowserTabContent(
     AddressBarRegistration(
         tabId = tabId,
         focusRequester = addressBarFocusRequester,
+        browserHandleId = browserHandle?.id,
     ) {
         // Claim the field BEFORE selecting it, or the navigation listener below wipes the
         // selection - see AddressBarUrlField.navigationWrite, which is the decision that
@@ -3893,6 +3899,7 @@ internal fun FluckBrowserTabContent(
         // system property (read inline so a recompose after toggling reflects it).
         val shareButtonEnabled = System.getProperty("boss.fluck.showShareButton") == "true"
         BrowserToolbar(
+            browserHandleId = browserHandle?.id,
             pageUrl = pageUrl,
             onShare = if (shareButtonEnabled) {
                 {
@@ -4923,7 +4930,8 @@ internal fun FluckBrowserTabContent(
         // AnchorBounds, not Cursor: the user is typing, so the pointer may be anywhere on screen and
         // the list must follow the URL bar instead. focusable = false for the same reason - the field
         // has to keep focus for typing to keep filtering, and it owns the arrow keys and Escape.
-        if (showUrlSuggestions && urlSuggestions.isNotEmpty()) {
+        if (showUrlSuggestions && urlSuggestions.isNotEmpty() &&
+            browserHandle?.id?.let(BrowserTitleBarBridge::isHosted) != true) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth(0.5f)
@@ -4935,126 +4943,18 @@ internal fun FluckBrowserTabContent(
                     focusable = false,
                     anchoring = BossPopupAnchoring.AnchorBounds,
                 ) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .wrapContentHeight(),
-                elevation = 8.dp,
-                backgroundColor = MaterialTheme.colors.surface
-            ) {
-                LazyColumn(
-                    state = dropdownListState,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 300.dp)
-                ) {
-                    // Keyed by URL so per-row state (the hover source below) follows the
-                    // entry rather than the slot — without it, deleting a row hands its
-                    // hover state to whichever suggestion shifts up into its place.
-                    itemsIndexed(urlSuggestions, key = { _, entry -> entry.url }) { index, entry ->
-                        val rowInteractionSource = remember { MutableInteractionSource() }
-                        val isRowHovered by rowInteractionSource.collectIsHoveredAsState()
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(
-                                    if (index == selectedDropdownIndex)
-                                        MaterialTheme.colors.primary.copy(alpha = 0.1f)
-                                    else
-                                        MaterialTheme.colors.surface
-                                )
-                                // clickable's own interaction source reports hover, so no
-                                // separate .hoverable() is needed.
-                                .clickable(
-                                    interactionSource = rowInteractionSource,
-                                    indication = LocalIndication.current
-                                ) {
-                                    urlBarText = TextFieldValue(entry.url, TextRange(entry.url.length))
-                                    showUrlSuggestions = false
-                                    autocompleteSuggestion = null
-                                    selectedDropdownIndex = -1
-                                    isUserEditingUrl = false
-                                    lastUserEditTime = 0L
-                                    typedSinceClaim = false
-                                    coroutineScope.launch {
-                                        browserHandle.onBrowser("loadUrl") { it.loadUrl(entry.url) }
-                                    }
-                                }
-                                .padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            // Icon to indicate type
-                            Icon(
-                                imageVector = if (entry.title.contains("Google Search", ignoreCase = true))
-                                    Icons.Filled.Search
-                                else
-                                    Icons.Outlined.Language,
-                                contentDescription = null,
-                                tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = entry.title.ifBlank { entry.domain },
-                                    style = MaterialTheme.typography.body2,
-                                    color = MaterialTheme.colors.onSurface,
-                                    maxLines = 1
-                                )
-                                Text(
-                                    text = entry.url,
-                                    style = MaterialTheme.typography.caption,
-                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
-                                    maxLines = 1
-                                )
-                            }
-                            // Forget this entry. Shown for the row under the pointer and
-                            // for the arrow-key selection (whose shift+Delete does the
-                            // same thing), so the affordance is discoverable either way.
-                            //
-                            // The slot is always laid out, even when the icon is hidden:
-                            // adding it on hover would re-truncate the title and URL under
-                            // the pointer. The whole 28.dp box is the target, not the
-                            // 16.dp glyph — this deletes, and it sits next to a row that
-                            // navigates on click.
-                            Box(
-                                modifier = Modifier.size(28.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (isRowHovered || index == selectedDropdownIndex) {
-                                    @OptIn(ExperimentalComposeUiApi::class)
-                                    Box(
-                                        modifier = Modifier
-                                            .size(28.dp)
-                                            // A pointer handler rather than .clickable:
-                                            // clickable is focusable, so clicking ✕ pulled
-                                            // focus out of the URL bar and onFocusLost then
-                                            // closed the whole dropdown 200ms later — you
-                                            // could delete one entry, then had to retype to
-                                            // delete a second. Primary button only: this
-                                            // deletes, so a right-click reaching for a
-                                            // context menu must not fire it.
-                                            .onPointerEvent(PointerEventType.Release) { event ->
-                                                if (event.button == PointerButton.Primary) {
-                                                    event.changes.forEach { it.consume() }
-                                                    onDeleteSuggestion(entry)
-                                                }
-                                            },
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Filled.Close,
-                                            contentDescription = "Remove from history",
-                                            tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
-                                            modifier = Modifier.size(16.dp)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+                    UrlSuggestionList(urlSuggestions, selectedDropdownIndex, dropdownListState,
+                        onSelect = { entry ->
+                            urlBarText = TextFieldValue(entry.url, TextRange(entry.url.length))
+                            showUrlSuggestions = false
+                            autocompleteSuggestion = null
+                            selectedDropdownIndex = -1
+                            isUserEditingUrl = false
+                            lastUserEditTime = 0L
+                            typedSinceClaim = false
+                            coroutineScope.launch { browserHandle.onBrowser("loadUrl") { it.loadUrl(entry.url) } }
+                        }, onDelete = onDeleteSuggestion,
+                    )
                 }
             }
         }
@@ -6038,6 +5938,7 @@ private fun ShareLinkRow(label: String, url: String) {
 
 @Composable
 internal fun BrowserToolbar(
+    browserHandleId: String? = null,
     urlBarText: TextFieldValue,
     // The loaded page's URL, which equals urlBarText except while the user is mid-edit. Only the
     // copy-link button reads it - everything else here is about the text box itself. See
@@ -6084,13 +5985,19 @@ internal fun BrowserToolbar(
      */
     addressBarFocusRequester: FocusRequester = remember { FocusRequester() }
 ) {
+    val nativeAddress = rememberNativeAddressBar(
+        urlBarText, autocompleteSuggestion, urlSuggestions, showUrlSuggestions, selectedDropdownIndex,
+        onUrlBarTextChange, onNavigate, onDismissSuggestions, onCancelUrlEditing,
+        onAcceptAutocomplete, onSelectedDropdownIndexChange, onSuggestionDeleted, onFocusLost,
+        suggestionsContent = { UrlSuggestionList(urlSuggestions, selectedDropdownIndex, dropdownListState,
+            onSuggestionSelected, onSuggestionDeleted, nativeStyle = true) },
+    )
+    if (NativeBrowserToolbar(
+            browserHandleId, pageUrl, canGoBack, canGoForward, isLoading, isBookmarked,
+            { onNavigate(processUrlInput(it)) }, onBack, onForward,
+            if (isLoading) onStop else onReload, onBookmarkClick, onShare, nativeAddress,
+        )) return
     val coroutineScope = rememberCoroutineScope()
-    // Auto-scroll to selected suggestion when using arrow keys
-    LaunchedEffect(selectedDropdownIndex) {
-        if (selectedDropdownIndex >= 0 && urlSuggestions.isNotEmpty()) {
-            dropdownListState.animateScrollToItem(selectedDropdownIndex)
-        }
-    }
 
     Row(
         modifier = Modifier
@@ -6249,18 +6156,9 @@ internal fun BrowserToolbar(
                                 //     was previewing. Enter should commit it instead of forcing the
                                 //     user to press Tab/Right first and then Enter.
                                 //  3. Plain typed text run through processUrlInput.
-                                val urlToLoad = when {
-                                    selectedDropdownIndex >= 0 && selectedDropdownIndex < urlSuggestions.size -> {
-                                        urlSuggestions[selectedDropdownIndex].url
-                                    }
-                                    autocompleteSuggestion != null && urlSuggestions.isNotEmpty() -> {
-                                        urlSuggestions.first().url
-                                    }
-                                    else -> {
-                                        val input = urlBarText.text.trim()
-                                        processUrlInput(input)
-                                    }
-                                }
+                                val urlToLoad = resolveAddressSubmission(
+                                    urlBarText.text, urlSuggestions, selectedDropdownIndex, autocompleteSuggestion != null,
+                                )
                                 onDismissSuggestions()
                                 onNavigate(urlToLoad)
                                 true
@@ -7319,4 +7217,135 @@ private fun FullscreenPlaceholder(
             }
         }
     }
+}
+
+/** Shared by the in-browser field and the native title-bar field. */
+@Composable
+internal fun UrlSuggestionList(
+    urlSuggestions: List<UrlHistoryEntry>,
+    selectedDropdownIndex: Int,
+    dropdownListState: LazyListState,
+    onSelect: (UrlHistoryEntry) -> Unit,
+    onDelete: (UrlHistoryEntry) -> Unit,
+    nativeStyle: Boolean = false,
+) {
+    LaunchedEffect(selectedDropdownIndex) {
+        if (selectedDropdownIndex in urlSuggestions.indices) {
+            dropdownListState.animateScrollToItem(selectedDropdownIndex)
+        }
+    }
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .wrapContentHeight(),
+                elevation = 8.dp,
+                shape = RoundedCornerShape(if (nativeStyle) 18.dp else 4.dp),
+                backgroundColor = MaterialTheme.colors.surface.copy(alpha = if (nativeStyle) 0.94f else 1f)
+            ) {
+                LazyColumn(
+                    state = dropdownListState,
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(if (nativeStyle) 8.dp else 0.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = if (nativeStyle) 400.dp else 300.dp)
+                ) {
+                    // Keyed by URL so per-row state (the hover source below) follows the
+                    // entry rather than the slot — without it, deleting a row hands its
+                    // hover state to whichever suggestion shifts up into its place.
+                    itemsIndexed(urlSuggestions, key = { _, entry -> entry.url }) { index, entry ->
+                        val rowInteractionSource = remember { MutableInteractionSource() }
+                        val isRowHovered by rowInteractionSource.collectIsHoveredAsState()
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(
+                                    if (index == selectedDropdownIndex)
+                                        MaterialTheme.colors.primary.copy(alpha = if (nativeStyle) 0.35f else 0.1f)
+                                    else
+                                        if (nativeStyle) Color.Transparent else MaterialTheme.colors.surface,
+                                    shape = RoundedCornerShape(if (nativeStyle) 10.dp else 0.dp)
+                                )
+                                // clickable's own interaction source reports hover, so no
+                                // separate .hoverable() is needed.
+                                .clickable(
+                                    interactionSource = rowInteractionSource,
+                                    indication = LocalIndication.current
+                                ) {
+                                    onSelect(entry)
+                                }
+                                .padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // Icon to indicate type
+                            Icon(
+                                imageVector = if (entry.title.contains("Google Search", ignoreCase = true))
+                                    Icons.Filled.Search
+                                else
+                                    Icons.Outlined.Language,
+                                contentDescription = null,
+                                tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = entry.title.ifBlank { entry.domain },
+                                    style = MaterialTheme.typography.body2,
+                                    color = MaterialTheme.colors.onSurface,
+                                    maxLines = 1
+                                )
+                                Text(
+                                    text = entry.url,
+                                    style = MaterialTheme.typography.caption,
+                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                    maxLines = 1
+                                )
+                            }
+                            // Forget this entry. Shown for the row under the pointer and
+                            // for the arrow-key selection (whose shift+Delete does the
+                            // same thing), so the affordance is discoverable either way.
+                            //
+                            // The slot is always laid out, even when the icon is hidden:
+                            // adding it on hover would re-truncate the title and URL under
+                            // the pointer. The whole 28.dp box is the target, not the
+                            // 16.dp glyph — this deletes, and it sits next to a row that
+                            // navigates on click.
+                            Box(
+                                modifier = Modifier.size(28.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (isRowHovered || index == selectedDropdownIndex) {
+                                    @OptIn(ExperimentalComposeUiApi::class)
+                                    Box(
+                                        modifier = Modifier
+                                            .size(28.dp)
+                                            // A pointer handler rather than .clickable:
+                                            // clickable is focusable, so clicking ✕ pulled
+                                            // focus out of the URL bar and onFocusLost then
+                                            // closed the whole dropdown 200ms later — you
+                                            // could delete one entry, then had to retype to
+                                            // delete a second. Primary button only: this
+                                            // deletes, so a right-click reaching for a
+                                            // context menu must not fire it.
+                                            .onPointerEvent(PointerEventType.Release) { event ->
+                                                if (event.button == PointerButton.Primary) {
+                                                    event.changes.forEach { it.consume() }
+                                                    onDelete(entry)
+                                                }
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "Remove from history",
+                                            tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 }

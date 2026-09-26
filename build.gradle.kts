@@ -25,6 +25,7 @@ kotlin {
 // Auto-detect CI environment
 val useLocalDependencies = System.getenv("CI") != "true"
 val bossPluginApiPath = "../boss-plugin-api"
+val localApiJar = providers.gradleProperty("bossPluginApiJar").getOrElse("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.94.jar")
 
 repositories {
     google()
@@ -37,8 +38,8 @@ dependencies {
         // Local development: use boss-plugin-api JAR from sibling repo.
         // Also on the test classpath (compileOnly doesn't propagate there) so
         // tests can reference api types like BrowserHandle.
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.83.jar"))
-        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.83.jar"))
+        compileOnly(files(localApiJar))
+        testImplementation(files(localApiJar))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
