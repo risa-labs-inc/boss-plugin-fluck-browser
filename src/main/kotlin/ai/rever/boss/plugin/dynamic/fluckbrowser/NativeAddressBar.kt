@@ -36,6 +36,7 @@ internal fun rememberNativeAddressBar(
         value.text, value.selection.start, value.selection.end, completion,
         showing && suggestions.isNotEmpty(), selected in suggestions.indices, revision,
         onEdit = { text, start, end -> onEdit(TextFieldValue(text, TextRange(start, end))) },
+        // AppKit guards completion commands by the current selection/completion state.
         onCommand = { command ->
             revision++
             when (command) {

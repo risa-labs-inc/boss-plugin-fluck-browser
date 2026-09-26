@@ -99,8 +99,8 @@ class PageEventChannelSourceTest {
     @Test
     fun `the manifest floors match what the plugin actually requires`() {
         // Native toolbar hosting names BrowserTitleBarBridge directly, added in API 1.0.94.
-        // Older hosts can still use the in-pane toolbar: only a host with native title-bar
-        // support claims the bridge. PageEventChannel remains optional via reflection.
+        // Older hosts must first install API 1.0.94; then they retain the in-pane toolbar
+        // until a supporting host claims the bridge. PageEventChannel stays reflective.
         val root = assertNotNull(repoRoot(), "could not locate the plugin root")
         val manifest = File(root, "src/main/resources/META-INF/boss-plugin/plugin.json").readText()
         assertTrue(

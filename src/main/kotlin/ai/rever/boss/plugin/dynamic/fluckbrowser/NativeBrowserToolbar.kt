@@ -28,7 +28,7 @@ internal fun NativeBrowserToolbar(
 ): Boolean {
     val windowId = LocalWindowIdProvider.current?.getWindowId()
     val hostedWindow = windowId?.let(BrowserTitleBarBridge::isWindowHosted) == true
-    if (handleId == null) return hostedWindow
+    if (handleId == null) return false
     val owner = remember(handleId) { Any() }
     SideEffect {
         BrowserTitleBarBridge.publish(handleId, owner, BrowserTitleBarState(
