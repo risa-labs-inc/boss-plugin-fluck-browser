@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -12,6 +13,19 @@ import kotlin.test.assertTrue
  */
 class VisiblePageUrlTest {
     private val LOADED = "https://example.com/article"
+
+    @Test
+    fun `clearing or replacing the address draft keeps the loaded page instead of home`() {
+        for (draft in listOf("", "   ", "about:blank", "new search")) {
+            assertFalse(showsDashboard(draft, LOADED))
+        }
+    }
+
+    @Test
+    fun `new and restored home tabs still show dashboard`() {
+        assertTrue(showsDashboard("", ""))
+        assertTrue(showsDashboard("about:blank", ""))
+    }
 
     @Test
     fun `the box agreeing with the page is the ordinary case`() {
