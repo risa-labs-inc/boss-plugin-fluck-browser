@@ -2940,19 +2940,13 @@ internal fun FluckBrowserTabContent(
 
     // navigationHistory / historyIndex live on hoistedState (declared above).
 
-    // Show dashboard for about:blank pages - matches bundled browser exactly
     val currentUrl = urlBarText.text
-    // What "the page I am on" means for copy-link and bookmarking. Equal to currentUrl whenever
-    // the box holds the loaded URL, which is almost always; see [visiblePageUrl]. Deliberately NOT
-    // substituted for currentUrl wholesale - showDashboard and isSecure below answer "what is this
-    // composable rendering", which is the box's question, not the loaded page's.
+    // Editing the address is not navigation. Keep the loaded document visible when the
+    // draft is cleared (including after focus loss), just as copy-link and bookmark do.
     val pageUrl = visiblePageUrl(urlBarText.text, loadedUrl)
-    val showDashboard = isHomeUrl(currentUrl)
+    val showDashboard = isHomeUrl(pageUrl)
 
-    // Security indicator derived from the LOADED page, not the box. showDashboard above asks what
-    // this composable is rendering, which is the draft's question; the padlock is a claim about
-    // the document the user is actually on, and typing "https://…" over an http page must not
-    // put a lock on it.
+    // Security describes the loaded document, never a partially typed address.
     val isSecure = pageUrl.startsWith("https://")
 
     // Lazily created provider - by the time LaunchedEffect runs, the tab should be registered

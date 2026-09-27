@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import kotlin.test.assertFalse
 
 /**
  * The URL bar is an editable text box that happens to hold the loaded URL most of the time, not a
@@ -12,6 +13,13 @@ import kotlin.test.assertTrue
  */
 class VisiblePageUrlTest {
     private val LOADED = "https://example.com/article"
+
+    @Test
+    fun `clearing or replacing the address draft keeps the loaded page instead of home`() {
+        for (draft in listOf("", "   ", "about:blank", "new search")) {
+            assertFalse(isHomeUrl(visiblePageUrl(draft, LOADED)))
+        }
+    }
 
     @Test
     fun `the box agreeing with the page is the ordinary case`() {
