@@ -708,7 +708,7 @@ internal fun isHomeUrl(url: String): Boolean = url.isBlank() || url == "about:bl
  * The URL of the page the user is looking at, as opposed to [draft] - whatever is currently in
  * the URL bar.
  *
- * The affordances that act on "the page I am on" (copy link, bookmark) must not act on a
+ * The surface, security indicator, and page actions (copy link, bookmark) must not act on a
  * half-typed string. `urlBarText` is not a loaded-URL field - it is an editable text box that
  * merely happens to hold the loaded URL most of the time - so [loaded] is tracked separately, off
  * the navigation listener, which reports the committed URL whether or not the box is being
@@ -730,6 +730,10 @@ internal fun visiblePageUrl(
     draft: String,
     loaded: String,
 ): String = if (loaded.isNotBlank()) loaded else draft
+
+/** Choose the surface from the loaded page, not an address edit. */
+internal fun showsDashboard(draft: String, loaded: String): Boolean =
+    isHomeUrl(visiblePageUrl(draft, loaded))
 
 /** What the starting surface says for the first stretch of a boot. */
 internal const val INITIALIZING_MESSAGE = "Initializing browser..."
@@ -2944,7 +2948,7 @@ internal fun FluckBrowserTabContent(
     // Editing the address is not navigation. Keep the loaded document visible when the
     // draft is cleared (including after focus loss), just as copy-link and bookmark do.
     val pageUrl = visiblePageUrl(urlBarText.text, loadedUrl)
-    val showDashboard = isHomeUrl(pageUrl)
+    val showDashboard = showsDashboard(urlBarText.text, loadedUrl)
 
     // Security describes the loaded document, never a partially typed address.
     val isSecure = pageUrl.startsWith("https://")
