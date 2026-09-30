@@ -116,6 +116,30 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         }
     }
 
+    internal val markdownShortcuts: ShortcutActionProvider by lazy {
+        object : ShortcutActionProvider {
+            override val providerId: String = "$PLUGIN_ID.markdown"
+
+            override fun shortcuts(): List<PluginShortcutSpec> =
+                listOf(
+                    PluginShortcutSpec(
+                        actionId = COPY_PAGE_MARKDOWN_ACTION,
+                        displayName = "Copy as Markdown for Agent",
+                        description = "Copy current web page or selection as Markdown for AI agents",
+                        defaultBinding = null,
+                    ),
+                )
+
+            override fun onAction(
+                actionId: String,
+                windowId: String?,
+            ) {
+                if (actionId != COPY_PAGE_MARKDOWN_ACTION) return
+                ai.rever.boss.plugin.dynamic.fluckbrowser.markdown.FluckBrowserMarkdownRegistry.copyActiveIn(windowId)
+            }
+        }
+    }
+
     override fun register(context: PluginContext) {
         pluginContext = context
 
@@ -153,6 +177,9 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
             // NoClassDefFoundError, whose message is the missing symbol but whose TYPE is what
             // says "this host is too old" rather than "the host rejected the id".
             .onFailure { println("[FluckBrowser] Cmd+L unavailable (${it::class.simpleName}): ${it.message}") }
+
+        runCatching { context.registerShortcutActionProvider(markdownShortcuts) }
+            .onFailure { println("[FluckBrowser] Copy Markdown shortcut unavailable (${it::class.simpleName}): ${it.message}") }
     }
 
     override fun dispose() {
@@ -175,10 +202,13 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // AddressBarShortcutProviderTest pins that they are.
         runCatching { pluginContext?.unregisterShortcutActionProvider(PLUGIN_ID) }
             .onFailure { println("[FluckBrowser] could not unregister the Cmd+L provider: ${it.message}") }
+        runCatching { pluginContext?.unregisterShortcutActionProvider("$PLUGIN_ID.markdown") }
+            .onFailure { println("[FluckBrowser] could not unregister the markdown shortcut provider: ${it.message}") }
         // Symmetric with the registrations the tab compositions make. Nothing can invoke them
         // once the provider is gone, so this is hygiene rather than a fix, but it stops entries
         // holding torn-down compositions across a disable/re-enable on the same classloader.
         AddressBarFocusRegistry.clear()
+        ai.rever.boss.plugin.dynamic.fluckbrowser.markdown.FluckBrowserMarkdownRegistry.clear()
         pluginContext?.tabRegistry?.unregisterTabType(FluckBrowserTabType.typeId)
         pluginContext = null
     }
@@ -195,5 +225,6 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
          * string by hand and genuinely cannot be compiled against; that one stays a test.
          */
         const val FOCUS_ADDRESS_BAR_ACTION = "plugin.$PLUGIN_ID.focus_address_bar"
+        const val COPY_PAGE_MARKDOWN_ACTION = "plugin.$PLUGIN_ID.copy_page_markdown"
     }
 }
