@@ -167,6 +167,12 @@ private const val PROBE_IDLE = "IDLE"
  * `position: fixed` element and would reject the visible field on a modal login. The host once had
  * an equivalent test; do not go looking for it, BossConsole#215 deleted that resolver along with
  * the API it served, and these rules are now the only copy.
+ *
+ * **Grouping lives here too, for the same reason.** `groupOf` answers which of those fields belong
+ * together, and the probe, the fill, the generated-password fill and the capture all ask it. Each
+ * of them used to answer for itself, from the whole page, and on a page carrying a login form and a
+ * signup form all four paired across the two. `CredentialFieldGroupingTest` runs each of them
+ * against such a page.
  */
 internal val FIELD_ELIGIBILITY_JS =
     """
@@ -219,6 +225,47 @@ internal val FIELD_ELIGIBILITY_JS =
         if (hasToken(el, 'username') || hasToken(el, 'email')) return true;
         if ((el.type || '').toLowerCase() === 'email') return true;
         return hints(el);
+    }
+    // The form that owns `node`: the element itself for a <form>, otherwise the `form` property of a
+    // field or a button, which is also how a `form="id"` attribute resolves. Null for anything no
+    // form owns, which is every field on a page with no form element at all.
+    function ownerForm(node) {
+        for (var n = node, depth = 0; n && depth < 8; n = n.parentElement, depth++) {
+            if ((n.tagName || '').toUpperCase() === 'FORM') return n;
+            if (n.form !== undefined) return n.form || null;
+        }
+        return null;
+    }
+    // The login fields that belong with `anchor` (a field, a form, or a submit control), so that a
+    // counterpart is looked for beside what the user acted on and never in another form on the same
+    // page. A login form and a signup form side by side are two groups; pairing across them writes a
+    // username into one and its password into the other, and reports both as filled.
+    //
+    // The group is the anchor's form. When that form holds nothing of the kind being looked for (a
+    // password for a username box or a form, a username box for a password), fields that belong to
+    // NO form join it, so markup that leaves a password outside its <form> still pairs. A different
+    // form never joins: that is the first screen of a two-step sign-in on a page that also carries a
+    // signup form, and borrowing the signup form's password box there is the bug. With no form to go
+    // on, the group is the page's form-less fields when they hold that kind, and otherwise the whole
+    // page, which is what every script did before.
+    function groupOf(anchor, fields) {
+        if (!anchor) return fields;
+        var form = ownerForm(anchor);
+        var i;
+        var isField = false;
+        for (i = 0; i < fields.length; i++) { if (fields[i] === anchor) isField = true; }
+        var wantPassword = !(isField && (anchor.type || '').toLowerCase() === 'password');
+        var same = [];
+        var formless = [];
+        for (i = 0; i < fields.length; i++) {
+            var owner = fields[i].form || null;
+            if (owner === form) same.push(fields[i]);
+            else if (owner === null) formless.push(fields[i]);
+        }
+        for (i = 0; i < same.length; i++) {
+            if (((same[i].type || '').toLowerCase() === 'password') === wantPassword) return same;
+        }
+        return form ? same.concat(formless) : fields;
     }
     """.trimIndent()
 
@@ -277,8 +324,9 @@ $FIELD_ELIGIBILITY_JS
         // 1. autocomplete says so. `current-password` is decisive in the other direction and is
         //    checked first, because a change-password form has both and the box holding the old
         //    password must never be offered a generated one.
-        // 2. More than one password box on the page. A sign-in form has one; a signup or
-        //    change-password form has two or three.
+        // 2. More than one password box in the same group (see groupOf). A sign-in form has one; a
+        //    signup or change-password form has two or three. Counted across the whole page, this
+        //    offered a generated password for the login box of any page that also had a signup form.
         // 3. Name/id/placeholder wording. Last, because "confirm" also appears on plenty of
         //    fields that are not passwords at all - which is why this only runs for a password box.
         var isNewPassword = false;
@@ -287,8 +335,9 @@ $FIELD_ELIGIBILITY_JS
                 isNewPassword = true;
             } else {
                 var passwordCount = 0;
-                for (i = 0; i < fields.length; i++) {
-                    if ((fields[i].type || '').toLowerCase() === 'password') passwordCount++;
+                var group = groupOf(el, fields);
+                for (i = 0; i < group.length; i++) {
+                    if ((group[i].type || '').toLowerCase() === 'password') passwordCount++;
                 }
                 if (passwordCount > 1) {
                     isNewPassword = true;
