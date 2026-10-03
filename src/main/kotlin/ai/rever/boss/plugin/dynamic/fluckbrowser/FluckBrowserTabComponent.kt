@@ -28,6 +28,7 @@ import ai.rever.boss.plugin.api.UrlHistoryProvider
 import ai.rever.boss.plugin.api.ZoomSettingsProvider
 import ai.rever.boss.plugin.bookmark.Bookmark
 import ai.rever.boss.plugin.ui.BossTheme
+import ai.rever.boss.plugin.ui.BossColors
 import ai.rever.boss.plugin.ui.BossThemeColors
 import ai.rever.boss.plugin.workspace.TabConfig
 import ai.rever.boss.plugin.browser.BrowserConfig
@@ -7227,6 +7228,9 @@ internal fun UrlSuggestionList(
     onDelete: (UrlHistoryEntry) -> Unit,
     nativeStyle: Boolean = false,
 ) {
+    val surface = if (nativeStyle) BossColors.contextMenuBackground else MaterialTheme.colors.surface
+    val primaryText = if (nativeStyle) BossThemeColors.TextPrimary else MaterialTheme.colors.onSurface
+    val secondaryText = if (nativeStyle) BossThemeColors.TextSecondary else MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
     LaunchedEffect(selectedDropdownIndex) {
         if (selectedDropdownIndex in urlSuggestions.indices) {
             dropdownListState.animateScrollToItem(selectedDropdownIndex)
@@ -7238,7 +7242,9 @@ internal fun UrlSuggestionList(
                     .wrapContentHeight(),
                 elevation = 8.dp,
                 shape = RoundedCornerShape(if (nativeStyle) 18.dp else 4.dp),
-                backgroundColor = MaterialTheme.colors.surface.copy(alpha = if (nativeStyle) 0.94f else 1f)
+                backgroundColor = surface,
+                border = if (nativeStyle) BorderStroke(1.dp, BossColors.contextMenuBorder.copy(alpha = 0.6f)) else null,
+                contentColor = primaryText,
             ) {
                 LazyColumn(
                     state = dropdownListState,
@@ -7257,10 +7263,14 @@ internal fun UrlSuggestionList(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .background(
-                                    if (index == selectedDropdownIndex)
-                                        MaterialTheme.colors.primary.copy(alpha = if (nativeStyle) 0.35f else 0.1f)
-                                    else
-                                        if (nativeStyle) Color.Transparent else MaterialTheme.colors.surface,
+                                    when {
+                                        index == selectedDropdownIndex ->
+                                            if (nativeStyle) BossColors.contextMenuHover
+                                            else MaterialTheme.colors.primary.copy(alpha = 0.1f)
+                                        nativeStyle && isRowHovered -> BossColors.contextMenuHover.copy(alpha = 0.55f)
+                                        nativeStyle -> Color.Transparent
+                                        else -> surface
+                                    },
                                     shape = RoundedCornerShape(if (nativeStyle) 10.dp else 0.dp)
                                 )
                                 // clickable's own interaction source reports hover, so no
@@ -7281,7 +7291,7 @@ internal fun UrlSuggestionList(
                                 else
                                     Icons.Outlined.Language,
                                 contentDescription = null,
-                                tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                tint = secondaryText,
                                 modifier = Modifier.size(16.dp)
                             )
                             Spacer(modifier = Modifier.width(12.dp))
@@ -7289,13 +7299,13 @@ internal fun UrlSuggestionList(
                                 Text(
                                     text = entry.title.ifBlank { entry.domain },
                                     style = MaterialTheme.typography.body2,
-                                    color = MaterialTheme.colors.onSurface,
+                                    color = primaryText,
                                     maxLines = 1
                                 )
                                 Text(
                                     text = entry.url,
                                     style = MaterialTheme.typography.caption,
-                                    color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                    color = secondaryText,
                                     maxLines = 1
                                 )
                             }
@@ -7336,7 +7346,7 @@ internal fun UrlSuggestionList(
                                         Icon(
                                             imageVector = Icons.Filled.Close,
                                             contentDescription = "Remove from history",
-                                            tint = MaterialTheme.colors.onSurface.copy(alpha = 0.6f),
+                                            tint = secondaryText,
                                             modifier = Modifier.size(16.dp)
                                         )
                                     }
