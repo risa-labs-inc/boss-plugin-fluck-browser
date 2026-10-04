@@ -5415,7 +5415,11 @@ object SwingContextMenu {
     ) {
         // A remote request may have suspended while loading form details. Never choose a different
         // window after its exact owner disappears.
-        if (owner != null && !owner.isShowing) { onDismiss(); return }
+        if (owner != null && !owner.isShowing) {
+            hide()
+            onDismiss()
+            return
+        }
         // Take down whatever is on screen FIRST. If a previous call fell through to Swing and
         // that popup is still up, going native without dismissing it would leave two menus
         // visible and drop the reference to the one hide() could still have closed.
@@ -5505,6 +5509,7 @@ object SwingContextMenu {
                 .filter { it.isShowing && it.bounds.contains(clickPoint) }
         val smallestFirst =
             compareBy<Window> { it.bounds.width.toLong() * it.bounds.height }
+        // A remote owner is authoritative even if its click lies outside the window bounds.
         val targetWindow: Window? =
             owner?.takeIf { it.isShowing }
             ?: focusedWindow
