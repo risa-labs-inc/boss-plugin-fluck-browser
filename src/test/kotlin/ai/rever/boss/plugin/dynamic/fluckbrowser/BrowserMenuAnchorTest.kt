@@ -1,0 +1,50 @@
+package ai.rever.boss.plugin.dynamic.fluckbrowser
+
+import ai.rever.boss.plugin.browser.BrowserContextMenuInfo
+import ai.rever.boss.plugin.browser.BrowserMenuContext
+import java.awt.Point
+import java.awt.event.MouseEvent
+import javax.swing.JFrame
+import javax.swing.JPanel
+import javax.swing.SwingUtilities
+import org.junit.Assume.assumeTrue
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNull
+import kotlin.test.assertSame
+
+class BrowserMenuAnchorTest {
+    @Test fun `old hosts keep the local cursor fallback`() {
+        assertEquals(Point(12, 34), browserMenuAnchor(BrowserContextMenuInfo()) { Point(12, 34) }?.point)
+        assertNull(browserMenuAnchor(BrowserContextMenuInfo()) { null })
+    }
+
+    @Test fun `remote menu uses exact clicked owner and remains an owned popup above its page`() {
+        assumeTrue(System.getenv("BOSS_TEST_APP_CAPTURE") == "1")
+        SwingUtilities.invokeAndWait {
+            val owner = JFrame("Synthetic remote browser menu").apply {
+                focusableWindowState = false
+                contentPane = JPanel()
+                setBounds(200, 200, 420, 300)
+                isVisible = true
+            }
+            try {
+                val point = Point(owner.x + 100, owner.y + 100)
+                val click = object : MouseEvent(owner.contentPane, MOUSE_PRESSED, 0, 0, 100, 100,
+                    point.x, point.y, 1, true, BUTTON3), BrowserMenuContext {}
+                val info = BrowserContextMenuInfo(menuContext = click)
+                val anchor = requireNotNull(browserMenuAnchor(info) { error("Must not read or move the system cursor") })
+                assertEquals(point, anchor.point); assertSame(owner, anchor.owner)
+                SwingContextMenu.show(point.x, point.y, listOf(ContextMenuItem(text = "Synthetic action", onClick = {})), owner = anchor.owner)
+                val popup = owner.ownedWindows.single { it.isShowing }
+                assertSame(owner, popup.owner)
+                assertEquals(point, popup.locationOnScreen)
+                owner.isVisible = false
+                assertNull(browserMenuAnchor(info) { error("A stale remote owner cannot fall back to another window") })
+            } finally {
+                SwingContextMenu.hide()
+                owner.dispose()
+            }
+        }
+    }
+}
