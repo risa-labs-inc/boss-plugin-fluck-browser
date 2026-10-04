@@ -12,7 +12,8 @@ internal data class BrowserMenuAnchor(val point: Point, val owner: Window? = nul
 internal fun browserMenuAnchor(info: BrowserContextMenuInfo, cursor: () -> Point?): BrowserMenuAnchor? {
     val remote = info.menuContext as? MouseEvent
     if (remote != null) {
-        val owner = SwingUtilities.getWindowAncestor(remote.component)?.takeIf { it.isShowing } ?: return null
+        val owner = (remote.component as? Window ?: SwingUtilities.getWindowAncestor(remote.component))
+            ?.takeIf { it.isShowing } ?: return null
         return BrowserMenuAnchor(remote.locationOnScreen, owner)
     }
     return cursor()?.let { BrowserMenuAnchor(it) }
