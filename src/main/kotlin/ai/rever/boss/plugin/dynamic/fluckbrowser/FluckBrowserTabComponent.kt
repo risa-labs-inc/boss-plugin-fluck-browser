@@ -4337,13 +4337,13 @@ internal fun FluckBrowserTabContent(
                 // the menu we are building.
                 val requestId = contextMenuRequest
                 val menuInfo = contextMenuInfo
-                // Read the pointer before the request is eligible to be consumed. Inside the
+                // Resolve the click anchor before the request is eligible to be consumed. Inside the
                 // run, a null here (headless, or the pointer on no screen device) would burn
                 // the request without ever showing anything — and unlike a cancelled run,
                 // this one never got as far as wanting to draw, so there is nothing to
                 // protect the user from replaying.
-                val mouseLocation = java.awt.MouseInfo.getPointerInfo()?.location
-                if (menuInfo != null && mouseLocation != null) {
+                val anchor = menuInfo?.let { browserMenuAnchor(it) { java.awt.MouseInfo.getPointerInfo()?.location } }
+                if (menuInfo != null && anchor != null) {
                     runContextMenuRequest(
                         request = requestId,
                         shownRequest = hoistedState.shownContextMenuRequest,
@@ -4433,8 +4433,9 @@ internal fun FluckBrowserTabContent(
                             }
                         )
                         SwingContextMenu.show(
-                            screenX = mouseLocation.x,
-                            screenY = mouseLocation.y,
+                            screenX = anchor.point.x,
+                            screenY = anchor.point.y,
+                            owner = anchor.owner,
                             items = menuItems,
                             onDismiss = {
                                 if (shouldClearContextMenuTarget(
@@ -5409,8 +5410,12 @@ object SwingContextMenu {
         screenX: Int,
         screenY: Int,
         items: List<ContextMenuItem>,
-        onDismiss: () -> Unit = {}
+        onDismiss: () -> Unit = {},
+        owner: Window? = null
     ) {
+        // A remote request may have suspended while loading form details. Never choose a different
+        // window after its exact owner disappears.
+        if (owner != null && !owner.isShowing) { onDismiss(); return }
         // Take down whatever is on screen FIRST. If a previous call fell through to Swing and
         // that popup is still up, going native without dismissing it would leave two menus
         // visible and drop the reference to the one hide() could still have closed.
@@ -5427,7 +5432,8 @@ object SwingContextMenu {
                     NativeMenuNode.Item(label = item.text, action = item.onClick)
                 }
             }
-        if (NativeContextMenu.show(screenX, screenY, nodes, onDismiss)) {
+        // OS menu windows are outside the captured window. A remote click needs its owner's popup.
+        if (owner == null && NativeContextMenu.show(screenX, screenY, nodes, onDismiss)) {
             currentPopup = null
             return
         }
@@ -5500,7 +5506,8 @@ object SwingContextMenu {
         val smallestFirst =
             compareBy<Window> { it.bounds.width.toLong() * it.bounds.height }
         val targetWindow: Window? =
-            focusedWindow
+            owner?.takeIf { it.isShowing }
+            ?: focusedWindow
                 ?.takeIf { it is java.awt.Frame || it is java.awt.Dialog }
                 ?.takeIf { it.isShowing && it.bounds.contains(clickPoint) }
                 // getWindows() is not in z-order, and smallest-area is only a proxy for
