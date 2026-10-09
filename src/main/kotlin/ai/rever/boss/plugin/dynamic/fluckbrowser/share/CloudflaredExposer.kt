@@ -18,7 +18,7 @@ import java.util.logging.Logger
  * holds and [QuickTunnel.destroy]s on teardown.
  *
  * Reuses an already-installed cloudflared: BossTerm drops a managed copy at
- * `~/.bossterm/bin/cloudflared`; we also check PATH and Homebrew. Auto-install /
+ * `~/.boss/bossterm/bin/cloudflared`; we also check PATH and Homebrew. Auto-install /
  * SHA-pinned download (BossTerm's CloudflaredExposer) is intentionally out of scope
  * here — if cloudflared is absent, sharing falls back to the loopback URL.
  */
@@ -29,13 +29,23 @@ object CloudflaredExposer {
     private val binName: String = if (isWindows) "cloudflared.exe" else "cloudflared"
 
     // Reuse BossTerm's managed binary first, then PATH, then Homebrew (Unix).
+    // The old ~/.bossterm path remains read-only fallback during upgrades; this
+    // plugin never creates or modifies it.
     private fun candidates(): List<String> = buildList {
-        add(File(System.getProperty("user.home"), ".bossterm/bin/$binName").absolutePath)
+        addAll(managedCandidates(System.getProperty("user.home"), isWindows))
         add(binName)
         if (!isWindows) {
             add("/opt/homebrew/bin/cloudflared")
             add("/usr/local/bin/cloudflared")
         }
+    }
+
+    internal fun managedCandidates(userHome: String, windows: Boolean): List<String> {
+        val name = if (windows) "cloudflared.exe" else "cloudflared"
+        return listOf(
+            File(userHome, ".boss/bossterm/bin/$name").absolutePath,
+            File(userHome, ".bossterm/bin/$name").absolutePath,
+        )
     }
 
     private fun bin(): String? = candidates().firstOrNull { runCmd(listOf(it, "--version"), 5) != null }
