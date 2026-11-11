@@ -1,20 +1,11 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser
 
-import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class NativeAutofillTest {
-    private val saved = System.getProperty(NativeAutofill.PROPERTY)
-
-    @AfterTest
-    fun restore() {
-        if (saved == null) System.clearProperty(NativeAutofill.PROPERTY)
-        else System.setProperty(NativeAutofill.PROPERTY, saved)
-    }
-
     private fun field(isNewPassword: Boolean = true) = FocusedLoginField(
         key = "1|password|pw|password",
         isPassword = true,
@@ -29,21 +20,13 @@ class NativeAutofillTest {
     )
 
     @Test
-    fun `absent property is inactive`() {
-        System.clearProperty(NativeAutofill.PROPERTY)
-        assertFalse(NativeAutofill.isActive())
-    }
-
-    @Test
-    fun `only the exact value true activates, read on every call`() {
-        System.clearProperty(NativeAutofill.PROPERTY)
-        assertFalse(NativeAutofill.isActive())
-        System.setProperty(NativeAutofill.PROPERTY, "true")
-        assertTrue(NativeAutofill.isActive())
-        System.setProperty(NativeAutofill.PROPERTY, "false")
-        assertFalse(NativeAutofill.isActive())
-        System.setProperty(NativeAutofill.PROPERTY, "TRUE")
-        assertFalse(NativeAutofill.isActive())
+    fun `inactive until the engine has wired a browser, whatever the old host property says`() {
+        System.setProperty("boss.browser.nativeAutofill", "true")
+        try {
+            assertFalse(NativeAutofill.isActive())
+        } finally {
+            System.clearProperty("boss.browser.nativeAutofill")
+        }
     }
 
     @Test

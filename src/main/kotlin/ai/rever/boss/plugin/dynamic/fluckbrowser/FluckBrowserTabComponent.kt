@@ -15,6 +15,8 @@ import ai.rever.boss.plugin.api.LocalWindowIdProvider
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.ScreenCaptureProvider
 import ai.rever.boss.plugin.api.SecretDataProvider
+import ai.rever.boss.plugin.browser.PAGE_EVENT_BRIDGE
+import ai.rever.boss.plugin.browser.PAGE_EVENT_EMIT
 import ai.rever.boss.plugin.api.SecretEntryData
 import ai.rever.boss.plugin.api.UpdateSecretRequestData
 import ai.rever.boss.plugin.api.TabComponentWithUI
@@ -2881,9 +2883,27 @@ internal fun FluckBrowserTabContent(
     // (BrowserSettings.init), and defaulting a password manager to off would leave a feature nobody
     // finds. Compare showShareButton below, which defaults OFF and so tests for "true".
     val suggestPasswordsEnabled = System.getProperty("boss.fluck.suggestPasswords") != "false"
+    val offerToSavePasswordsEnabled = System.getProperty("boss.fluck.offerToSavePasswords") != "false"
+
+    // Native Chromium autofill (Secret Manager mirrored into the browser's own stores). When it is
+    // wired into this tab, the JS saved-logins popup and save prompt below stand down.
+    val autofillWindowId = LocalWindowIdProvider.current?.getWindowId()
+    DisposableEffect(browserHandle) {
+        val handle = browserHandle
+        if (handle != null) {
+            coroutineScope.launch(Dispatchers.IO) {
+                ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
+                    .attach(handle, autofillWindowId)
+            }
+        }
+        onDispose {
+            handle?.let {
+                ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
+                    .detach(it)
+            }
+        }
+    }
     val nativeAutofill = NativeAutofill.isActive()
-    val offerToSavePasswordsEnabled =
-        System.getProperty("boss.fluck.offerToSavePasswords") != "false" && !nativeAutofill
 
     // A credential the user submitted, waiting to find out whether the login worked. Memory only,
     // never persisted. See CredentialSavePolicy.
@@ -3579,9 +3599,11 @@ internal fun FluckBrowserTabContent(
     // This is the only path by which a page value the user typed reaches the plugin, and it only
     // ever fires on a submit. The periodic probe above stays value-free (hasValue: Boolean) for
     // exactly that reason - see CredentialCapture's KDoc for the rule.
-    LaunchedEffect(browserHandle, offerToSavePasswordsEnabled) {
+    LaunchedEffect(browserHandle, offerToSavePasswordsEnabled, nativeAutofill) {
         val handle = browserHandle ?: return@LaunchedEffect
-        if (!offerToSavePasswordsEnabled) {
+        // Native autofill needs the channel even with the JS prompt off: it carries the submitted
+        // value for Chromium's save callback and the dropdown's arrow/Enter/Escape keys.
+        if (!offerToSavePasswordsEnabled && !nativeAutofill) {
             // Also drops anything already captured: leaving a pending credential in memory after
             // the feature is switched off would surface a prompt the user has just disabled.
             pendingSave = null
@@ -3607,7 +3629,12 @@ internal fun FluckBrowserTabContent(
         // in a long task would otherwise park the thread drawing the UI.
         withContext(Dispatchers.IO) {
             val installed =
-                PageEventChannel.install(handle, CredentialCapture.INSTALL_JS) { url, json ->
+                PageEventChannel.install(
+                    handle,
+                    CredentialCapture.INSTALL_JS + "\n" +
+                        ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.AutofillKeys
+                            .script("$PAGE_EVENT_BRIDGE.$PAGE_EVENT_EMIT"),
+                ) { url, json ->
                     // JxBrowser thread, inside the page's own event dispatch. trySend and nothing
                     // else: a blocking hand-off would stall the submit the user just performed.
                     //
@@ -3641,9 +3668,23 @@ internal fun FluckBrowserTabContent(
     }
 
     // Turn a pushed capture into a pending save.
-    LaunchedEffect(captureChannel, offerToSavePasswordsEnabled) {
-        if (!offerToSavePasswordsEnabled) return@LaunchedEffect
+    LaunchedEffect(captureChannel, offerToSavePasswordsEnabled, nativeAutofill) {
+        if (!offerToSavePasswordsEnabled && !nativeAutofill) return@LaunchedEffect
         for (event in captureChannel) {
+            if (nativeAutofill) {
+                val handle = browserHandle
+                val nav = ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.AutofillKeys.parse(event.json)
+                if (nav != null && handle != null) {
+                    ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
+                        .onNavKey(handle, nav)
+                } else if (offerToSavePasswordsEnabled) {
+                    CredentialCapture.parse(event.json)?.let {
+                        ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
+                            .recordCapture(event.url, it.username, it.password)
+                    }
+                }
+                continue
+            }
             val captured = CredentialCapture.parse(event.json) ?: continue
             // The domain comes from the URL the HOST read off the posting document, never from the
             // page's payload: the bridge is reachable by any script on the page, so a page-supplied
@@ -4457,6 +4498,14 @@ internal fun FluckBrowserTabContent(
                         )
                     }
                 }
+            }
+
+            // Where native autofill's dropdown and save card anchor: this view, on screen.
+            browserHandle?.let { handle ->
+                ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillAnchor(
+                    handle,
+                    Modifier.matchParentSize(),
+                )
             }
 
             // Inline credential suggestions, anchored under the page's focused login box.

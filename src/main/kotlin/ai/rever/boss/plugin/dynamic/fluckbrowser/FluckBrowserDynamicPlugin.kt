@@ -133,6 +133,11 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // host notification toast is posted (it duplicated those and looked off-style).
         BrowserShareManager.start(context)
 
+        // Native Chromium autofill backed by Secret Manager. Guarded: it reaches JxBrowser by
+        // reflection and must never cost the tab type if anything about it is off.
+        runCatching { ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine.start(context) }
+            .onFailure { println("[FluckBrowser] native autofill unavailable (${it::class.simpleName})") }
+
         // Cmd+L, LAST and in a runCatching, both deliberately. The address bar belongs to this
         // plugin, not the host, so the chord does too — the host has no URL field to focus and
         // every other keymap action it owns acts on a BrowserHandle rather than on our toolbar.
@@ -162,6 +167,9 @@ class FluckBrowserDynamicPlugin : DynamicPlugin {
         // into unloaded plugin code - the classloader can never be collected, and every mouse
         // move and key press in the whole app is dispatched into it until the JVM exits.
         SwingContextMenu.hide()
+
+        // Removes the records native autofill mirrored into Chromium before the plugin goes away.
+        runCatching { ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine.stop() }
 
         // Tear down the share server (stops any active capture) before unregistering.
         BrowserShareManager.shutdown()
