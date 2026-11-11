@@ -47,4 +47,15 @@ internal object MirrorDiff {
         lastSyncedKeys: Set<String>,
         present: Set<String>,
     ): Set<String> = (owned + lastSyncedKeys) intersect present
+
+    /**
+     * Index keys to keep after a clear removed [targets]: all of them when any removal failed or the
+     * store could not be listed afterwards ([after] null), else those still present. Dropping a key
+     * whose record survived would leave it untracked for good, and autofillable for the next user.
+     */
+    fun keepAfterClear(
+        targets: Set<String>,
+        failed: Int,
+        after: Set<String>?,
+    ): Set<String> = if (failed > 0 || after == null) targets else after intersect targets
 }

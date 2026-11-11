@@ -58,36 +58,4 @@ internal object SuggestionRows {
             SuggestionKind.CARD,
         )
     }
-
-}
-
-/** The page-side half of dropdown keyboard support: arrows/Enter/Escape are forwarded while it is open. */
-internal object AutofillKeys {
-    /** Per-load event name the plugin dispatches to tell the page script the dropdown's state. Not a window global. */
-    val EVENT: String = "boss-nav-" + java.util.UUID.randomUUID().toString().replace("-", "").take(16)
-
-    /** Appended to the capture script; emits {"nav":"down"|...} through the same page-event bridge. */
-    fun script(emit: String): String =
-        """
-        (function() {
-            var navState = 0;
-            document.addEventListener('$EVENT', function(e) { navState = (e.detail | 0); }, true);
-            document.addEventListener('keydown', function(e) {
-                // Only real keystrokes: a page could otherwise accept a suggestion for itself.
-                if (!e.isTrusted || !navState) return;
-                var k = e.key === 'ArrowDown' ? 'down' : e.key === 'ArrowUp' ? 'up' :
-                    e.key === 'Escape' ? 'escape' : (e.key === 'Enter' && navState === 2) ? 'enter' : null;
-                if (!k) return;
-                e.preventDefault();
-                e.stopImmediatePropagation();
-                try { $emit(JSON.stringify({ nav: k })); } catch (x) { }
-            }, true);
-        })();
-        """.trimIndent()
-
-    /** Page-side statement that sets the state (0 closed, 1 open, 2 row highlighted). */
-    fun setState(state: Int): String = "document.dispatchEvent(new CustomEvent('$EVENT', { detail: $state }));"
-
-    /** The nav key in a page-event payload, or null when it is something else. */
-    fun parse(json: String): String? = Regex("^\\{\"nav\":\"(down|up|enter|escape)\"\\}$").find(json.trim())?.groupValues?.get(1)
 }

@@ -1,6 +1,5 @@
 package ai.rever.boss.plugin.dynamic.fluckbrowser.autofill
 
-
 /**
  * Record of the last submitted login per origin, so a SavePasswordCallback (which carries
  * url + login only) can be paired with the value. In memory only, short-lived, never logged.

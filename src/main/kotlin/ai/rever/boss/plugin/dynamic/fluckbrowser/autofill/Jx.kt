@@ -58,6 +58,17 @@ internal class Jx private constructor(
     val suggestionsHiddenT = type("$P.browser.event.internal.SuggestionsHidden")
     val navigationStartedT = type("$P.navigation.event.NavigationStarted")
     val browserClosingT = type("$P.browser.event.BrowserClosing")
+    private val pressKeyT = type("$CB.input.PressKeyCallback")
+    private val pressKeyParamsEvent = type("${pressKeyT.name}\$Params").m("event")
+    private val keyEventT = type("$P.ui.event.KeyEvent")
+    private val keyCode = keyEventT.m("keyCode")
+    private val keyModifiers = keyEventT.m("keyModifiers")
+    private val modifiersT = type("$P.ui.KeyModifiers")
+    private val modifierFlags = listOf("isAltDown", "isControlDown", "isMetaDown", "isShiftDown").map { modifiersT.m(it) }
+    private val pressKeyResponseT = type("${pressKeyT.name}\$Response")
+    private val suppressResponse = pressKeyResponseT.m("suppress")
+    private val proceedResponse = pressKeyResponseT.m("proceed")
+    private val pressKeyOn = pressKeyT.methods.first { it.name == "on" && it.parameterCount == 1 }
 
     private val browserProfile = browserT.m("profile")
     private val browserEngine = browserT.m("engine")
@@ -66,6 +77,8 @@ internal class Jx private constructor(
     private val browserMainFrame = browserT.m("mainFrame")
     private val browserIsClosed = browserT.m("isClosed")
     private val advisableSet = browserT.m("set", clsCls, callbackT)
+    private val advisableGet = browserT.m("get", clsCls)
+    private val advisableRemove = browserT.m("remove", clsCls)
     private val observableOn = browserT.m("on", clsCls, observerT)
     private val navigationOn = navigationT.m("on", clsCls, observerT)
     private val frameExecute = frameT.m("executeJavaScript", str)
@@ -302,6 +315,55 @@ internal class Jx private constructor(
     ) {
         val proxy = proxy(callbackType) { args -> if (args.size == 2) on(args[0]!!, args[1]!!) }
         advisableSet.invoke(browser, callbackType, proxy)
+    }
+
+    fun removeCallback(
+        browser: Any,
+        callbackType: Class<*>,
+    ) {
+        advisableRemove.invoke(browser, callbackType)
+    }
+
+    /**
+     * Puts [consume] in front of the browser's existing PressKeyCallback (the host's): real key presses
+     * only, never anything a page can synthesise. [consume] gets the key name (`KEY_CODE_DOWN`...) for
+     * unmodified keys and returns true to suppress it; everything else goes to the host's callback.
+     */
+    fun interceptKeys(
+        browser: Any,
+        consume: (String) -> Boolean,
+    ) {
+        val previous = (advisableGet.invoke(browser, pressKeyT) as? java.util.Optional<*>)?.orElse(null)
+        val proxy =
+            Proxy.newProxyInstance(
+                loader,
+                arrayOf(pressKeyT),
+                InvocationHandler { self, method, args ->
+                    when (method.name) {
+                        "on" -> {
+                            val params = args?.firstOrNull()
+                            val taken =
+                                params != null &&
+                                    runCatching {
+                                        val event = pressKeyParamsEvent.invoke(params)
+                                        val mods = keyModifiers.invoke(event)
+                                        val plain = modifierFlags.none { it.invoke(mods) == true }
+                                        plain && consume((keyCode.invoke(event) as Enum<*>).name)
+                                    }.getOrDefault(false)
+                            when {
+                                taken -> suppressResponse.invoke(null)
+                                previous != null -> pressKeyOn.invoke(previous, params)
+                                else -> proceedResponse.invoke(null)
+                            }
+                        }
+                        "toString" -> "BossNativeAutofill(PressKeyCallback)"
+                        "hashCode" -> System.identityHashCode(self)
+                        "equals" -> self === args?.firstOrNull()
+                        else -> null
+                    }
+                },
+            )
+        advisableSet.invoke(browser, pressKeyT, proxy)
     }
 
     fun onEvent(

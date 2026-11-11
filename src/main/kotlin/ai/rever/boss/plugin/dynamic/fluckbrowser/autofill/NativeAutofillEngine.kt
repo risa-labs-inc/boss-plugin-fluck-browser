@@ -23,8 +23,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.awt.Point
 import java.io.File
-import java.util.Collections
-import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -49,10 +47,6 @@ internal object NativeAutofillEngine {
         System.getProperty("boss.fluck.nativeAutofill") != "false" &&
             System.getenv("BOSS_NATIVE_AUTOFILL")?.trim()?.lowercase() !in setOf("false", "0", "no", "off")
 
-    /** True once a browser has passed the probe; read from composition, so it is snapshot state. */
-    var active: Boolean by mutableStateOf(false)
-        private set
-
     @Volatile private var probeFailed = false
 
     private var scope = newScope()
@@ -60,7 +54,7 @@ internal object NativeAutofillEngine {
     private val syncRequests = Channel<Unit>(Channel.CONFLATED)
     private val captured = CapturedLogins()
     private val fingerprints = ConcurrentHashMap<String, String>()
-    private val tabs = Collections.synchronizedMap(WeakHashMap<Any, Tab>())
+    private val tabs = TabRegistry<Any, Tab>()
 
     @Volatile private var context: PluginContext? = null
 
@@ -81,16 +75,21 @@ internal object NativeAutofillEngine {
 
     private fun log(msg: String) = println("$TAG $msg")
 
-    /** One browser tab's native-autofill state. */
-    private val anchors = Collections.synchronizedMap(WeakHashMap<Any, () -> AutofillAnchor?>())
+    /** Where each browser's view sits on screen; set and removed by NativeAutofillAnchor. */
+    private val anchors = ConcurrentHashMap<Any, () -> AutofillAnchor?>()
 
+    /** One browser tab's native-autofill state. Holds its browser weakly: the browser holds this via its callbacks. */
     private class Tab(
-        val browser: Any,
+        browser: Any,
         val jx: Jx,
         val anchors: Map<Any, () -> AutofillAnchor?>,
         @Volatile var windowId: String? = null,
     ) {
-        fun anchor(): AutofillAnchor? = anchors[browser]?.invoke()
+        private val ref = java.lang.ref.WeakReference(browser)
+
+        val browser: Any? get() = ref.get()
+
+        fun anchor(): AutofillAnchor? = browser?.let { anchors[it]?.invoke() }
 
         @Volatile var dropdown: OpenDropdown? = null
 
@@ -136,22 +135,21 @@ internal object NativeAutofillEngine {
             }
     }
 
+    /** Plugin dispose. Never blocks the caller: the clear runs on its own thread. */
     @Synchronized
     fun stop() {
-        clearBlocking("plugin disposed")
         shutdownHook?.let { runCatching { Runtime.getRuntime().removeShutdownHook(it) } }
         shutdownHook = null
-        tabs.values.forEach { t ->
+        Thread({ clearBlocking("plugin disposed") }, "fluck-native-autofill-stop").apply { isDaemon = true }.start()
+        tabs.live().forEach { t ->
             onEdt {
                 t.dropdown?.window?.dispose()
                 t.prompt?.dismiss()
             }
         }
         tabs.clear()
+        anchors.clear()
         scope.cancel()
-        context = null
-        mirrorProfile = null
-        active = false
     }
 
     fun requestSync() {
@@ -160,7 +158,11 @@ internal object NativeAutofillEngine {
 
     // ------------------------------------------------------------------ tabs
 
-    /** Wire native autofill into [handle]'s browser. False when it is unavailable (the JS path stays). */
+    /**
+     * Wire native autofill into [handle]'s browser. True when this tab is now native (the caller's JS
+     * autofill stands down for this tab only); false when it stays on the JS path. Safe to race
+     * [detach]: a detach during wiring makes this undo itself and return false.
+     */
     @Suppress("ReturnCount")
     fun attach(
         handle: BrowserHandle,
@@ -168,44 +170,62 @@ internal object NativeAutofillEngine {
     ): Boolean {
         if (!enabled || probeFailed) return false
         val browser = browserOf(handle) ?: return false
-        tabs[browser]?.let { return true }
+        if (tabs[browser] != null) return true
+        if (!tabs.reserve(browser)) return false
         val jx =
             Jx.resolve(browser).getOrElse {
+                tabs.abandon(browser)
                 probeFailed = true
                 log("WARN JxBrowser surface does not match (${it::class.simpleName}: ${it.message}); using JS autofill")
                 return false
             }
-        return runCatching {
-            val profile = jx.profile(browser)
-            if (!jx.isUserProfile(profile)) return false
-            val tab = Tab(browser, jx, anchors, windowId = windowId)
-            installCallbacks(tab)
-            // The host closes the engine in its own shutdown hook, which beats ours to the stores.
-            // Closing browsers is the last moment they are still open, so the last tab takes the
-            // mirror with it; the next tab re-syncs.
-            jx.onEvent(browser, jx.browserClosingT) { onBrowserClosing(browser) }
-            val hardware = jx.hardwareAccelerated(browser)
-            if (hardware) installDropdown(tab)
-            log("wired into a tab (own dropdown=$hardware)")
-            tabs[browser] = tab
-            if (mirrorProfile == null) {
-                mirrorProfile = jx to profile
-                requestSync()
+        val tab = Tab(browser, jx, anchors, windowId = windowId)
+        val wired =
+            runCatching {
+                val profile = jx.profile(browser)
+                if (!jx.isUserProfile(profile)) return@runCatching null
+                installCallbacks(tab, browser)
+                jx.onEvent(browser, jx.browserClosingT) { onBrowserClosing(browser) }
+                val hardware = jx.hardwareAccelerated(browser)
+                if (hardware) installDropdown(tab, browser)
+                profile to hardware
+            }.getOrElse {
+                tabs.abandon(browser)
+                probeFailed = true
+                log("WARN could not wire native autofill (${it::class.simpleName}); using JS autofill")
+                return false
             }
-            active = true
-            true
-        }.getOrElse {
-            probeFailed = true
-            log("WARN could not wire native autofill (${it::class.simpleName}); using JS autofill")
-            false
+        if (wired == null) {
+            tabs.abandon(browser)
+            return false
         }
+        if (!tabs.publish(browser, tab)) {
+            uninstall(jx, browser)
+            return false
+        }
+        log("wired into a tab (own dropdown=${wired.second})")
+        if (mirrorProfile == null) {
+            mirrorProfile = jx to wired.first
+            requestSync()
+        }
+        return true
     }
 
+    private fun uninstall(
+        jx: Jx,
+        browser: Any,
+    ) {
+        listOf(jx.savePasswordT, jx.updatePasswordT, jx.saveCardT, jx.saveProfileT, jx.showSuggestionsT)
+            .forEach { runCatching { jx.removeCallback(browser, it) } }
+    }
+
+    /** The last tab closing takes the mirror with it (async: never blocks a JxBrowser thread). */
     private fun onBrowserClosing(browser: Any) {
-        val others = synchronized(tabs) { tabs.keys.count { it !== browser } }
-        if (others > 0) return
-        clearBlocking("last tab closing", keepIndex = true)
-        mirrorProfile = null
+        if (tabs.liveCountExcept(browser) > 0) return
+        scope.launch {
+            clear("last tab closing", keepIndex = true)
+            mirrorProfile = null
+        }
     }
 
     fun setAnchor(
@@ -218,7 +238,7 @@ internal object NativeAutofillEngine {
 
     fun detach(handle: BrowserHandle) {
         val browser = browserOf(handle) ?: return
-        val tab = tabs.remove(browser) ?: return
+        val tab = tabs.detach(browser) ?: return
         onEdt {
             tab.dropdown?.window?.cancel()
             tab.prompt?.dismiss()
@@ -234,21 +254,26 @@ internal object NativeAutofillEngine {
         captured.record(pageUrl, username, password)
     }
 
-    /** Arrow / Enter / Escape from the page while our dropdown is open. */
-    fun onNavKey(
-        handle: BrowserHandle,
+    /**
+     * A real key press on [tab]'s browser (host PressKeyCallback, so never page-synthesised). True when
+     * our dropdown or save card took it. Enter only accepts a row the user highlighted.
+     */
+    private fun onKey(
+        tab: Tab,
         key: String,
-    ) {
-        val tab = browserOf(handle)?.let { tabs[it] } ?: return
-        onEdt {
-            val open = tab.dropdown
-            when {
-                open != null && key == "down" -> open.window.moveSelection(1)
-                open != null && key == "up" -> open.window.moveSelection(-1)
-                open != null && key == "enter" -> open.window.acceptSelected()
-                open != null && key == "escape" -> open.window.cancel()
-                open == null && key == "escape" -> tab.prompt?.dismiss()
-            }
+    ): Boolean {
+        val open = tab.dropdown
+        if (open == null) {
+            if (key != "KEY_CODE_ESCAPE" || tab.prompt == null) return false
+            onEdt { tab.prompt?.dismiss() }
+            return true
+        }
+        return when (key) {
+            "KEY_CODE_DOWN" -> true.also { onEdt { open.window.moveSelection(1) } }
+            "KEY_CODE_UP" -> true.also { onEdt { open.window.moveSelection(-1) } }
+            "KEY_CODE_ESCAPE" -> true.also { onEdt { open.window.cancel() } }
+            "KEY_CODE_RETURN" -> open.window.hasSelection.also { if (it) onEdt { open.window.acceptSelected() } }
+            else -> false
         }
     }
 
@@ -284,7 +309,7 @@ internal object NativeAutofillEngine {
             val path = jx.profilePath(profile)
             val owned = index.keys(path)
             val stores = Stores(jx, profile)
-            val present = stores.presentKeys()
+            val present = stores.presentKeys() ?: return@withLock log("sync skipped: Chromium stores could not be listed")
             val plan = MirrorDiff.plan(desired, present, owned, fingerprints)
             plan.adopt.forEach { index.add(path, it) }
             lastSyncedKeys = desired.keys
@@ -299,10 +324,11 @@ internal object NativeAutofillEngine {
                 // Indexed before the add: a crash after this leaves an indexed key, never an untracked record.
                 index.add(path, item.key)
                 runCatching { index.save() }
-                if (runCatching { stores.write(item, replace = item.key in present) }.isSuccess) {
-                    fingerprints[item.key] = item.fingerprint
-                    written++
-                }
+                runCatching { stores.write(item, replace = item.key in present) }
+                    .onSuccess {
+                        fingerprints[item.key] = item.fingerprint
+                        written++
+                    }.onFailure { log("write failed (${item.key.substringBefore('|')}): ${rootCause(it)}") }
             }
             runCatching { index.save() }
             log(
@@ -317,16 +343,22 @@ internal object NativeAutofillEngine {
         while (offset < MAX_ROWS) {
             val page = provider.getUserSecretsWithSharingInfo(PAGE_SIZE, offset).getOrNull() ?: return null
             out += page.data
-            if (!page.hasMore || page.data.isEmpty()) break
+            if (!page.hasMore || page.data.isEmpty()) return out
             offset += page.data.size
         }
-        return out
+        // Over the cap: a truncated list would remove owned keys past it, so treat it as a failed read.
+        log("sync skipped: more than $MAX_ROWS Secret Manager rows")
+        return null
     }
 
     /** The default profile of a live engine, from any attached tab. */
     private fun liveProfile(): Pair<Jx, Any>? {
-        val tab = tabs.values.firstOrNull { runCatching { !it.jx.isClosed(it.browser) }.getOrDefault(false) } ?: return null
-        return (tab.jx to tab.jx.profile(tab.browser)).also { mirrorProfile = it }
+        for (tab in tabs.live()) {
+            val browser = tab.browser ?: continue
+            if (runCatching { tab.jx.isClosed(browser) }.getOrDefault(true)) continue
+            return (tab.jx to tab.jx.profile(browser)).also { mirrorProfile = it }
+        }
+        return null
     }
 
     private val indexes = ConcurrentHashMap<String, MirrorIndex>()
@@ -365,23 +397,20 @@ internal object NativeAutofillEngine {
         val stores = Stores(jx, profile)
         val owned = index.keys(path)
         // No listing first: on quit the engine is closing underneath us, so every round trip counts.
-        val targets = owned + synced
+        val targets = MirrorDiff.clearSet(owned, synced, owned + synced)
         if (targets.isEmpty()) return
-        val failed = runCatching { stores.removeAll(targets) }.getOrElse {
-            log("remove failed: ${rootCause(it)}")
-            targets.size
-        }
-        // Reading the store back orders after the removals, so they are committed before we report.
-        val still = runCatching { stores.presentKeys() }.getOrDefault(targets) intersect (owned + targets)
-        if (keepIndex) {
-            // If the engine stops first, the next start reconciles from these.
-            targets.forEach { index.add(path, it) }
-        } else {
-            index.clear(path)
-            still.forEach { index.add(path, it) }
-        }
+        val failed =
+            runCatching { stores.removeAll(targets) }.getOrElse {
+                log("remove failed: ${rootCause(it)}")
+                targets.size
+            }
+        // Reading back orders after the removals; null when the store cannot be listed.
+        val after = stores.presentKeys()
+        val keep = if (keepIndex) targets else MirrorDiff.keepAfterClear(targets, failed, after)
+        index.clear(path)
+        keep.forEach { index.add(path, it) }
         runCatching { index.save() }
-        log("cleared reason=$reason targets=${targets.size} failed=$failed stillPresent=${still.size}")
+        log("cleared reason=$reason targets=${targets.size} failed=$failed kept=${keep.size}")
     }
 
     private fun rootCause(t: Throwable): String {
@@ -393,23 +422,27 @@ internal object NativeAutofillEngine {
         reason: String,
         keepIndex: Boolean = false,
     ) {
-        runCatching { runBlocking { withTimeoutOrNull(3_000) { clear(reason, keepIndex) } } }
+        val done = runCatching { runBlocking { withTimeoutOrNull(3_000) { clear(reason, keepIndex) } } }.getOrNull()
+        if (done == null) log("clear ($reason) did not finish in 3 s; the index keeps its keys for the next start")
     }
 
     // ------------------------------------------------------------------ save path
 
-    private fun installCallbacks(tab: Tab) {
+    private fun installCallbacks(
+        tab: Tab,
+        browser: Any,
+    ) {
         val jx = tab.jx
-        jx.setCallback(tab.browser, jx.savePasswordT) { p, a ->
+        jx.setCallback(browser, jx.savePasswordT) { p, a ->
             val (url, login) = jx.savePasswordParams(p)
             onPasswordSave(tab, url, login, update = false, action = a)
         }
-        jx.setCallback(tab.browser, jx.updatePasswordT) { p, a ->
+        jx.setCallback(browser, jx.updatePasswordT) { p, a ->
             val (url, login) = jx.updatePasswordParams(p)
             onPasswordSave(tab, url, login, update = true, action = a)
         }
-        jx.setCallback(tab.browser, jx.saveCardT) { p, a -> onCardSave(tab, jx.saveCardParams(p), a) }
-        jx.setCallback(tab.browser, jx.saveProfileT) { p, a -> onAddressSave(tab, jx.fieldsOf(jx.saveProfileParams(p)), a) }
+        jx.setCallback(browser, jx.saveCardT) { p, a -> onCardSave(tab, jx.saveCardParams(p), a) }
+        jx.setCallback(browser, jx.saveProfileT) { p, a -> onAddressSave(tab, jx.fieldsOf(jx.saveProfileParams(p)), a) }
     }
 
     private fun canSave(): Boolean = System.getProperty("boss.fluck.offerToSavePasswords") != "false" && userId != null
@@ -555,7 +588,8 @@ internal object NativeAutofillEngine {
         prompt(tab, request) { choice, _ ->
             if (choice != SaveChoice.SAVE) return@prompt run { decline() }
             scope.launch {
-                val known = AutofillMapping.map(lastRows).containsKey(key)
+                // Same last four and expiry is not enough: only the same number counts as already saved.
+                val known = AutofillMapping.map(lastRows).values.any { it is MirrorItem.Card && it.number == number }
                 val provider = context?.secretDataProvider
                 val ok = known || provider?.createSecret(AutofillMapping.cardRequest(number, expiry, holder))?.isSuccess == true
                 if (ok) {
@@ -636,9 +670,14 @@ internal object NativeAutofillEngine {
 
     // ------------------------------------------------------------------ dropdown
 
-    private fun installDropdown(tab: Tab) {
+    private fun installDropdown(
+        tab: Tab,
+        browser: Any,
+    ) {
         val jx = tab.jx
-        jx.setCallback(tab.browser, jx.showSuggestionsT) { p, a ->
+        // Keys for the dropdown come from the host's PressKeyCallback (real input only), never the page.
+        jx.interceptKeys(browser) { key -> onKey(tab, key) }
+        jx.setCallback(browser, jx.showSuggestionsT) { p, a ->
             val shown = runCatching { jx.showParams(p) }.getOrElse {
                 log("suggestions unreadable (${it::class.simpleName}); cancelled")
                 runCatching { jx.cancelSuggestions(a) }
@@ -646,7 +685,7 @@ internal object NativeAutofillEngine {
             }
             onEdt { showDropdown(tab, shown, a) }
         }
-        jx.onEvent(tab.browser, jx.suggestionsUpdatedT) { e ->
+        jx.onEvent(browser, jx.suggestionsUpdatedT) { e ->
             val list = jx.updatedSuggestions(e)
             onEdt {
                 tab.dropdown?.let { open ->
@@ -655,14 +694,13 @@ internal object NativeAutofillEngine {
                 }
             }
         }
-        jx.onEvent(tab.browser, jx.suggestionsHiddenT) {
+        jx.onEvent(browser, jx.suggestionsHiddenT) {
             onEdt {
                 tab.dropdown?.window?.dispose()
                 tab.dropdown = null
-                navFlag(tab, 0)
             }
         }
-        jx.onNavigation(tab.browser, jx.navigationStartedT) { onEdt { tab.dropdown?.window?.cancel() } }
+        jx.onNavigation(browser, jx.navigationStartedT) { onEdt { tab.dropdown?.window?.cancel() } }
     }
 
     private fun showDropdown(
@@ -675,11 +713,11 @@ internal object NativeAutofillEngine {
         tab.dropdown = null
         val anchor = tab.anchor()
         if (anchor == null || shown.suggestions.isEmpty()) {
-            if (anchor == null) log("dropdown cancelled: browser view not on screen (anchor=${anchors.containsKey(tab.browser)})")
+            if (anchor == null) log("dropdown cancelled: browser view not on screen ")
             runCatching { jx.cancelSuggestions(action) }
             return
         }
-        val site = runCatching { java.net.URI(jx.url(tab.browser)).host.orEmpty().removePrefix("www.") }.getOrDefault("")
+        val site = runCatching { java.net.URI(tab.browser?.let { jx.url(it) }.orEmpty()).host.orEmpty().removePrefix("www.") }.getOrDefault("")
         lateinit var open: OpenDropdown
         val window =
             SuggestionsWindow(
@@ -695,30 +733,18 @@ internal object NativeAutofillEngine {
                 onManage = { openManager(tab.windowId) },
                 onAccept = { i ->
                     if (tab.dropdown === open) tab.dropdown = null
-                    navFlag(tab, 0)
-                    val picked = open.suggestions.getOrNull(i)
+                        val picked = open.suggestions.getOrNull(i)
                     if (picked != null) runCatching { jx.acceptSuggestion(action, picked) } else runCatching { jx.cancelSuggestions(action) }
                 },
                 onCancel = {
                     if (tab.dropdown === open) tab.dropdown = null
-                    navFlag(tab, 0)
-                    runCatching { jx.cancelSuggestions(action) }
+                        runCatching { jx.cancelSuggestions(action) }
                 },
-                onSelection = { selected -> navFlag(tab, if (selected) 2 else 1) },
             )
         open = OpenDropdown(window, shown.suggestions, shown.type, site, action)
         tab.dropdown = open
         val ok = window.show(shown.suggestions.map { rowOf(jx, it, shown.type, site) }, Point(shown.x, shown.y))
-        if (ok) navFlag(tab, 1)
         log(if (ok) "dropdown shown type=${shown.type} count=${shown.suggestions.size}" else "dropdown withheld: window not active")
-    }
-
-    /** Tells the page script whether arrows/Enter/Escape belong to our dropdown (0 closed, 1 open, 2 row selected). */
-    private fun navFlag(
-        tab: Tab,
-        state: Int,
-    ) {
-        scope.launch { runCatching { tab.jx.runInMainFrame(tab.browser, AutofillKeys.setState(state)) } }
     }
 
     private fun openManager(windowId: String?) {
@@ -745,13 +771,15 @@ internal object NativeAutofillEngine {
     ) {
         private fun keyOf(r: Jx.Login): String = loginKey(AutofillMapping.normalizeOrigin(r.url) ?: r.url, r.login)
 
-        fun presentKeys(): Set<String> {
-            val out = mutableSetOf<String>()
-            runCatching { jx.logins(profile).forEach { out += keyOf(it) } }
-            runCatching { jx.cards(profile).forEach { out += cardKey(it.last4, it.expiry) } }
-            runCatching { jx.udps(profile).forEach { out += addressKey(it.fields) } }
-            return out
-        }
+        /** Every key Chromium holds, or null when any store cannot be listed. */
+        fun presentKeys(): Set<String>? =
+            runCatching {
+                buildSet {
+                    jx.logins(profile).forEach { add(keyOf(it)) }
+                    jx.cards(profile).forEach { add(cardKey(it.last4, it.expiry)) }
+                    jx.udps(profile).forEach { add(addressKey(it.fields)) }
+                }
+            }.getOrNull()
 
         /** Removes every record whose key is in [keys], passwords first; returns how many removals failed. */
         fun removeAll(keys: Set<String>): Int {

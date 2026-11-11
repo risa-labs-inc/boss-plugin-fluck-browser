@@ -15,8 +15,6 @@ import ai.rever.boss.plugin.api.LocalWindowIdProvider
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.ScreenCaptureProvider
 import ai.rever.boss.plugin.api.SecretDataProvider
-import ai.rever.boss.plugin.browser.PAGE_EVENT_BRIDGE
-import ai.rever.boss.plugin.browser.PAGE_EVENT_EMIT
 import ai.rever.boss.plugin.api.SecretEntryData
 import ai.rever.boss.plugin.api.UpdateSecretRequestData
 import ai.rever.boss.plugin.api.TabComponentWithUI
@@ -29,6 +27,8 @@ import ai.rever.boss.plugin.api.UrlHistoryEntry
 import ai.rever.boss.plugin.api.UrlHistoryProvider
 import ai.rever.boss.plugin.api.ZoomSettingsProvider
 import ai.rever.boss.plugin.bookmark.Bookmark
+import ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillAnchor
+import ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
 import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossColors
 import ai.rever.boss.plugin.ui.BossThemeColors
@@ -2888,22 +2888,24 @@ internal fun FluckBrowserTabContent(
     // Native Chromium autofill (Secret Manager mirrored into the browser's own stores). When it is
     // wired into this tab, the JS saved-logins popup and save prompt below stand down.
     val autofillWindowId = LocalWindowIdProvider.current?.getWindowId()
+    // Per tab: only a tab native autofill actually wired loses its JS autofill.
+    var nativeAutofill by remember(browserHandle) { mutableStateOf(false) }
     DisposableEffect(browserHandle) {
         val handle = browserHandle
-        if (handle != null) {
-            coroutineScope.launch(Dispatchers.IO) {
-                ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
-                    .attach(handle, autofillWindowId)
-            }
-        }
-        onDispose {
+        // attach() tolerates finishing after detach(): it then undoes itself and returns false.
+        val wiring =
             handle?.let {
-                ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
-                    .detach(it)
+                coroutineScope.launch(Dispatchers.IO) {
+                    val wired = NativeAutofillEngine.attach(it, autofillWindowId)
+                    withContext(Dispatchers.Main) { nativeAutofill = wired }
+                }
             }
+        onDispose {
+            wiring?.cancel()
+            nativeAutofill = false
+            handle?.let { NativeAutofillEngine.detach(it) }
         }
     }
-    val nativeAutofill = NativeAutofill.isActive()
 
     // A credential the user submitted, waiting to find out whether the login worked. Memory only,
     // never persisted. See CredentialSavePolicy.
@@ -3599,11 +3601,9 @@ internal fun FluckBrowserTabContent(
     // This is the only path by which a page value the user typed reaches the plugin, and it only
     // ever fires on a submit. The periodic probe above stays value-free (hasValue: Boolean) for
     // exactly that reason - see CredentialCapture's KDoc for the rule.
-    LaunchedEffect(browserHandle, offerToSavePasswordsEnabled, nativeAutofill) {
+    LaunchedEffect(browserHandle, offerToSavePasswordsEnabled) {
         val handle = browserHandle ?: return@LaunchedEffect
-        // Native autofill needs the channel even with the JS prompt off: it carries the submitted
-        // value for Chromium's save callback and the dropdown's arrow/Enter/Escape keys.
-        if (!offerToSavePasswordsEnabled && !nativeAutofill) {
+        if (!offerToSavePasswordsEnabled) {
             // Also drops anything already captured: leaving a pending credential in memory after
             // the feature is switched off would surface a prompt the user has just disabled.
             pendingSave = null
@@ -3629,12 +3629,7 @@ internal fun FluckBrowserTabContent(
         // in a long task would otherwise park the thread drawing the UI.
         withContext(Dispatchers.IO) {
             val installed =
-                PageEventChannel.install(
-                    handle,
-                    CredentialCapture.INSTALL_JS + "\n" +
-                        ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.AutofillKeys
-                            .script("$PAGE_EVENT_BRIDGE.$PAGE_EVENT_EMIT"),
-                ) { url, json ->
+                PageEventChannel.install(handle, CredentialCapture.INSTALL_JS) { url, json ->
                     // JxBrowser thread, inside the page's own event dispatch. trySend and nothing
                     // else: a blocking hand-off would stall the submit the user just performed.
                     //
@@ -3669,19 +3664,12 @@ internal fun FluckBrowserTabContent(
 
     // Turn a pushed capture into a pending save.
     LaunchedEffect(captureChannel, offerToSavePasswordsEnabled, nativeAutofill) {
-        if (!offerToSavePasswordsEnabled && !nativeAutofill) return@LaunchedEffect
+        if (!offerToSavePasswordsEnabled) return@LaunchedEffect
         for (event in captureChannel) {
+            // Native: the value only pairs with Chromium's own save callback; nothing here prompts.
             if (nativeAutofill) {
-                val handle = browserHandle
-                val nav = ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.AutofillKeys.parse(event.json)
-                if (nav != null && handle != null) {
-                    ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
-                        .onNavKey(handle, nav)
-                } else if (offerToSavePasswordsEnabled) {
-                    CredentialCapture.parse(event.json)?.let {
-                        ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
-                            .recordCapture(event.url, it.username, it.password)
-                    }
+                CredentialCapture.parse(event.json)?.let {
+                    NativeAutofillEngine.recordCapture(event.url, it.username, it.password)
                 }
                 continue
             }
@@ -4502,7 +4490,7 @@ internal fun FluckBrowserTabContent(
 
             // Where native autofill's dropdown and save card anchor: this view, on screen.
             browserHandle?.let { handle ->
-                ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillAnchor(
+                NativeAutofillAnchor(
                     handle,
                     Modifier.matchParentSize(),
                 )

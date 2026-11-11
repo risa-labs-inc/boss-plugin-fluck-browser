@@ -27,22 +27,6 @@ class JxProbeTest {
     }
 
     @Test
-    fun `dropdown key payloads are recognised and nothing else is`() {
-        assertEquals("down", AutofillKeys.parse("""{"nav":"down"}"""))
-        assertEquals("escape", AutofillKeys.parse("""{"nav":"escape"}"""))
-        assertNull(AutofillKeys.parse("""{"username":"a","password":"b"}"""))
-        assertNull(AutofillKeys.parse("""{"nav":"left"}"""))
-    }
-
-    @Test
-    fun `the key script only acts while the flag is set`() {
-        val js = AutofillKeys.script("bridge.emit")
-        assertTrue("if (!e.isTrusted || !navState) return;" in js)
-        assertTrue(AutofillKeys.EVENT in AutofillKeys.setState(1))
-        assertTrue("window." !in js, "no globals on window")
-    }
-
-    @Test
     fun `suggestion rows`() {
         val pw = SuggestionRows.rowOf("ada@x.com", "••••", null, null, "PASSWORDS", "example.com")
         assertEquals(SuggestionKind.PASSWORD, pw.kind)

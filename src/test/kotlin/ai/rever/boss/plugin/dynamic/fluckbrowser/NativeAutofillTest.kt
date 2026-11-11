@@ -20,16 +20,6 @@ class NativeAutofillTest {
     )
 
     @Test
-    fun `inactive until the engine has wired a browser, whatever the old host property says`() {
-        System.setProperty("boss.browser.nativeAutofill", "true")
-        try {
-            assertFalse(NativeAutofill.isActive())
-        } finally {
-            System.clearProperty("boss.browser.nativeAutofill")
-        }
-    }
-
-    @Test
     fun `saved logins list is offered normally and suppressed when native is active`() {
         assertTrue(shouldOfferSuggestions(field(), null, 1))
         assertTrue(shouldOfferSuggestions(field(), null, 1, nativeAutofill = false))
