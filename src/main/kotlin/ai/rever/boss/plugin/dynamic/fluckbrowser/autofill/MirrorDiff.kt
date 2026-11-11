@@ -3,37 +3,48 @@ package ai.rever.boss.plugin.dynamic.fluckbrowser.autofill
 /**
  * One reconcile step between what Secret Manager wants in Chromium and what is there.
  *
- * @param desired SM rows mapped to items, by key.
- * @param present keys Chromium holds right now (ours and the user's own).
- * @param owned keys the mirror added and still owns (the persisted index).
- * @param fingerprints in-memory value fingerprints of what the mirror last wrote, by key.
+ * @property adopt Chromium records that match a current SM row but are missing from the index
+ *   (a lost or stale index, a crash between add and index write). Taken into the index so normal
+ *   removal covers them.
+ * @property remove owned keys SM no longer has.
+ * @property write items to (re)write; adopted ones are rewritten so Chromium holds SM's value.
  */
 internal data class MirrorPlan(
+    val adopt: Set<String>,
     val remove: Set<String>,
     val write: List<MirrorItem>,
-    val skippedForeign: Set<String>,
 )
 
 internal object MirrorDiff {
+    /**
+     * @param desired SM rows mapped to items, by key.
+     * @param present keys Chromium holds right now (ours and the user's own).
+     * @param owned keys in the persisted index.
+     * @param fingerprints in-memory value fingerprints of what the mirror last wrote, by key.
+     */
     fun plan(
         desired: Map<String, MirrorItem>,
         present: Set<String>,
         owned: Set<String>,
         fingerprints: Map<String, String>,
     ): MirrorPlan {
+        val adopt = (desired.keys intersect present) - owned
+        val mine = owned + adopt
         val remove = owned - desired.keys
-        val write = mutableListOf<MirrorItem>()
-        val foreign = mutableSetOf<String>()
-        for ((key, item) in desired) {
-            when {
-                // A record the user (or Chromium itself) saved before the mirror knew it: never ours to touch.
-                key in present && key !in owned -> foreign += key
-
-                key in owned && key in present && fingerprints[key] == item.fingerprint -> Unit
-
-                else -> write += item
+        val write =
+            desired.values.filter { item ->
+                !(item.key in mine && item.key in present && fingerprints[item.key] == item.fingerprint)
             }
-        }
-        return MirrorPlan(remove = remove, write = write, skippedForeign = foreign)
+        return MirrorPlan(adopt = adopt, remove = remove, write = write)
     }
+
+    /**
+     * What sign-out and quit remove: everything indexed, plus anything matching an SM row seen at
+     * the last successful sync. A record matching neither may be the user's own and stays.
+     */
+    fun clearSet(
+        owned: Set<String>,
+        lastSyncedKeys: Set<String>,
+        present: Set<String>,
+    ): Set<String> = (owned + lastSyncedKeys) intersect present
 }

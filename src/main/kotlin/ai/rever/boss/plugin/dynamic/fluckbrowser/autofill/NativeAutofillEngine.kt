@@ -70,6 +70,9 @@ internal object NativeAutofillEngine {
 
     @Volatile private var syncedUserId: String? = null
 
+    /** Keys of the SM rows seen at the last successful sync; sign-out and quit remove matches too. */
+    @Volatile private var lastSyncedKeys: Set<String> = emptySet()
+
     @Volatile private var mirrorProfile: Pair<Jx, Any>? = null
 
     private var shutdownHook: Thread? = null
@@ -270,7 +273,10 @@ internal object NativeAutofillEngine {
             val path = jx.profilePath(profile)
             val owned = index.keys(path)
             val stores = Stores(jx, profile)
-            val plan = MirrorDiff.plan(desired, stores.presentKeys(), owned, fingerprints)
+            val present = stores.presentKeys()
+            val plan = MirrorDiff.plan(desired, present, owned, fingerprints)
+            plan.adopt.forEach { index.add(path, it) }
+            lastSyncedKeys = desired.keys
             for (key in plan.remove) {
                 runCatching { stores.remove(key) }
                 index.remove(path, key)
@@ -278,8 +284,10 @@ internal object NativeAutofillEngine {
             }
             var written = 0
             for (item in plan.write) {
-                if (runCatching { stores.write(item, replaceOwned = item.key in owned) }.isSuccess) {
-                    index.add(path, item.key)
+                // Indexed before the add: a crash after this leaves an indexed key, never an untracked record.
+                index.add(path, item.key)
+                runCatching { index.save() }
+                if (runCatching { stores.write(item, replace = item.key in present) }.isSuccess) {
                     fingerprints[item.key] = item.fingerprint
                     written++
                 }
@@ -287,7 +295,7 @@ internal object NativeAutofillEngine {
             runCatching { index.save() }
             log(
                 "synced rows=${rows.size} mirrored=${desired.size} written=$written " +
-                    "removed=${plan.remove.size} skippedForeign=${plan.skippedForeign.size}",
+                    "removed=${plan.remove.size} adopted=${plan.adopt.size}",
             )
         }
 
@@ -337,24 +345,27 @@ internal object NativeAutofillEngine {
         lastRows = emptyList()
         syncedUserId = null
         fingerprints.clear()
+        val synced = lastSyncedKeys
+        lastSyncedKeys = emptySet()
         val (jx, profile) = mirrorProfile ?: return
         val index = indexFor(jx, profile)
         val path = runCatching { jx.profilePath(profile) }.getOrNull() ?: return
-        val keys = index.keys(path)
-        if (keys.isEmpty()) return
-        val removed =
-            runCatching {
-                val stores = Stores(jx, profile)
-                keys.forEach { key -> runCatching { stores.remove(key) } }
-                if (!keepIndex) {
-                    val still = runCatching { stores.presentKeys() }.getOrDefault(keys) intersect keys
-                    index.clear(path)
-                    still.forEach { index.add(path, it) }
-                    index.save()
-                }
-                keys.size
-            }.getOrElse { 0 }
-        log("cleared reason=$reason removed=$removed")
+        val stores = Stores(jx, profile)
+        val owned = index.keys(path)
+        val present = runCatching { stores.presentKeys() }.getOrDefault(owned)
+        val targets = MirrorDiff.clearSet(owned, synced, present)
+        if (targets.isEmpty() && owned.isEmpty()) return
+        targets.forEach { key -> runCatching { stores.remove(key) } }
+        if (keepIndex) {
+            // Removal may not reach disk before the engine stops; the next start reconciles from these.
+            targets.forEach { index.add(path, it) }
+        } else {
+            val still = runCatching { stores.presentKeys() }.getOrDefault(targets) intersect (owned + targets)
+            index.clear(path)
+            still.forEach { index.add(path, it) }
+        }
+        runCatching { index.save() }
+        log("cleared reason=$reason removed=${targets.size}")
     }
 
     private fun clearBlocking(
@@ -731,9 +742,9 @@ internal object NativeAutofillEngine {
 
         fun write(
             item: MirrorItem,
-            replaceOwned: Boolean,
+            replace: Boolean,
         ) {
-            if (replaceOwned) remove(item.key)
+            if (replace) remove(item.key)
             when (item) {
                 is MirrorItem.Login -> jx.addLogin(profile, item.origin + "/", item.username, item.password)
                 is MirrorItem.Card -> jx.addCard(profile, item.number, item.expiry, item.holder)

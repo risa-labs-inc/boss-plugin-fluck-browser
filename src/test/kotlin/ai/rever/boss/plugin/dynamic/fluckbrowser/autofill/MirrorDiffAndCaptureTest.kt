@@ -30,18 +30,36 @@ class MirrorDiffAndCaptureTest {
     }
 
     @Test
-    fun `records the mirror did not add are never touched`() {
+    fun `a record matching an SM row but missing from the index is adopted and rewritten`() {
         val a = login("a.com", "me")
-        val plan =
-            MirrorDiff.plan(
-                desired = mapOf(a.key to a),
-                present = setOf(a.key, "pw|https://users-own.com|x"),
-                owned = emptySet(),
-                fingerprints = emptyMap(),
-            )
+        val plan = MirrorDiff.plan(mapOf(a.key to a), setOf(a.key), owned = emptySet(), fingerprints = emptyMap())
+        assertEquals(setOf(a.key), plan.adopt)
+        assertEquals(listOf(a.key), plan.write.map { it.key })
         assertTrue(plan.remove.isEmpty())
-        assertTrue(plan.write.isEmpty())
-        assertEquals(setOf(a.key), plan.skippedForeign)
+    }
+
+    @Test
+    fun `a crash between add and index write is recovered, then removed like any owned record`() {
+        val a = login("a.com", "me")
+        // Old order: Chromium has the copy, the index never heard of it.
+        val first = MirrorDiff.plan(mapOf(a.key to a), setOf(a.key), emptySet(), emptyMap())
+        assertEquals(setOf(a.key), first.adopt)
+        val owned = first.adopt
+        // SM row deleted later: the adopted key goes.
+        val later = MirrorDiff.plan(emptyMap(), setOf(a.key), owned, emptyMap())
+        assertEquals(setOf(a.key), later.remove)
+        // Sign-out before any further sync: removed via the last synced keys even with no index entry.
+        assertEquals(setOf(a.key), MirrorDiff.clearSet(emptySet(), setOf(a.key), setOf(a.key)))
+    }
+
+    @Test
+    fun `a record matching neither the index nor any SM row is never touched`() {
+        val a = login("a.com", "me")
+        val users = "pw|https://users-own.com|x"
+        val plan = MirrorDiff.plan(mapOf(a.key to a), setOf(a.key, users), emptySet(), emptyMap())
+        assertTrue(users !in plan.adopt && users !in plan.remove && plan.write.none { it.key == users })
+        assertEquals(setOf(a.key), MirrorDiff.clearSet(setOf(a.key), setOf(a.key), setOf(a.key, users)))
+        assertTrue(MirrorDiff.clearSet(emptySet(), emptySet(), setOf(users)).isEmpty())
     }
 
     @Test
