@@ -57,6 +57,7 @@ internal class Jx private constructor(
     val suggestionsUpdatedT = type("$P.browser.event.internal.SuggestionsUpdated")
     val suggestionsHiddenT = type("$P.browser.event.internal.SuggestionsHidden")
     val navigationStartedT = type("$P.navigation.event.NavigationStarted")
+    val browserClosingT = type("$P.browser.event.BrowserClosing")
 
     private val browserProfile = browserT.m("profile")
     private val browserEngine = browserT.m("engine")

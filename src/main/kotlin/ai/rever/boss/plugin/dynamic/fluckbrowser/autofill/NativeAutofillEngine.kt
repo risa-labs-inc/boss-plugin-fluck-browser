@@ -180,6 +180,10 @@ internal object NativeAutofillEngine {
             if (!jx.isUserProfile(profile)) return false
             val tab = Tab(browser, jx, anchors, windowId = windowId)
             installCallbacks(tab)
+            // The host closes the engine in its own shutdown hook, which beats ours to the stores.
+            // Closing browsers is the last moment they are still open, so the last tab takes the
+            // mirror with it; the next tab re-syncs.
+            jx.onEvent(browser, jx.browserClosingT) { onBrowserClosing(browser) }
             val hardware = jx.hardwareAccelerated(browser)
             if (hardware) installDropdown(tab)
             log("wired into a tab (own dropdown=$hardware)")
@@ -195,6 +199,13 @@ internal object NativeAutofillEngine {
             log("WARN could not wire native autofill (${it::class.simpleName}); using JS autofill")
             false
         }
+    }
+
+    private fun onBrowserClosing(browser: Any) {
+        val others = synchronized(tabs) { tabs.keys.count { it !== browser } }
+        if (others > 0) return
+        clearBlocking("last tab closing", keepIndex = true)
+        mirrorProfile = null
     }
 
     fun setAnchor(
@@ -279,7 +290,8 @@ internal object NativeAutofillEngine {
             lastSyncedKeys = desired.keys
             for (key in plan.remove) {
                 runCatching { stores.remove(key) }
-                index.remove(path, key)
+                    .onSuccess { index.remove(path, key) }
+                    .onFailure { log("remove failed (${key.substringBefore('|')}): ${rootCause(it)}") }
                 fingerprints.remove(key)
             }
             var written = 0
@@ -352,20 +364,29 @@ internal object NativeAutofillEngine {
         val path = runCatching { jx.profilePath(profile) }.getOrNull() ?: return
         val stores = Stores(jx, profile)
         val owned = index.keys(path)
-        val present = runCatching { stores.presentKeys() }.getOrDefault(owned)
-        val targets = MirrorDiff.clearSet(owned, synced, present)
-        if (targets.isEmpty() && owned.isEmpty()) return
-        targets.forEach { key -> runCatching { stores.remove(key) } }
+        // No listing first: on quit the engine is closing underneath us, so every round trip counts.
+        val targets = owned + synced
+        if (targets.isEmpty()) return
+        val failed = runCatching { stores.removeAll(targets) }.getOrElse {
+            log("remove failed: ${rootCause(it)}")
+            targets.size
+        }
+        // Reading the store back orders after the removals, so they are committed before we report.
+        val still = runCatching { stores.presentKeys() }.getOrDefault(targets) intersect (owned + targets)
         if (keepIndex) {
-            // Removal may not reach disk before the engine stops; the next start reconciles from these.
+            // If the engine stops first, the next start reconciles from these.
             targets.forEach { index.add(path, it) }
         } else {
-            val still = runCatching { stores.presentKeys() }.getOrDefault(targets) intersect (owned + targets)
             index.clear(path)
             still.forEach { index.add(path, it) }
         }
         runCatching { index.save() }
-        log("cleared reason=$reason removed=${targets.size}")
+        log("cleared reason=$reason targets=${targets.size} failed=$failed stillPresent=${still.size}")
+    }
+
+    private fun rootCause(t: Throwable): String {
+        val root = generateSequence(t) { it.cause }.last()
+        return root::class.simpleName.orEmpty()
     }
 
     private fun clearBlocking(
@@ -730,6 +751,18 @@ internal object NativeAutofillEngine {
             runCatching { jx.cards(profile).forEach { out += cardKey(it.last4, it.expiry) } }
             runCatching { jx.udps(profile).forEach { out += addressKey(it.fields) } }
             return out
+        }
+
+        /** Removes every record whose key is in [keys], passwords first; returns how many removals failed. */
+        fun removeAll(keys: Set<String>): Int {
+            var failed = 0
+            fun attempt(block: () -> Unit) {
+                runCatching(block).onFailure { failed++ }
+            }
+            jx.logins(profile).filter { keyOf(it) in keys }.forEach { attempt { jx.removeLogin(profile, it) } }
+            jx.cards(profile).filter { cardKey(it.last4, it.expiry) in keys }.forEach { attempt { jx.removeCard(profile, it) } }
+            jx.udps(profile).filter { addressKey(it.fields) in keys }.forEach { attempt { jx.removeUdp(profile, it) } }
+            return failed
         }
 
         fun remove(key: String) {
