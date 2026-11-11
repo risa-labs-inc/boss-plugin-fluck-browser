@@ -2881,7 +2881,9 @@ internal fun FluckBrowserTabContent(
     // (BrowserSettings.init), and defaulting a password manager to off would leave a feature nobody
     // finds. Compare showShareButton below, which defaults OFF and so tests for "true".
     val suggestPasswordsEnabled = System.getProperty("boss.fluck.suggestPasswords") != "false"
-    val offerToSavePasswordsEnabled = System.getProperty("boss.fluck.offerToSavePasswords") != "false"
+    val nativeAutofill = NativeAutofill.isActive()
+    val offerToSavePasswordsEnabled =
+        System.getProperty("boss.fluck.offerToSavePasswords") != "false" && !nativeAutofill
 
     // A credential the user submitted, waiting to find out whether the login worked. Memory only,
     // never persisted. See CredentialSavePolicy.
@@ -3536,7 +3538,13 @@ internal fun FluckBrowserTabContent(
         remember(probeDomain, allSecrets) {
             probeDomain != null && matchSecretsForDomain(probeDomain, allSecrets).isNotEmpty()
         }
-    val probeWanted = hasCredentialsForPage || suggestPasswordsEnabled || pendingSave != null
+    // Native autofill: only the explicit "suggest password" request needs the probe.
+    val probeWanted =
+        if (nativeAutofill) {
+            suggestPasswordsEnabled && forceSuggestPassword
+        } else {
+            hasCredentialsForPage || suggestPasswordsEnabled || pendingSave != null
+        }
     LaunchedEffect(browserHandle, probeWanted) {
         if (!probeWanted) {
             focusedLoginField = null
@@ -4483,9 +4491,15 @@ internal fun FluckBrowserTabContent(
                         dismissedSuggestionId,
                         suggestPasswordsEnabled,
                         forced = forceSuggestPassword,
+                        nativeAutofill = nativeAutofill,
                     )
             if (!generatorHasThisBox &&
-                shouldOfferSuggestions(suggestionField, dismissedSuggestionId, suggestionMatches.size) &&
+                shouldOfferSuggestions(
+                    suggestionField,
+                    dismissedSuggestionId,
+                    suggestionMatches.size,
+                    nativeAutofill = nativeAutofill,
+                ) &&
                 suggestionField != null
             ) {
                 Box(
@@ -4554,7 +4568,8 @@ internal fun FluckBrowserTabContent(
             // for the numbers and for why the bound depends on the candidate length.
             val wantsSuggestion =
                 generatorField != null &&
-                    (generatorField.isNewPassword || (forceSuggestPassword && generatorField.isPassword))
+                    ((generatorField.isNewPassword && !nativeAutofill) ||
+                        (forceSuggestPassword && generatorField.isPassword))
             val offered by produceState<PasswordGenerator.Outcome.Generated?>(
                 initialValue = null,
                 generatorField?.dismissId,
@@ -4581,6 +4596,7 @@ internal fun FluckBrowserTabContent(
                     dismissedSuggestionId,
                     suggestPasswordsEnabled,
                     forced = forceSuggestPassword,
+                    nativeAutofill = nativeAutofill,
                 )
             ) {
                 Box(
