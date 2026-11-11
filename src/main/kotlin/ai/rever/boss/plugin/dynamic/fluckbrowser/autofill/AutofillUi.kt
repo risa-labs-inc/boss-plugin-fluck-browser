@@ -363,7 +363,8 @@ internal class SuggestionsWindow(
 
     /** True when a row was highlighted and accepted. */
     fun acceptSelected(): Boolean {
-        if (selected < 0) return false
+        // Keyboard accept only while the dropdown is showing over an active owner window.
+        if (selected < 0 || closed || !overlay.dialog.isVisible || !overlay.ownerActive) return false
         accept(selected)
         return true
     }

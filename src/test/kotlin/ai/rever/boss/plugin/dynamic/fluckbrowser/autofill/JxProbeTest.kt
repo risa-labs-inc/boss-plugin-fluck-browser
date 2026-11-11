@@ -37,7 +37,7 @@ class JxProbeTest {
     @Test
     fun `the key script only acts while the flag is set`() {
         val js = AutofillKeys.script("bridge.emit")
-        assertTrue("if (!navState) return;" in js)
+        assertTrue("if (!e.isTrusted || !navState) return;" in js)
         assertTrue(AutofillKeys.EVENT in AutofillKeys.setState(1))
         assertTrue("window." !in js, "no globals on window")
     }

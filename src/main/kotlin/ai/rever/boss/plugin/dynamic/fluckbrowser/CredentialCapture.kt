@@ -230,7 +230,7 @@ internal object CredentialCapture {
 
         document.addEventListener('submit', function() { capture(); }, true);
         document.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') capture();
+            if (e.isTrusted && e.key === 'Enter') capture();
         }, true);
         document.addEventListener('pointerdown', function(e) {
             if (looksLikeSubmit(e.target)) capture();

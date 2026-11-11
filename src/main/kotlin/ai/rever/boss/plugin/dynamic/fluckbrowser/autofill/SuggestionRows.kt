@@ -73,7 +73,8 @@ internal object AutofillKeys {
             var navState = 0;
             document.addEventListener('$EVENT', function(e) { navState = (e.detail | 0); }, true);
             document.addEventListener('keydown', function(e) {
-                if (!navState) return;
+                // Only real keystrokes: a page could otherwise accept a suggestion for itself.
+                if (!e.isTrusted || !navState) return;
                 var k = e.key === 'ArrowDown' ? 'down' : e.key === 'ArrowUp' ? 'up' :
                     e.key === 'Escape' ? 'escape' : (e.key === 'Enter' && navState === 2) ? 'enter' : null;
                 if (!k) return;
