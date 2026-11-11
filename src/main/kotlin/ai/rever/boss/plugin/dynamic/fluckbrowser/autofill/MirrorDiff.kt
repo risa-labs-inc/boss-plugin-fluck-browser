@@ -21,19 +21,24 @@ internal object MirrorDiff {
      * @param present keys Chromium holds right now (ours and the user's own).
      * @param owned keys in the persisted index.
      * @param fingerprints in-memory value fingerprints of what the mirror last wrote, by key.
+     * @param written every key this install has ever written into the profile.
      */
     fun plan(
         desired: Map<String, MirrorItem>,
         present: Set<String>,
         owned: Set<String>,
         fingerprints: Map<String, String>,
+        written: Set<String> = owned,
     ): MirrorPlan {
-        val adopt = (desired.keys intersect present) - owned
+        // Only keys this install once wrote: a matching record the user saved themselves is theirs.
+        val adopt = (desired.keys intersect present intersect written) - owned
         val mine = owned + adopt
         val remove = owned - desired.keys
         val write =
             desired.values.filter { item ->
-                !(item.key in mine && item.key in present && fingerprints[item.key] == item.fingerprint)
+                val foreign = item.key in present && item.key !in mine
+                val current = item.key in mine && item.key in present && fingerprints[item.key] == item.fingerprint
+                !foreign && !current
             }
         return MirrorPlan(adopt = adopt, remove = remove, write = write)
     }
@@ -46,7 +51,8 @@ internal object MirrorDiff {
         owned: Set<String>,
         lastSyncedKeys: Set<String>,
         present: Set<String>,
-    ): Set<String> = (owned + lastSyncedKeys) intersect present
+        written: Set<String> = owned + lastSyncedKeys,
+    ): Set<String> = (owned + (lastSyncedKeys intersect written)) intersect present
 
     /**
      * Index keys to keep after a clear removed [targets]: all of them when any removal failed or the

@@ -9,8 +9,10 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
 /**
- * Keys of the Chromium records the mirror added, per profile path. Persisted so a crash before
- * clear-on-quit is cleaned up on the next sync. Keys only: no values.
+ * Keys of the Chromium records the mirror owns, per profile path, plus every key this install has
+ * ever written there ([written]), so adoption never claims a record the user saved themselves.
+ * Keys only, no values, but `pw|origin|username` keys still name sites and usernames, so the file
+ * is owner-only (0600) where the filesystem allows.
  */
 internal class MirrorIndex(
     private val file: File,
@@ -27,12 +29,18 @@ internal class MirrorIndex(
     @Synchronized
     fun keys(profile: String): Set<String> = byProfile[profile]?.toSet().orEmpty()
 
+    /** Every key this install has written into [profile], owned now or not. */
+    @Synchronized
+    fun written(profile: String): Set<String> = byProfile[profile + WRITTEN]?.toSet().orEmpty()
+
     @Synchronized
     fun add(
         profile: String,
         key: String,
     ) {
-        if (profile.isNotEmpty()) byProfile.getOrPut(profile) { mutableSetOf() } += key
+        if (profile.isEmpty()) return
+        byProfile.getOrPut(profile) { mutableSetOf() } += key
+        byProfile.getOrPut(profile + WRITTEN) { mutableSetOf() } += key
     }
 
     @Synchronized
@@ -54,6 +62,13 @@ internal class MirrorIndex(
         val tmp = File(file.parentFile, file.name + ".tmp")
         val snapshot = byProfile.filterValues { it.isNotEmpty() }.mapValues { it.value.sorted() }
         tmp.writeText(Json.encodeToString(serializer, snapshot))
+        runCatching {
+            Files.setPosixFilePermissions(tmp.toPath(), java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"))
+        }
         Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+    }
+
+    private companion object {
+        const val WRITTEN = "#written"
     }
 }

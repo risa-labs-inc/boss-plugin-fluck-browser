@@ -48,4 +48,24 @@ class LifecycleTest {
         assertEquals(setOf("card|4242|2030-01"), MirrorDiff.keepAfterClear(targets, failed = 0, after = setOf("card|4242|2030-01", "pw|https://users-own.com|x")))
         assertTrue(MirrorDiff.keepAfterClear(targets, failed = 0, after = emptySet()).isEmpty())
     }
+
+    @Test
+    fun `history of written keys survives a clear, owned keys do not`() {
+        val dir = kotlin.io.path.createTempDirectory("idx").toFile()
+        val f = java.io.File(dir, "i.json")
+        val idx = MirrorIndex(f)
+        idx.add("/p", "pw|https://a.com|me")
+        idx.clear("/p")
+        idx.save()
+        val again = MirrorIndex(f)
+        assertTrue(again.keys("/p").isEmpty())
+        assertEquals(setOf("pw|https://a.com|me"), again.written("/p"))
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun `one parser for both kill switches`() {
+        listOf("false", "FALSE", " 0 ", "no", "Off").forEach { assertTrue(NativeAutofillEngine.isOff(it), it) }
+        listOf(null, "", "true", "1").forEach { assertFalse(NativeAutofillEngine.isOff(it), it.toString()) }
+    }
 }

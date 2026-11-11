@@ -32,7 +32,7 @@ class MirrorDiffAndCaptureTest {
     @Test
     fun `a record matching an SM row but missing from the index is adopted and rewritten`() {
         val a = login("a.com", "me")
-        val plan = MirrorDiff.plan(mapOf(a.key to a), setOf(a.key), owned = emptySet(), fingerprints = emptyMap())
+        val plan = MirrorDiff.plan(mapOf(a.key to a), setOf(a.key), owned = emptySet(), fingerprints = emptyMap(), written = setOf(a.key))
         assertEquals(setOf(a.key), plan.adopt)
         assertEquals(listOf(a.key), plan.write.map { it.key })
         assertTrue(plan.remove.isEmpty())
@@ -42,14 +42,24 @@ class MirrorDiffAndCaptureTest {
     fun `a crash between add and index write is recovered, then removed like any owned record`() {
         val a = login("a.com", "me")
         // Old order: Chromium has the copy, the index never heard of it.
-        val first = MirrorDiff.plan(mapOf(a.key to a), setOf(a.key), emptySet(), emptyMap())
+        // The index is written before the add, so the key is in this install's history.
+        val first = MirrorDiff.plan(mapOf(a.key to a), setOf(a.key), emptySet(), emptyMap(), written = setOf(a.key))
         assertEquals(setOf(a.key), first.adopt)
         val owned = first.adopt
         // SM row deleted later: the adopted key goes.
         val later = MirrorDiff.plan(emptyMap(), setOf(a.key), owned, emptyMap())
         assertEquals(setOf(a.key), later.remove)
         // Sign-out before any further sync: removed via the last synced keys even with no index entry.
-        assertEquals(setOf(a.key), MirrorDiff.clearSet(emptySet(), setOf(a.key), setOf(a.key)))
+        assertEquals(setOf(a.key), MirrorDiff.clearSet(emptySet(), setOf(a.key), setOf(a.key), written = setOf(a.key)))
+    }
+
+    @Test
+    fun `a matching record the user saved themselves is never adopted or cleared`() {
+        val a = login("a.com", "me")
+        val plan = MirrorDiff.plan(mapOf(a.key to a), setOf(a.key), emptySet(), emptyMap(), written = emptySet())
+        assertTrue(plan.adopt.isEmpty())
+        assertTrue(plan.write.none { it.key == a.key })
+        assertTrue(MirrorDiff.clearSet(emptySet(), setOf(a.key), setOf(a.key), written = emptySet()).isEmpty())
     }
 
     @Test

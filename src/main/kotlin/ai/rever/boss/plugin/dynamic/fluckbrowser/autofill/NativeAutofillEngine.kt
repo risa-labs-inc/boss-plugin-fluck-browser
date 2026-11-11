@@ -44,8 +44,11 @@ internal object NativeAutofillEngine {
 
     /** Kill switch: `-Dboss.fluck.nativeAutofill=false` or `BOSS_NATIVE_AUTOFILL=false`. */
     private val enabled: Boolean =
-        System.getProperty("boss.fluck.nativeAutofill") != "false" &&
-            System.getenv("BOSS_NATIVE_AUTOFILL")?.trim()?.lowercase() !in setOf("false", "0", "no", "off")
+        !isOff(System.getProperty("boss.fluck.nativeAutofill")) && !isOff(System.getenv("BOSS_NATIVE_AUTOFILL"))
+
+    internal fun isOff(value: String?): Boolean = value?.trim()?.lowercase() in setOf("false", "0", "no", "off")
+
+    @Volatile private var started = false
 
     @Volatile private var probeFailed = false
 
@@ -94,6 +97,23 @@ internal object NativeAutofillEngine {
         @Volatile var dropdown: OpenDropdown? = null
 
         @Volatile var prompt: SavePrompt? = null
+
+        /** Everything installed on the browser, so [uninstall] can take it all back. */
+        val subscriptions: MutableList<Any> = java.util.concurrent.CopyOnWriteArrayList()
+
+        @Volatile var keyHook: Jx.KeyHook? = null
+    }
+
+    /** Removes every callback, observer and key hook this plugin put on [tab]'s browser. */
+    private fun uninstall(tab: Tab) {
+        val browser = tab.browser ?: return
+        val jx = tab.jx
+        listOf(jx.savePasswordT, jx.updatePasswordT, jx.saveCardT, jx.saveProfileT, jx.showSuggestionsT)
+            .forEach { runCatching { jx.removeCallback(browser, it) } }
+        tab.subscriptions.forEach { runCatching { jx.unsubscribe(it) } }
+        tab.subscriptions.clear()
+        tab.keyHook?.let { hook -> runCatching { jx.restoreKeys(browser, hook) } }
+        tab.keyHook = null
     }
 
     private class OpenDropdown(
@@ -109,6 +129,8 @@ internal object NativeAutofillEngine {
     @Synchronized
     fun start(ctx: PluginContext) {
         if (!enabled) return log("disabled by switch")
+        if (started) return
+        started = true
         context = ctx
         scope = newScope()
         scope.launch {
@@ -130,18 +152,21 @@ internal object NativeAutofillEngine {
             }
         }
         shutdownHook =
-            Thread({ clearBlocking("exit", keepIndex = true) }, "fluck-native-autofill-exit").also {
+            Thread({ clearBlocking("exit", keepIndex = true, timeoutMs = 1_000) }, "fluck-native-autofill-exit").also {
                 runCatching { Runtime.getRuntime().addShutdownHook(it) }
             }
     }
 
-    /** Plugin dispose. Never blocks the caller: the clear runs on its own thread. */
+    /** Plugin dispose. Blocks the caller at most 1 s: the clear runs on its own thread. */
     @Synchronized
     fun stop() {
         shutdownHook?.let { runCatching { Runtime.getRuntime().removeShutdownHook(it) } }
         shutdownHook = null
-        Thread({ clearBlocking("plugin disposed") }, "fluck-native-autofill-stop").apply { isDaemon = true }.start()
+        val profile = mirrorProfile
+        val clearing = Thread({ clearBlocking("plugin disposed", profile = profile) }, "fluck-native-autofill-stop").apply { isDaemon = true }
+        clearing.start()
         tabs.live().forEach { t ->
+            uninstall(t)
             onEdt {
                 t.dropdown?.window?.dispose()
                 t.prompt?.dismiss()
@@ -150,6 +175,11 @@ internal object NativeAutofillEngine {
         tabs.clear()
         anchors.clear()
         scope.cancel()
+        // Bounded, so dispose stays prompt; the clear has read what it needs by then.
+        runCatching { clearing.join(1_000) }
+        context = null
+        mirrorProfile = null
+        started = false
     }
 
     fun requestSync() {
@@ -185,11 +215,12 @@ internal object NativeAutofillEngine {
                 val profile = jx.profile(browser)
                 if (!jx.isUserProfile(profile)) return@runCatching null
                 installCallbacks(tab, browser)
-                jx.onEvent(browser, jx.browserClosingT) { onBrowserClosing(browser) }
+                tab.subscriptions += jx.onEvent(browser, jx.browserClosingT) { onBrowserClosing(browser) }
                 val hardware = jx.hardwareAccelerated(browser)
                 if (hardware) installDropdown(tab, browser)
                 profile to hardware
             }.getOrElse {
+                uninstall(tab)
                 tabs.abandon(browser)
                 probeFailed = true
                 log("WARN could not wire native autofill (${it::class.simpleName}); using JS autofill")
@@ -200,7 +231,7 @@ internal object NativeAutofillEngine {
             return false
         }
         if (!tabs.publish(browser, tab)) {
-            uninstall(jx, browser)
+            uninstall(tab)
             return false
         }
         log("wired into a tab (own dropdown=${wired.second})")
@@ -209,14 +240,6 @@ internal object NativeAutofillEngine {
             requestSync()
         }
         return true
-    }
-
-    private fun uninstall(
-        jx: Jx,
-        browser: Any,
-    ) {
-        listOf(jx.savePasswordT, jx.updatePasswordT, jx.saveCardT, jx.saveProfileT, jx.showSuggestionsT)
-            .forEach { runCatching { jx.removeCallback(browser, it) } }
     }
 
     /** The last tab closing takes the mirror with it (async: never blocks a JxBrowser thread). */
@@ -239,6 +262,7 @@ internal object NativeAutofillEngine {
     fun detach(handle: BrowserHandle) {
         val browser = browserOf(handle) ?: return
         val tab = tabs.detach(browser) ?: return
+        uninstall(tab)
         onEdt {
             tab.dropdown?.window?.cancel()
             tab.prompt?.dismiss()
@@ -310,7 +334,7 @@ internal object NativeAutofillEngine {
             val owned = index.keys(path)
             val stores = Stores(jx, profile)
             val present = stores.presentKeys() ?: return@withLock log("sync skipped: Chromium stores could not be listed")
-            val plan = MirrorDiff.plan(desired, present, owned, fingerprints)
+            val plan = MirrorDiff.plan(desired, present, owned, fingerprints, index.written(path))
             plan.adopt.forEach { index.add(path, it) }
             lastSyncedKeys = desired.keys
             for (key in plan.remove) {
@@ -320,10 +344,10 @@ internal object NativeAutofillEngine {
                 fingerprints.remove(key)
             }
             var written = 0
+            // Indexed before the adds: a crash after this leaves indexed keys, never untracked records.
+            plan.write.forEach { index.add(path, it.key) }
+            runCatching { index.save() }
             for (item in plan.write) {
-                // Indexed before the add: a crash after this leaves an indexed key, never an untracked record.
-                index.add(path, item.key)
-                runCatching { index.save() }
                 runCatching { stores.write(item, replace = item.key in present) }
                     .onSuccess {
                         fingerprints[item.key] = item.fingerprint
@@ -374,7 +398,8 @@ internal object NativeAutofillEngine {
     private suspend fun clear(
         reason: String,
         keepIndex: Boolean = false,
-    ) = mutex.withLock { clearLocked(reason, keepIndex) }
+        profile: Pair<Jx, Any>? = null,
+    ) = mutex.withLock { clearLocked(reason, keepIndex, profile) }
 
     /**
      * Removes what the mirror added. The index keeps any key still present afterwards, and on exit
@@ -384,6 +409,7 @@ internal object NativeAutofillEngine {
     private fun clearLocked(
         reason: String,
         keepIndex: Boolean = false,
+        profileOverride: Pair<Jx, Any>? = null,
     ) {
         captured.clear()
         lastRows = emptyList()
@@ -391,13 +417,13 @@ internal object NativeAutofillEngine {
         fingerprints.clear()
         val synced = lastSyncedKeys
         lastSyncedKeys = emptySet()
-        val (jx, profile) = mirrorProfile ?: return
+        val (jx, profile) = profileOverride ?: mirrorProfile ?: return
         val index = indexFor(jx, profile)
         val path = runCatching { jx.profilePath(profile) }.getOrNull() ?: return
         val stores = Stores(jx, profile)
         val owned = index.keys(path)
         // No listing first: on quit the engine is closing underneath us, so every round trip counts.
-        val targets = MirrorDiff.clearSet(owned, synced, owned + synced)
+        val targets = MirrorDiff.clearSet(owned, synced, owned + synced, index.written(path))
         if (targets.isEmpty()) return
         val failed =
             runCatching { stores.removeAll(targets) }.getOrElse {
@@ -421,9 +447,11 @@ internal object NativeAutofillEngine {
     private fun clearBlocking(
         reason: String,
         keepIndex: Boolean = false,
+        timeoutMs: Long = 3_000,
+        profile: Pair<Jx, Any>? = null,
     ) {
-        val done = runCatching { runBlocking { withTimeoutOrNull(3_000) { clear(reason, keepIndex) } } }.getOrNull()
-        if (done == null) log("clear ($reason) did not finish in 3 s; the index keeps its keys for the next start")
+        val done = runCatching { runBlocking { withTimeoutOrNull(timeoutMs) { clear(reason, keepIndex, profile) } } }.getOrNull()
+        if (done == null) log("clear ($reason) did not finish in $timeoutMs ms; the index keeps its keys for the next start")
     }
 
     // ------------------------------------------------------------------ save path
@@ -676,7 +704,7 @@ internal object NativeAutofillEngine {
     ) {
         val jx = tab.jx
         // Keys for the dropdown come from the host's PressKeyCallback (real input only), never the page.
-        jx.interceptKeys(browser) { key -> onKey(tab, key) }
+        tab.keyHook = jx.interceptKeys(browser) { key -> onKey(tab, key) }
         jx.setCallback(browser, jx.showSuggestionsT) { p, a ->
             val shown = runCatching { jx.showParams(p) }.getOrElse {
                 log("suggestions unreadable (${it::class.simpleName}); cancelled")
@@ -685,7 +713,7 @@ internal object NativeAutofillEngine {
             }
             onEdt { showDropdown(tab, shown, a) }
         }
-        jx.onEvent(browser, jx.suggestionsUpdatedT) { e ->
+        tab.subscriptions += jx.onEvent(browser, jx.suggestionsUpdatedT) { e ->
             val list = jx.updatedSuggestions(e)
             onEdt {
                 tab.dropdown?.let { open ->
@@ -694,13 +722,13 @@ internal object NativeAutofillEngine {
                 }
             }
         }
-        jx.onEvent(browser, jx.suggestionsHiddenT) {
+        tab.subscriptions += jx.onEvent(browser, jx.suggestionsHiddenT) {
             onEdt {
                 tab.dropdown?.window?.dispose()
                 tab.dropdown = null
             }
         }
-        jx.onNavigation(browser, jx.navigationStartedT) { onEdt { tab.dropdown?.window?.cancel() } }
+        tab.subscriptions += jx.onNavigation(browser, jx.navigationStartedT) { onEdt { tab.dropdown?.window?.cancel() } }
     }
 
     private fun showDropdown(

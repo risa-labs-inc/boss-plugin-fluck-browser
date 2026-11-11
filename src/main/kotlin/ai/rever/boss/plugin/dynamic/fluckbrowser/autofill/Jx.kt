@@ -329,10 +329,16 @@ internal class Jx private constructor(
      * only, never anything a page can synthesise. [consume] gets the key name (`KEY_CODE_DOWN`...) for
      * unmodified keys and returns true to suppress it; everything else goes to the host's callback.
      */
+    /** What [interceptKeys] installed, so it can be put back. */
+    class KeyHook(
+        val proxy: Any,
+        val previous: Any?,
+    )
+
     fun interceptKeys(
         browser: Any,
         consume: (String) -> Boolean,
-    ) {
+    ): KeyHook {
         val previous = (advisableGet.invoke(browser, pressKeyT) as? java.util.Optional<*>)?.orElse(null)
         val proxy =
             Proxy.newProxyInstance(
@@ -364,23 +370,38 @@ internal class Jx private constructor(
                 },
             )
         advisableSet.invoke(browser, pressKeyT, proxy)
+        return KeyHook(proxy, previous)
+    }
+
+    /** Puts the host's PressKeyCallback back, but only if ours is still the one installed. */
+    fun restoreKeys(
+        browser: Any,
+        hook: KeyHook,
+    ) {
+        val current = (advisableGet.invoke(browser, pressKeyT) as? java.util.Optional<*>)?.orElse(null)
+        if (current !== hook.proxy) return
+        if (hook.previous != null) advisableSet.invoke(browser, pressKeyT, hook.previous) else advisableRemove.invoke(browser, pressKeyT)
+    }
+
+    /** Cancels a subscription returned by [onEvent] / [onNavigation]. */
+    fun unsubscribe(subscription: Any) {
+        val m =
+            subscription.javaClass.interfaces.firstOrNull { it.name == "$P.event.Subscription" }?.getMethod("unsubscribe")
+                ?: subscription.javaClass.getMethod("unsubscribe")
+        m.invoke(subscription)
     }
 
     fun onEvent(
         browser: Any,
         eventType: Class<*>,
         on: (Any) -> Unit,
-    ) {
-        observableOn.invoke(browser, eventType, proxy(observerT) { args -> args.firstOrNull()?.let(on) })
-    }
+    ): Any = observableOn.invoke(browser, eventType, proxy(observerT) { args -> args.firstOrNull()?.let(on) })
 
     fun onNavigation(
         browser: Any,
         eventType: Class<*>,
         on: (Any) -> Unit,
-    ) {
-        navigationOn.invoke(browserNavigation.invoke(browser), eventType, proxy(observerT) { args -> args.firstOrNull()?.let(on) })
-    }
+    ): Any = navigationOn.invoke(browserNavigation.invoke(browser), eventType, proxy(observerT) { args -> args.firstOrNull()?.let(on) })
 
     private fun proxy(
         iface: Class<*>,
