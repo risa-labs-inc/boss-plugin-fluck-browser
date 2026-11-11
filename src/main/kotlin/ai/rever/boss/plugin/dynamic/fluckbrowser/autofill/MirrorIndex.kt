@@ -29,6 +29,18 @@ internal class MirrorIndex(
     @Synchronized
     fun keys(profile: String): Set<String> = byProfile[profile]?.toSet().orEmpty()
 
+    /** The user whose rows were last mirrored into [profile] (an id, no PII). */
+    @Synchronized
+    fun owner(profile: String): String? = byProfile[profile + OWNER]?.firstOrNull()
+
+    @Synchronized
+    fun setOwner(
+        profile: String,
+        userId: String,
+    ) {
+        if (profile.isNotEmpty()) byProfile[profile + OWNER] = mutableSetOf(userId)
+    }
+
     /** Every key this install has written into [profile], owned now or not. */
     @Synchronized
     fun written(profile: String): Set<String> = byProfile[profile + WRITTEN]?.toSet().orEmpty()
@@ -61,14 +73,25 @@ internal class MirrorIndex(
         file.parentFile?.mkdirs()
         val tmp = File(file.parentFile, file.name + ".tmp")
         val snapshot = byProfile.filterValues { it.isNotEmpty() }.mapValues { it.value.sorted() }
-        tmp.writeText(Json.encodeToString(serializer, snapshot))
+        tmp.delete()
         runCatching {
-            Files.setPosixFilePermissions(tmp.toPath(), java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"))
+            Files.createFile(
+                tmp.toPath(),
+                java.nio.file.attribute.PosixFilePermissions.asFileAttribute(
+                    java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"),
+                ),
+            )
         }
-        Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        tmp.writeText(Json.encodeToString(serializer, snapshot))
+        try {
+            Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        } catch (e: java.nio.file.AtomicMoveNotSupportedException) {
+            Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
     }
 
     private companion object {
         const val WRITTEN = "#written"
+        const val OWNER = "#user"
     }
 }

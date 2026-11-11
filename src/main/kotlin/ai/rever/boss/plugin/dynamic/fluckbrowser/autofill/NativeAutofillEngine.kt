@@ -101,6 +101,8 @@ internal object NativeAutofillEngine {
         /** Everything installed on the browser, so [uninstall] can take it all back. */
         val subscriptions: MutableList<Any> = java.util.concurrent.CopyOnWriteArrayList()
 
+        val callbacks: MutableList<Jx.Installed> = java.util.concurrent.CopyOnWriteArrayList()
+
         @Volatile var keyHook: Jx.KeyHook? = null
     }
 
@@ -108,8 +110,8 @@ internal object NativeAutofillEngine {
     private fun uninstall(tab: Tab) {
         val browser = tab.browser ?: return
         val jx = tab.jx
-        listOf(jx.savePasswordT, jx.updatePasswordT, jx.saveCardT, jx.saveProfileT, jx.showSuggestionsT)
-            .forEach { runCatching { jx.removeCallback(browser, it) } }
+        tab.callbacks.forEach { runCatching { jx.restoreCallback(browser, it) } }
+        tab.callbacks.clear()
         tab.subscriptions.forEach { runCatching { jx.unsubscribe(it) } }
         tab.subscriptions.clear()
         tab.keyHook?.let { hook -> runCatching { jx.restoreKeys(browser, hook) } }
@@ -220,10 +222,10 @@ internal object NativeAutofillEngine {
                 if (hardware) installDropdown(tab, browser)
                 profile to hardware
             }.getOrElse {
+                // Per tab (a browser closing while we wire it, say); the surface itself passed the probe.
                 uninstall(tab)
                 tabs.abandon(browser)
-                probeFailed = true
-                log("WARN could not wire native autofill (${it::class.simpleName}); using JS autofill")
+                log("could not wire this tab (${it::class.simpleName}); it keeps JS autofill")
                 return false
             }
         if (wired == null) {
@@ -323,6 +325,10 @@ internal object NativeAutofillEngine {
             if (userId == null) return@withLock clearLocked("no user")
             if (syncedUserId != null && syncedUserId != userId) clearLocked("user changed")
             val (jx, profile) = liveProfile() ?: return@withLock
+            // Another user's mirror goes first, from the index alone: it must not wait on a Secret
+            // Manager read that may fail.
+            val previous = indexFor(jx, profile).owner(jx.profilePath(profile))
+            if (previous != null && previous != userId) clearLocked("previous user")
             val provider = ctx.secretDataProvider ?: return@withLock
             val rows = fetchAll(provider) ?: return@withLock log("sync skipped: Secret Manager read failed")
             lastRows = rows
@@ -346,14 +352,15 @@ internal object NativeAutofillEngine {
             var written = 0
             // Indexed before the adds: a crash after this leaves indexed keys, never untracked records.
             plan.write.forEach { index.add(path, it.key) }
-            runCatching { index.save() }
-            for (item in plan.write) {
+            val indexed = runCatching { index.save() }.onFailure { log("index save failed (${rootCause(it)}); no adds this sync") }.isSuccess
+            for (item in if (indexed) plan.write else emptyList()) {
                 runCatching { stores.write(item, replace = item.key in present) }
                     .onSuccess {
                         fingerprints[item.key] = item.fingerprint
                         written++
                     }.onFailure { log("write failed (${item.key.substringBefore('|')}): ${rootCause(it)}") }
             }
+            userId?.let { index.setOwner(path, it) }
             runCatching { index.save() }
             log(
                 "synced rows=${rows.size} mirrored=${desired.size} written=$written " +
@@ -461,16 +468,43 @@ internal object NativeAutofillEngine {
         browser: Any,
     ) {
         val jx = tab.jx
-        jx.setCallback(browser, jx.savePasswordT) { p, a ->
-            val (url, login) = jx.savePasswordParams(p)
-            onPasswordSave(tab, url, login, update = false, action = a)
-        }
-        jx.setCallback(browser, jx.updatePasswordT) { p, a ->
-            val (url, login) = jx.updatePasswordParams(p)
-            onPasswordSave(tab, url, login, update = true, action = a)
-        }
-        jx.setCallback(browser, jx.saveCardT) { p, a -> onCardSave(tab, jx.saveCardParams(p), a) }
-        jx.setCallback(browser, jx.saveProfileT) { p, a -> onAddressSave(tab, jx.fieldsOf(jx.saveProfileParams(p)), a) }
+        // Every path answers Chromium: a handler that throws still ignores / declines.
+        fun answered(
+            negative: (Any) -> Unit,
+            body: (Any, Any) -> Unit,
+        ): (Any, Any) -> Unit =
+            { p, a ->
+                runCatching { body(p, a) }.onFailure {
+                    log("save callback failed (${rootCause(it)}); answered negatively")
+                    runCatching { negative(a) }
+                }
+            }
+        tab.callbacks +=
+            jx.setCallback(
+                browser,
+                jx.savePasswordT,
+                answered({ jx.savePassword(it, "ignore") }) { p, a ->
+                    val (url, login) = jx.savePasswordParams(p)
+                    onPasswordSave(tab, url, login, update = false, action = a)
+                },
+            )
+        tab.callbacks +=
+            jx.setCallback(
+                browser,
+                jx.updatePasswordT,
+                answered({ jx.updatePassword(it, "ignore") }) { p, a ->
+                    val (url, login) = jx.updatePasswordParams(p)
+                    onPasswordSave(tab, url, login, update = true, action = a)
+                },
+            )
+        tab.callbacks +=
+            jx.setCallback(browser, jx.saveCardT, answered({ jx.saveCard(it, false) }) { p, a -> onCardSave(tab, jx.saveCardParams(p), a) })
+        tab.callbacks +=
+            jx.setCallback(
+                browser,
+                jx.saveProfileT,
+                answered({ jx.saveProfile(it, false) }) { p, a -> onAddressSave(tab, jx.fieldsOf(jx.saveProfileParams(p)), a) },
+            )
     }
 
     private fun canSave(): Boolean = System.getProperty("boss.fluck.offerToSavePasswords") != "false" && userId != null
@@ -705,7 +739,7 @@ internal object NativeAutofillEngine {
         val jx = tab.jx
         // Keys for the dropdown come from the host's PressKeyCallback (real input only), never the page.
         tab.keyHook = jx.interceptKeys(browser) { key -> onKey(tab, key) }
-        jx.setCallback(browser, jx.showSuggestionsT) { p, a ->
+        tab.callbacks += jx.setCallback(browser, jx.showSuggestionsT) { p, a ->
             val shown = runCatching { jx.showParams(p) }.getOrElse {
                 log("suggestions unreadable (${it::class.simpleName}); cancelled")
                 runCatching { jx.cancelSuggestions(a) }
@@ -741,7 +775,7 @@ internal object NativeAutofillEngine {
         tab.dropdown = null
         val anchor = tab.anchor()
         if (anchor == null || shown.suggestions.isEmpty()) {
-            if (anchor == null) log("dropdown cancelled: browser view not on screen ")
+            if (anchor == null) log("dropdown cancelled: browser view not on screen")
             runCatching { jx.cancelSuggestions(action) }
             return
         }
@@ -761,12 +795,12 @@ internal object NativeAutofillEngine {
                 onManage = { openManager(tab.windowId) },
                 onAccept = { i ->
                     if (tab.dropdown === open) tab.dropdown = null
-                        val picked = open.suggestions.getOrNull(i)
+                    val picked = open.suggestions.getOrNull(i)
                     if (picked != null) runCatching { jx.acceptSuggestion(action, picked) } else runCatching { jx.cancelSuggestions(action) }
                 },
                 onCancel = {
                     if (tab.dropdown === open) tab.dropdown = null
-                        runCatching { jx.cancelSuggestions(action) }
+                    runCatching { jx.cancelSuggestions(action) }
                 },
             )
         open = OpenDropdown(window, shown.suggestions, shown.type, site, action)

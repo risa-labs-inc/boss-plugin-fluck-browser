@@ -2892,15 +2892,22 @@ internal fun FluckBrowserTabContent(
     var nativeAutofill by remember(browserHandle) { mutableStateOf(false) }
     DisposableEffect(browserHandle) {
         val handle = browserHandle
-        // attach() tolerates finishing after detach(): it then undoes itself and returns false.
+        // attach() can't be interrupted, and may even reserve after onDispose ran: whichever of the
+        // two finishes last detaches.
+        val disposed = java.util.concurrent.atomic.AtomicBoolean(false)
         val wiring =
             handle?.let {
                 coroutineScope.launch(Dispatchers.IO) {
                     val wired = NativeAutofillEngine.attach(it, autofillWindowId)
-                    withContext(Dispatchers.Main) { nativeAutofill = wired }
+                    if (disposed.get()) {
+                        NativeAutofillEngine.detach(it)
+                    } else {
+                        withContext(Dispatchers.Main) { nativeAutofill = wired }
+                    }
                 }
             }
         onDispose {
+            disposed.set(true)
             wiring?.cancel()
             nativeAutofill = false
             handle?.let { NativeAutofillEngine.detach(it) }

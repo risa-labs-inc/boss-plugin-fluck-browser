@@ -68,4 +68,19 @@ class LifecycleTest {
         listOf("false", "FALSE", " 0 ", "no", "Off").forEach { assertTrue(NativeAutofillEngine.isOff(it), it) }
         listOf(null, "", "true", "1").forEach { assertFalse(NativeAutofillEngine.isOff(it), it.toString()) }
     }
+
+    @Test
+    fun `the index remembers whose rows it mirrored`() {
+        val dir = kotlin.io.path.createTempDirectory("idx").toFile()
+        val f = java.io.File(dir, "i.json")
+        MirrorIndex(f).apply {
+            setOwner("/p", "user-a")
+            add("/p", "pw|https://a.com|me")
+            save()
+        }
+        val again = MirrorIndex(f)
+        assertEquals("user-a", again.owner("/p"))
+        assertEquals(setOf("pw|https://a.com|me"), again.keys("/p"))
+        dir.deleteRecursively()
+    }
 }

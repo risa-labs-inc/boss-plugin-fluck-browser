@@ -308,13 +308,36 @@ internal class Jx private constructor(
     // ---- callbacks and events ----
 
     /** Installs [on] as the browser's [callbackType] via a Proxy; returns false if JxBrowser refused. */
+    /** One callback we installed, and whatever it replaced, so [restoreCallback] can put that back. */
+    class Installed(
+        val type: Class<*>,
+        val proxy: Any,
+        val previous: Any?,
+    )
+
     fun setCallback(
         browser: Any,
         callbackType: Class<*>,
         on: (params: Any, action: Any) -> Unit,
-    ) {
+    ): Installed {
+        val previous = (advisableGet.invoke(browser, callbackType) as? java.util.Optional<*>)?.orElse(null)
         val proxy = proxy(callbackType) { args -> if (args.size == 2) on(args[0]!!, args[1]!!) }
         advisableSet.invoke(browser, callbackType, proxy)
+        return Installed(callbackType, proxy, previous)
+    }
+
+    /** Puts back what [installed] replaced, but only if ours is still the one installed. */
+    fun restoreCallback(
+        browser: Any,
+        installed: Installed,
+    ) {
+        val current = (advisableGet.invoke(browser, installed.type) as? java.util.Optional<*>)?.orElse(null)
+        if (current !== installed.proxy) return
+        if (installed.previous != null) {
+            advisableSet.invoke(browser, installed.type, installed.previous)
+        } else {
+            advisableRemove.invoke(browser, installed.type)
+        }
     }
 
     fun removeCallback(
@@ -324,17 +347,17 @@ internal class Jx private constructor(
         advisableRemove.invoke(browser, callbackType)
     }
 
-    /**
-     * Puts [consume] in front of the browser's existing PressKeyCallback (the host's): real key presses
-     * only, never anything a page can synthesise. [consume] gets the key name (`KEY_CODE_DOWN`...) for
-     * unmodified keys and returns true to suppress it; everything else goes to the host's callback.
-     */
     /** What [interceptKeys] installed, so it can be put back. */
     class KeyHook(
         val proxy: Any,
         val previous: Any?,
     )
 
+    /**
+     * Puts [consume] in front of the browser's existing PressKeyCallback (the host's): real key presses
+     * only, never anything a page can synthesise. [consume] gets the key name (`KEY_CODE_DOWN`...) for
+     * unmodified keys and returns true to suppress it; everything else goes to the host's callback.
+     */
     fun interceptKeys(
         browser: Any,
         consume: (String) -> Boolean,
