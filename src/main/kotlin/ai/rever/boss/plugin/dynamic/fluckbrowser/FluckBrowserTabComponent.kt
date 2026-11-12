@@ -27,6 +27,8 @@ import ai.rever.boss.plugin.api.UrlHistoryEntry
 import ai.rever.boss.plugin.api.UrlHistoryProvider
 import ai.rever.boss.plugin.api.ZoomSettingsProvider
 import ai.rever.boss.plugin.bookmark.Bookmark
+import ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillAnchor
+import ai.rever.boss.plugin.dynamic.fluckbrowser.autofill.NativeAutofillEngine
 import ai.rever.boss.plugin.ui.BossTheme
 import ai.rever.boss.plugin.ui.BossColors
 import ai.rever.boss.plugin.ui.BossThemeColors
@@ -2883,6 +2885,35 @@ internal fun FluckBrowserTabContent(
     val suggestPasswordsEnabled = System.getProperty("boss.fluck.suggestPasswords") != "false"
     val offerToSavePasswordsEnabled = System.getProperty("boss.fluck.offerToSavePasswords") != "false"
 
+    // Native Chromium autofill (Secret Manager mirrored into the browser's own stores). When it is
+    // wired into this tab, the JS saved-logins popup and save prompt below stand down.
+    val autofillWindowId = LocalWindowIdProvider.current?.getWindowId()
+    // Per tab: only a tab native autofill actually wired loses its JS autofill.
+    var nativeAutofill by remember(browserHandle) { mutableStateOf(false) }
+    DisposableEffect(browserHandle) {
+        val handle = browserHandle
+        // attach() can't be interrupted, and may even reserve after onDispose ran: whichever of the
+        // two finishes last detaches.
+        val disposed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val wiring =
+            handle?.let {
+                coroutineScope.launch(Dispatchers.IO) {
+                    val wired = NativeAutofillEngine.attach(it, autofillWindowId)
+                    if (disposed.get()) {
+                        NativeAutofillEngine.detach(it)
+                    } else {
+                        withContext(Dispatchers.Main) { nativeAutofill = wired }
+                    }
+                }
+            }
+        onDispose {
+            disposed.set(true)
+            wiring?.cancel()
+            nativeAutofill = false
+            handle?.let { NativeAutofillEngine.detach(it) }
+        }
+    }
+
     // A credential the user submitted, waiting to find out whether the login worked. Memory only,
     // never persisted. See CredentialSavePolicy.
     var pendingSave by remember { mutableStateOf<CredentialSavePolicy.Pending?>(null) }
@@ -3536,7 +3567,13 @@ internal fun FluckBrowserTabContent(
         remember(probeDomain, allSecrets) {
             probeDomain != null && matchSecretsForDomain(probeDomain, allSecrets).isNotEmpty()
         }
-    val probeWanted = hasCredentialsForPage || suggestPasswordsEnabled || pendingSave != null
+    // Native autofill: only the explicit "suggest password" request needs the probe.
+    val probeWanted =
+        if (nativeAutofill) {
+            suggestPasswordsEnabled && forceSuggestPassword
+        } else {
+            hasCredentialsForPage || suggestPasswordsEnabled || pendingSave != null
+        }
     LaunchedEffect(browserHandle, probeWanted) {
         if (!probeWanted) {
             focusedLoginField = null
@@ -3633,9 +3670,16 @@ internal fun FluckBrowserTabContent(
     }
 
     // Turn a pushed capture into a pending save.
-    LaunchedEffect(captureChannel, offerToSavePasswordsEnabled) {
+    LaunchedEffect(captureChannel, offerToSavePasswordsEnabled, nativeAutofill) {
         if (!offerToSavePasswordsEnabled) return@LaunchedEffect
         for (event in captureChannel) {
+            // Native: the value only pairs with Chromium's own save callback; nothing here prompts.
+            if (nativeAutofill) {
+                CredentialCapture.parse(event.json)?.let {
+                    NativeAutofillEngine.recordCapture(event.url, it.username, it.password)
+                }
+                continue
+            }
             val captured = CredentialCapture.parse(event.json) ?: continue
             // The domain comes from the URL the HOST read off the posting document, never from the
             // page's payload: the bridge is reachable by any script on the page, so a page-supplied
@@ -4451,6 +4495,14 @@ internal fun FluckBrowserTabContent(
                 }
             }
 
+            // Where native autofill's dropdown and save card anchor: this view, on screen.
+            browserHandle?.let { handle ->
+                NativeAutofillAnchor(
+                    handle,
+                    Modifier.matchParentSize(),
+                )
+            }
+
             // Inline credential suggestions, anchored under the page's focused login box.
             //
             // The anchor is a zero-size Box offset to where the field is: BossPopup measures its
@@ -4483,9 +4535,15 @@ internal fun FluckBrowserTabContent(
                         dismissedSuggestionId,
                         suggestPasswordsEnabled,
                         forced = forceSuggestPassword,
+                        nativeAutofill = nativeAutofill,
                     )
             if (!generatorHasThisBox &&
-                shouldOfferSuggestions(suggestionField, dismissedSuggestionId, suggestionMatches.size) &&
+                shouldOfferSuggestions(
+                    suggestionField,
+                    dismissedSuggestionId,
+                    suggestionMatches.size,
+                    nativeAutofill = nativeAutofill,
+                ) &&
                 suggestionField != null
             ) {
                 Box(
@@ -4554,7 +4612,8 @@ internal fun FluckBrowserTabContent(
             // for the numbers and for why the bound depends on the candidate length.
             val wantsSuggestion =
                 generatorField != null &&
-                    (generatorField.isNewPassword || (forceSuggestPassword && generatorField.isPassword))
+                    ((generatorField.isNewPassword && !nativeAutofill) ||
+                        (forceSuggestPassword && generatorField.isPassword))
             val offered by produceState<PasswordGenerator.Outcome.Generated?>(
                 initialValue = null,
                 generatorField?.dismissId,
@@ -4581,6 +4640,7 @@ internal fun FluckBrowserTabContent(
                     dismissedSuggestionId,
                     suggestPasswordsEnabled,
                     forced = forceSuggestPassword,
+                    nativeAutofill = nativeAutofill,
                 )
             ) {
                 Box(

@@ -470,6 +470,7 @@ internal fun shouldOfferGeneratedPassword(
     dismissedId: String?,
     enabled: Boolean,
     forced: Boolean = false,
+    nativeAutofill: Boolean = false,
 ): Boolean {
     if (!enabled) return false
     if (field == null) return false
@@ -477,6 +478,8 @@ internal fun shouldOfferGeneratedPassword(
         // Deliberately skips the dismissal check as well: the request came after the dismissal.
         return field.isPassword && !field.hasValue && PasswordGenerator.fits(field.maxLength)
     }
+    // Native autofill owns the automatic offer; only a forced request gets through.
+    if (nativeAutofill) return false
     if (!field.isNewPassword) return false
     // Dismissed for this box on this page, same scoping as the saved-logins list.
     if (field.dismissId == dismissedId) return false
@@ -491,7 +494,9 @@ internal fun shouldOfferSuggestions(
     field: FocusedLoginField?,
     dismissedId: String?,
     matchCount: Int,
+    nativeAutofill: Boolean = false,
 ): Boolean {
+    if (nativeAutofill) return false
     if (field == null) return false
     // Dismissed for this box on this page. Scoped by dismissId, not key - see FocusedLoginField.
     if (field.dismissId == dismissedId) return false
